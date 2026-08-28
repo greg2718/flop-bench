@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://flop-bench.local/schemas/evidence-bundle-v0.1.json",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "evidence_id",
+    "claim_id",
+    "hypothesis",
+    "capabilities",
+    "procedure",
+    "observations",
+    "result",
+    "failure_conditions",
+    "provenance",
+    "safety_report",
+    "previous_ledger_hash",
+    "record_hash"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": "flop-bench.evidence-bundle.v0.1"},
+    "evidence_id": {"type": "string"},
+    "claim_id": {"type": "string"},
+    "hypothesis": {"type": "string"},
+    "capabilities": {"type": "array", "items": {"type": "string"}},
+    "procedure": {"type": "array", "items": {"type": "object"}},
+    "observations": {"type": "array", "items": {"type": "object"}},
+    "result": {"enum": ["PASS", "PARTIAL", "FAIL"]},
+    "failure_conditions": {"type": "array", "items": {"type": "string"}},
+    "provenance": {"type": "object"},
+    "safety_report": {"type": "object"},
+    "previous_ledger_hash": {"type": ["string", "null"]},
+    "record_hash": {"type": "string"},
+    "created_at": {"type": "string"},
+    "input_hashes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "artifact_hash": {"type": "string"},
+    "assertions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["expect"],
+        "additionalProperties": false,
+        "properties": {"expect": {"type": "string", "minLength": 1}}
+      }
+    }
+  }
+}

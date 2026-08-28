@@ -1,0 +1,13 @@
+{
+  "schema_version": "flop-bench.test-spec.v0.1",
+  "claim_id": "claim-example-blocked-local-command",
+  "hypothesis": "This command is blocked unless the human explicitly authorizes local execution.",
+  "requested_capabilities": ["approved-local-command"],
+  "mode": "approved-local",
+  "procedure": [
+    {"adapter": "local_command", "argv": ["python3", "--version"], "cwd": ".", "timeout_seconds": 5}
+  ],
+  "assertions": [{"expect": "CLI refuses without --allow-local-exec"}],
+  "failure_conditions": ["The command runs without explicit CLI authorization"],
+  "provenance": {"source": "local example"}
+}

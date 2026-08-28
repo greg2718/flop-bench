@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://flop-bench.local/schemas/router-validation-export-v0.1.json",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "subject_did",
+    "capability",
+    "result",
+    "evidence_id",
+    "evidence_quality",
+    "limitations",
+    "provenance",
+    "operator_group"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": "flop-bench.router-validation-export.v0.1"},
+    "subject_did": {"type": ["string", "null"]},
+    "capability": {"type": "string"},
+    "result": {"enum": ["PASS", "PARTIAL", "FAIL"]},
+    "evidence_id": {"type": "string"},
+    "evidence_quality": {"type": "string"},
+    "limitations": {"type": "array", "items": {"type": "string"}},
+    "provenance": {"type": "object"},
+    "operator_group": {
+      "type": "object",
+      "required": ["common_control_disclosure", "operator_group_id", "note"],
+      "additionalProperties": false,
+      "properties": {
+        "common_control_disclosure": {"const": true},
+        "operator_group_id": {"type": "string", "minLength": 1},
+        "note": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

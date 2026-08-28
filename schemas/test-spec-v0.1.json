@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://flop-bench.local/schemas/test-spec-v0.1.json",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "claim_id",
+    "hypothesis",
+    "requested_capabilities",
+    "mode",
+    "procedure",
+    "assertions",
+    "failure_conditions",
+    "provenance"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": "flop-bench.test-spec.v0.1"},
+    "claim_id": {"type": "string", "minLength": 1},
+    "hypothesis": {"type": "string", "minLength": 1},
+    "requested_capabilities": {"type": "array", "items": {"type": "string"}},
+    "mode": {"enum": ["passive", "approved-local"]},
+    "procedure": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["adapter", "path"],
+            "additionalProperties": false,
+            "properties": {
+              "adapter": {"const": "file_exists"},
+              "path": {"type": "string", "minLength": 1}
+            }
+          },
+          {
+            "type": "object",
+            "required": ["adapter", "path", "sha256"],
+            "additionalProperties": false,
+            "properties": {
+              "adapter": {"const": "file_sha256"},
+              "path": {"type": "string", "minLength": 1},
+              "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            }
+          },
+          {
+            "type": "object",
+            "required": ["adapter", "path", "text"],
+            "additionalProperties": false,
+            "properties": {
+              "adapter": {"const": "text_contains"},
+              "path": {"type": "string", "minLength": 1},
+              "text": {"type": "string"}
+            }
+          },
+          {
+            "type": "object",
+            "required": ["adapter", "path", "json_path", "equals"],
+            "additionalProperties": false,
+            "properties": {
+              "adapter": {"const": "json_path_equals"},
+              "path": {"type": "string", "minLength": 1},
+              "json_path": {"type": "string", "minLength": 1},
+              "equals": true
+            }
+          },
+          {
+            "type": "object",
+            "required": ["adapter", "path", "schema_path"],
+            "additionalProperties": false,
+            "properties": {
+              "adapter": {"const": "json_schema"},
+              "path": {"type": "string", "minLength": 1},
+              "schema_path": {"type": "string", "minLength": 1}
+            }
+          },
+          {
+            "type": "object",
+            "required": ["adapter", "argv", "cwd"],
+            "additionalProperties": false,
+            "properties": {
+              "adapter": {"const": "local_command"},
+              "argv": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "minLength": 1}
+              },
+              "cwd": {"type": "string", "minLength": 1},
+              "timeout_seconds": {"type": "number", "exclusiveMinimum": 0},
+              "expect_exit_code": {"type": "integer"},
+              "env": {"type": "object", "additionalProperties": {"type": "string"}}
+            }
+          }
+        ]
+      }
+    },
+    "assertions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["expect"],
+        "additionalProperties": false,
+        "properties": {"expect": {"type": "string", "minLength": 1}}
+      }
+    },
+    "failure_conditions": {"type": "array", "items": {"type": "string"}},
+    "provenance": {"type": "object"}
+  }
+}

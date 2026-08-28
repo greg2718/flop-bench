@@ -1,0 +1,14 @@
+{
+  "schema_version": "flop-bench.test-spec.v0.1",
+  "claim_id": "claim-example-passive-file",
+  "hypothesis": "The README exists and contains the project name.",
+  "requested_capabilities": ["file-existence", "utf8-text-containment"],
+  "mode": "passive",
+  "procedure": [
+    {"adapter": "file_exists", "path": "README.md"},
+    {"adapter": "text_contains", "path": "README.md", "text": "FLOP Bench"}
+  ],
+  "assertions": [{"expect": "all steps pass"}],
+  "failure_conditions": ["README.md is absent", "README.md does not contain FLOP Bench"],
+  "provenance": {"source": "local example"}
+}

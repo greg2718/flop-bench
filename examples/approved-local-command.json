@@ -1,0 +1,13 @@
+{
+  "schema_version": "flop-bench.test-spec.v0.1",
+  "claim_id": "claim-example-approved-local-command",
+  "hypothesis": "Python can report its version when local execution is explicitly authorized.",
+  "requested_capabilities": ["approved-local-command"],
+  "mode": "approved-local",
+  "procedure": [
+    {"adapter": "local_command", "argv": ["python3", "--version"], "cwd": ".", "timeout_seconds": 5, "expect_exit_code": 0}
+  ],
+  "assertions": [{"expect": "exit code 0"}],
+  "failure_conditions": ["Python version command exits nonzero or times out"],
+  "provenance": {"source": "local example", "requires": "--allow-local-exec"}
+}

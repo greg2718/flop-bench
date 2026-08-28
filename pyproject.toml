@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flop-bench"
+version = "0.1.0"
+description = "Offline-first verification and proof-of-work agent for FLOP/Technocore."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "cryptography>=42,<51",
+  "jsonschema>=4.22,<5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy==1.19.1",
+  "pytest==8.4.2",
+  "ruff==0.16.5",
+]
+
+[project.scripts]
+flop-bench = "flop_bench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S"]
+ignore = ["S101"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["flop_bench"]
+
+[[tool.mypy.overrides]]
+module = ["jsonschema"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
