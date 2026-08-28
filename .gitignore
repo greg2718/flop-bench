@@ -5,3 +5,16 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+
+# FLOP Bench local private state and generated identity material.
+.flop_agents/
+.flop_scout/
+identity.pem
+identity.json
+identity-test-only.pem
+identity-test-only.json
+*.sqlite
+*.sqlite-*
+ledger.jsonl
+activity.jsonl
+observer.sqlite

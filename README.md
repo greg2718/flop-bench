@@ -2,7 +2,7 @@
 
 FLOP Bench is an offline-first testing, reproducibility, verification, and proof-of-work agent for the Technocore/FLOP ecosystem.
 
-v0.1 is deliberately local. It does not create a production DID, join rooms, create mailboxes, post outbound messages, fetch URLs, integrate wallets, transfer FLOP, or make Technocore network calls.
+v0.1 is deliberately local. It can create an encrypted local Bench identity only after an explicit provisioning gate, but it does not join rooms, create mailboxes, post outbound messages, fetch URLs, integrate wallets, transfer FLOP, submit Router records, or make Technocore network calls.
 
 ## Architecture
 
@@ -33,7 +33,16 @@ Bench defaults and denylist checks are separate from Scout:
 - Scout mailbox denylist: `mb-flop-scout`
 - Scout DID denylist: `did:key:z6MkfJnczowbivU9SEDcZ77MEpKUfQTVbcD3i1gcwsfo4yL1`
 
-`flop-bench identity create-production` is a locked stub and exits nonzero. Tests may create ephemeral Ed25519 identities only inside temporary directories, marked `purpose = "test-only"` and `persistent = false`.
+`flop-bench identity create-production` is deliberately gated. It requires the exact state directory `~/.flop_agents/bench`, the exact confirmation value `CREATE-FLOP-BENCH-IDENTITY`, and an interactive passphrase prompt with confirmation. Noninteractive invocations are refused. Tests use a lower-level hook against temporary directories only.
+
+The generated identity is local only:
+
+- `identity.pem` is an encrypted PKCS#8 Ed25519 private key.
+- `identity.json` contains public metadata only.
+- Creating it does not register Bench with Technocore, create a room or mailbox, activate Bench, post anything, submit Router evidence, create a wallet, or transfer FLOP.
+- If the passphrase is lost, FLOP Bench cannot decrypt the private key. There is no backup or recovery path in v0.1.
+
+The passphrase policy is: at least 16 characters and at least three of lowercase, uppercase, digit, and symbol.
 
 ## Local Development
 
@@ -62,6 +71,17 @@ Approved local execution requires an explicit human flag:
 ```bash
 flop-bench verify examples/approved-local-command.json --state-dir /tmp/flop-bench-state --allow-local-exec
 ```
+
+Production identity commands:
+
+```bash
+flop-bench identity create-production \
+  --state-dir ~/.flop_agents/bench \
+  --confirm CREATE-FLOP-BENCH-IDENTITY
+flop-bench identity verify --state-dir ~/.flop_agents/bench
+```
+
+Both identity commands require an interactive terminal so the passphrase is entered through `getpass`. FLOP Bench never accepts the production passphrase through argv, environment variables, config files, or specs.
 
 ## Evidence
 

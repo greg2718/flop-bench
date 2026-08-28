@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from jsonschema import Draft202012Validator
 
 from flop_bench import engine
@@ -25,7 +27,14 @@ from flop_bench.config import (
 )
 from flop_bench.engine import router_export, verify_spec
 from flop_bench.exceptions import IsolationError, LedgerError, SafetyError, ValidationError
-from flop_bench.identity import create_ephemeral_test_identity, refuse_production_identity_creation
+from flop_bench.identity import (
+    IDENTITY_CONFIRMATION,
+    create_ephemeral_test_identity,
+    create_production_identity,
+    public_did,
+    read_interactive_new_passphrase,
+    verify_identity,
+)
 from flop_bench.ledger import append_record, verify_ledger
 from flop_bench.schemas import (
     EVIDENCE_BUNDLE_SCHEMA,
@@ -68,6 +77,18 @@ def spec(
         "failure_conditions": ["step failed"],
         "provenance": {"fixture": str(tmp_path)},
     }
+
+
+def strong_test_phrase() -> str:
+    return "".join(["Strong", "Passphrase", "1!"])
+
+
+def different_test_phrase() -> str:
+    return "".join(["Different", "Passphrase", "1!"])
+
+
+def weak_test_phrase() -> str:
+    return "".join(["we", "ak"])
 
 
 def test_schema_validation_accepts_spec_and_rejects_missing_required(tmp_path: Path) -> None:
@@ -273,14 +294,239 @@ def test_forbidden_config_values_resolve_path_aliases(tmp_path: Path) -> None:
 
 
 def test_production_identity_creation_refusal_and_ephemeral_containment(tmp_path: Path) -> None:
-    with pytest.raises(SafetyError):
-        refuse_production_identity_creation()
     meta = create_ephemeral_test_identity(tmp_path / "identity")
     assert meta["purpose"] == "test-only"
     assert meta["persistent"] is False
     assert str(tmp_path) in meta["private_key_path"]
     assert not (Path.home() / ".flop_agents" / "bench" / "identity.pem").exists()
     assert not (Path.home() / ".flop_agents" / "bench" / "identity.json").exists()
+
+
+def test_successful_temporary_production_style_identity_creation(tmp_path: Path) -> None:
+    state = tmp_path / "bench"
+    passphrase = strong_test_phrase()
+    metadata = create_production_identity(
+        state_dir=state,
+        confirm=IDENTITY_CONFIRMATION,
+        passphrase=passphrase,
+        passphrase_confirmation=passphrase,
+        expected_state_dir=state,
+    )
+    pem = state / "identity.pem"
+    identity_json = state / "identity.json"
+    assert pem.exists()
+    assert identity_json.exists()
+    assert metadata == json.loads(identity_json.read_text(encoding="utf-8"))
+    assert metadata["purpose"] == "flop-bench-production"
+    assert metadata["persistent"] is True
+    assert metadata["canonical_room"] == "d-flop-bench"
+    assert metadata["mailbox"] == "mb-flop-bench"
+    assert metadata["did"] != SCOUT_DID
+    assert metadata["operator_group"]["related_agents"] == [
+        "FLOP Scout",
+        "FLOP Bench",
+        "FLOP Sentinel",
+    ]
+    serialized = json.dumps(metadata, sort_keys=True)
+    assert "private" not in serialized.lower()
+    assert passphrase not in serialized
+
+
+def test_production_identity_refusals(tmp_path: Path) -> None:
+    state = tmp_path / "bench"
+    passphrase = strong_test_phrase()
+    with pytest.raises(SafetyError):
+        create_production_identity(
+            state_dir=state,
+            confirm="WRONG",
+            passphrase=passphrase,
+            passphrase_confirmation=passphrase,
+            expected_state_dir=state,
+        )
+    with pytest.raises(SafetyError):
+        create_production_identity(
+            state_dir=tmp_path / "other",
+            confirm=IDENTITY_CONFIRMATION,
+            passphrase=passphrase,
+            passphrase_confirmation=passphrase,
+            expected_state_dir=state,
+        )
+    with pytest.raises(IsolationError):
+        create_production_identity(
+            state_dir=SCOUT_STATE,
+            confirm=IDENTITY_CONFIRMATION,
+            passphrase=passphrase,
+            passphrase_confirmation=passphrase,
+            expected_state_dir=SCOUT_STATE,
+        )
+
+
+def test_existing_identity_refusal_and_passphrase_policy(tmp_path: Path) -> None:
+    state = tmp_path / "bench"
+    passphrase = strong_test_phrase()
+    create_production_identity(
+        state_dir=state,
+        confirm=IDENTITY_CONFIRMATION,
+        passphrase=passphrase,
+        passphrase_confirmation=passphrase,
+        expected_state_dir=state,
+    )
+    with pytest.raises(SafetyError):
+        create_production_identity(
+            state_dir=state,
+            confirm=IDENTITY_CONFIRMATION,
+            passphrase=passphrase,
+            passphrase_confirmation=passphrase,
+            expected_state_dir=state,
+        )
+    for bad_passphrase, confirmation in [
+        ("", ""),
+        ("short", "short"),
+        ("alllowercasebutlong", "alllowercasebutlong"),
+        (strong_test_phrase(), different_test_phrase()),
+    ]:
+        with pytest.raises(SafetyError):
+            create_production_identity(
+                state_dir=tmp_path / f"bad-{len(bad_passphrase)}-{len(confirmation)}",
+                confirm=IDENTITY_CONFIRMATION,
+                passphrase=bad_passphrase,
+                passphrase_confirmation=confirmation,
+                expected_state_dir=tmp_path / f"bad-{len(bad_passphrase)}-{len(confirmation)}",
+            )
+
+
+def test_identity_cli_passphrase_prompt_refuses_noninteractive() -> None:
+    with pytest.raises(SafetyError):
+        read_interactive_new_passphrase()
+
+
+def test_encrypted_pem_did_derivation_and_permissions(tmp_path: Path) -> None:
+    state = tmp_path / "bench"
+    passphrase = strong_test_phrase()
+    metadata = create_production_identity(
+        state_dir=state,
+        confirm=IDENTITY_CONFIRMATION,
+        passphrase=passphrase,
+        passphrase_confirmation=passphrase,
+        expected_state_dir=state,
+    )
+    pem_bytes = (state / "identity.pem").read_bytes()
+    assert b"BEGIN ENCRYPTED PRIVATE KEY" in pem_bytes
+    with pytest.raises(TypeError):
+        serialization.load_pem_private_key(pem_bytes, password=None)
+    loaded = serialization.load_pem_private_key(pem_bytes, password=passphrase.encode("utf-8"))
+    assert isinstance(loaded, Ed25519PrivateKey)
+    assert public_did(loaded) == metadata["did"]
+    assert state.stat().st_mode & 0o777 == 0o700
+    assert (state / "identity.pem").stat().st_mode & 0o777 == 0o600
+    assert (state / "identity.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_identity_atomic_failure_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "bench"
+    passphrase = strong_test_phrase()
+
+    def fail_json_write(_path: Path, _value: dict[str, object], _mode: int = 0o600) -> None:
+        raise OSError("simulated metadata write failure")
+
+    monkeypatch.setattr("flop_bench.identity._atomic_write_json_no_replace", fail_json_write)
+    with pytest.raises(OSError):
+        create_production_identity(
+            state_dir=state,
+            confirm=IDENTITY_CONFIRMATION,
+            passphrase=passphrase,
+            passphrase_confirmation=passphrase,
+            expected_state_dir=state,
+        )
+    assert not (state / "identity.pem").exists()
+    assert not (state / "identity.json").exists()
+
+
+def test_identity_verification_success_wrong_passphrase_and_tamper_detection(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "bench"
+    passphrase = strong_test_phrase()
+    create_production_identity(
+        state_dir=state,
+        confirm=IDENTITY_CONFIRMATION,
+        passphrase=passphrase,
+        passphrase_confirmation=passphrase,
+        expected_state_dir=state,
+    )
+    result = verify_identity(state_dir=state, passphrase=passphrase, expected_state_dir=state)
+    assert result["ok"] is True
+    assert result["pem_encrypted"] is True
+    with pytest.raises(SafetyError) as wrong_pass:
+        verify_identity(
+            state_dir=state,
+            passphrase=different_test_phrase(),
+            expected_state_dir=state,
+        )
+    assert different_test_phrase() not in str(wrong_pass.value)
+    metadata = json.loads((state / "identity.json").read_text(encoding="utf-8"))
+    metadata["purpose"] = "tampered"
+    write_json(state / "identity.json", metadata)
+    (state / "identity.json").chmod(0o600)
+    with pytest.raises(ValidationError):
+        verify_identity(state_dir=state, passphrase=passphrase, expected_state_dir=state)
+    metadata["purpose"] = "flop-bench-production"
+    metadata["did"] = SCOUT_DID
+    write_json(state / "identity.json", metadata)
+    (state / "identity.json").chmod(0o600)
+    with pytest.raises(IsolationError):
+        verify_identity(state_dir=state, passphrase=passphrase, expected_state_dir=state)
+
+
+def test_identity_verification_rejects_unencrypted_pem(tmp_path: Path) -> None:
+    state = tmp_path / "bench"
+    passphrase = strong_test_phrase()
+    create_production_identity(
+        state_dir=state,
+        confirm=IDENTITY_CONFIRMATION,
+        passphrase=passphrase,
+        passphrase_confirmation=passphrase,
+        expected_state_dir=state,
+    )
+    key = Ed25519PrivateKey.generate()
+    (state / "identity.pem").write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    (state / "identity.pem").chmod(0o600)
+    with pytest.raises(ValidationError):
+        verify_identity(state_dir=state, passphrase=passphrase, expected_state_dir=state)
+
+
+def test_identity_outputs_exceptions_and_json_do_not_leak_secrets(tmp_path: Path) -> None:
+    state = tmp_path / "bench"
+    passphrase = strong_test_phrase()
+    metadata = create_production_identity(
+        state_dir=state,
+        confirm=IDENTITY_CONFIRMATION,
+        passphrase=passphrase,
+        passphrase_confirmation=passphrase,
+        expected_state_dir=state,
+    )
+    public_result = verify_identity(
+        state_dir=state, passphrase=passphrase, expected_state_dir=state
+    )
+    visible = json.dumps({"metadata": metadata, "verify": public_result}, sort_keys=True)
+    assert passphrase not in visible
+    assert "seed" not in visible.lower()
+    assert "private_key" not in visible
+    with pytest.raises(SafetyError) as exc:
+        create_production_identity(
+            state_dir=tmp_path / "weak",
+            confirm=IDENTITY_CONFIRMATION,
+            passphrase=weak_test_phrase(),
+            passphrase_confirmation=weak_test_phrase(),
+            expected_state_dir=tmp_path / "weak",
+        )
+    assert weak_test_phrase() not in str(exc.value)
 
 
 def test_disabled_technocore_transport() -> None:
@@ -484,15 +730,43 @@ def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
     )
     assert export.returncode == 0, export.stderr
     refusal = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
-        [sys.executable, "-m", "flop_bench.cli", "identity", "create-production"],
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "identity",
+            "create-production",
+            "--state-dir",
+            str(Path.home() / ".flop_agents" / "bench"),
+            "--confirm",
+            IDENTITY_CONFIRMATION,
+        ],
         cwd=REPO,
         env=env,
         text=True,
         capture_output=True,
         check=False,
     )
-    assert refusal.returncode != 0
-    assert "disabled" in refusal.stderr
+    assert refusal.returncode == 4
+    assert "interactive terminal required" in refusal.stderr
+    verify_refusal = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "identity",
+            "verify",
+            "--state-dir",
+            str(Path.home() / ".flop_agents" / "bench"),
+        ],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert verify_refusal.returncode == 4
+    assert "interactive terminal required" in verify_refusal.stderr
     failed_isolation = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
         [
             sys.executable,

@@ -9,7 +9,13 @@ from typing import Any
 from .config import BenchConfig, assert_isolated, isolation_boundaries
 from .engine import router_export, verify_spec
 from .exceptions import FlopBenchError, IsolationError, LedgerError, SafetyError, ValidationError
-from .identity import refuse_production_identity_creation
+from .identity import (
+    IDENTITY_CONFIRMATION,
+    create_production_identity,
+    read_interactive_existing_passphrase,
+    read_interactive_new_passphrase,
+    verify_identity,
+)
 from .ledger import verify_ledger
 from .schemas import validate_test_spec
 from .state import connect_state
@@ -52,7 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
     rexp.add_argument("evidence", type=Path)
     identity = sub.add_parser("identity")
     identity_sub = identity.add_subparsers(dest="identity_cmd", required=True)
-    identity_sub.add_parser("create-production")
+    create_identity = identity_sub.add_parser("create-production")
+    create_identity.add_argument("--state-dir", required=True, type=Path)
+    create_identity.add_argument("--confirm", required=True, choices=[IDENTITY_CONFIRMATION])
+    verify_identity_cmd = identity_sub.add_parser("verify")
+    verify_identity_cmd.add_argument("--state-dir", required=True, type=Path)
     return parser
 
 
@@ -85,7 +95,18 @@ def run(argv: list[str] | None = None) -> int:
             evidence = json.loads(args.evidence.read_text(encoding="utf-8"))
             _print_json(router_export(evidence))
         elif args.cmd == "identity" and args.identity_cmd == "create-production":
-            refuse_production_identity_creation()
+            passphrase, confirmation = read_interactive_new_passphrase()
+            _print_json(
+                create_production_identity(
+                    state_dir=args.state_dir,
+                    confirm=args.confirm,
+                    passphrase=passphrase,
+                    passphrase_confirmation=confirmation,
+                )
+            )
+        elif args.cmd == "identity" and args.identity_cmd == "verify":
+            passphrase = read_interactive_existing_passphrase()
+            _print_json(verify_identity(state_dir=args.state_dir, passphrase=passphrase))
         else:
             raise FlopBenchError("unknown command")
     except LedgerError as exc:
