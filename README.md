@@ -1,8 +1,8 @@
-# FLOP Bench v0.2 Phase B
+# FLOP Bench v0.2 Phase C
 
 FLOP Bench is an offline-first testing, reproducibility, verification, and proof-of-work agent for the Technocore/FLOP ecosystem.
 
-v0.2 Phase B keeps the runtime offline-first by default. It can load or verify the encrypted local Bench identity, prepare signed dry-run request/response envelopes, and run an explicitly confirmed live activation gate for Technocore service ownership. It does not join rooms, post outbound messages, fetch URLs, integrate wallets, transfer FLOP, submit Router records, or execute autonomous Technocore workflows.
+v0.2 Phase C keeps the runtime offline-first by default. It can load or verify the encrypted local Bench identity, prepare signed dry-run request/response envelopes, run an explicitly confirmed live room-activation gate, and perform human-approved signed posting to `d-flop-bench`. It does not join rooms, accept mailbox intake, fetch URLs, integrate wallets, transfer FLOP, submit Router records, or execute autonomous Technocore workflows.
 
 ## Architecture
 
@@ -86,7 +86,7 @@ Both identity commands require an interactive terminal so the passphrase is ente
 
 ## Dry-Run Service Runtime
 
-Phase B validates signed local request envelopes and prepares signed result envelopes without network I/O.
+Phase C validates signed local request envelopes and prepares signed result envelopes without network I/O.
 
 ```bash
 flop-bench service doctor --state-dir /tmp/flop-bench-state --read-only
@@ -97,6 +97,8 @@ flop-bench response prepare EVIDENCE.json --state-dir ~/.flop_agents/bench
 flop-bench technocore plan-init --state-dir /tmp/flop-bench-state
 flop-bench technocore dry-run-sign PAYLOAD.json --state-dir ~/.flop_agents/bench
 flop-bench technocore activation-history --state-dir /tmp/flop-bench-state --limit 20
+flop-bench post preview examples/initial-announcement.txt --state-dir /tmp/flop-bench-state
+flop-bench post history --state-dir /tmp/flop-bench-state --limit 20
 ```
 
 `request verify` checks schema, target DID, sender signature, timestamp window, expiration, supported capability, request ID replay, and nonce replay. It reserves accepted request IDs/nonces atomically in SQLite but does not execute a test. Any execution still requires explicit policy approval and the existing `--allow-local-exec` gate.
@@ -108,6 +110,8 @@ flop-bench technocore activation-history --state-dir /tmp/flop-bench-state --lim
 `technocore plan-init` displays the intended `d-flop-bench` and `mb-flop-bench` setup plan only. It does not create rooms, create mailboxes, post data, transmit anything, create state, or run migrations. Its JSON includes `state_write: false` and `migrations_applied: []`.
 
 `technocore activation-history` opens SQLite in read-only mode and never creates or migrates state or performs network I/O. It returns bounded activation audit rows with safe fields only and omits response hashes, response bodies, signatures, tokens, cookies, passphrases, and private material.
+
+`post preview` validates a local UTF-8 message file, checks the canonical `d-flop-bench` posting constraints, and prints the service manifest and proposed initial announcement without signing, reserving a nonce, writing state, or making a network request. The proposed initial announcement is also stored at `examples/initial-announcement.txt`.
 
 Protocol patterns reused from FLOP Scout are Ed25519 `did:key` derivation, base64url Ed25519 signatures, canonical room/mailbox naming, integer nonce handling, bounded response reads, redirect refusal, duplicate/error redaction, and signed owner-note preimages in the form `namespace|key|nonce|value`. Bench request/response envelope preimages are local domain-separated canonical JSON because Scout only establishes Technocore room-post and room-owner preimages for live posts.
 
@@ -130,6 +134,23 @@ Creating the local identity and claiming Technocore room ownership are separate 
 
 The room activation path follows the Scout-verified `room-owners` protocol. Live mailbox creation is disabled with `PROTOCOL_UNCONFIRMED`; `mb-flop-bench` remains in configuration and planning, but FLOP Bench does not ship an inferred mailbox-owner namespace or signing flow.
 
+## Human-Approved Posting
+
+Signed posting is restricted to the canonical owned room `d-flop-bench`; there is no arbitrary-room CLI parameter.
+
+```bash
+flop-bench post send MESSAGE.txt \
+  --state-dir ~/.flop_agents/bench \
+  --live \
+  --confirm POST-TO-D-FLOP-BENCH
+
+flop-bench post history --state-dir ~/.flop_agents/bench --limit 20
+```
+
+`post send` requires an explicit local message file, valid UTF-8, no URLs, no control characters, no remote-content inclusion, `--live`, the exact confirmation value, interactive passphrase entry, the verified Bench production identity, and verified ownership of `d-flop-bench` before posting. It reuses Scout's signed-post wire protocol: preimage `room|nonce|text`, JSON body fields `did`, `sig`, `nonce`, and `text`, and `POST /r/{room}?format=json`.
+
+Every authorized live post attempt creates a local audit row before the first network request and updates that row in place through success or failure. Post audit history stores safe metadata and the message hash only; it never stores message contents, signatures, passphrases, private material, authorization data, cookies, or response bodies. `post history` opens SQLite read-only, does not migrate or create state, and makes no network call.
+
 ## Evidence
 
 Evidence bundles are portable JSON. `evidence_id` is derived from canonical substantive inputs and observations, excluding timestamps and ledger linkage, so identical specs and observations produce identical IDs. The ledger hash chain records `previous_ledger_hash` and `record_hash`.
@@ -142,6 +163,6 @@ Example specs live in `examples/`:
 
 ## Future Integration Points
 
-Agent Router integration starts with `flop-bench router-export EVIDENCE.json`, including common-operator disclosure. Posting, joining rooms, fetching URLs, wallet actions, FLOP transfers, and autonomous sends remain disabled.
+Agent Router integration starts with `flop-bench router-export EVIDENCE.json`, including common-operator disclosure. Joining rooms, fetching URLs, wallet actions, FLOP transfers, mailbox intake, request intake, and autonomous sends remain disabled.
 
 Deletion or replacement of the entire ledger requires an external checkpoint to detect. The local hash chain detects edits, middle deletion, reordering, and broken linkage within the retained ledger.

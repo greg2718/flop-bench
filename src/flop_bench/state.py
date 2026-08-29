@@ -9,7 +9,7 @@ from typing import Any
 
 from .exceptions import SafetyError
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 STATE_DB = "state.sqlite"
 PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIR_MODE = 0o700
@@ -176,6 +176,54 @@ def activation_history(state_dir: Path, *, limit: int) -> dict[str, Any]:
     }
 
 
+def post_history(state_dir: Path, *, limit: int) -> dict[str, Any]:
+    if limit < 1 or limit > 100:
+        raise SafetyError("post history limit must be between 1 and 100")
+    resolved = state_dir.expanduser().resolve(strict=False)
+    status = migration_status(resolved)
+    if not status["database_exists"]:
+        return {
+            "ok": True,
+            "state_dir": str(resolved),
+            "state_write": False,
+            "network_action": False,
+            "limit": limit,
+            "posts": [],
+            "permission_issues": status["permission_issues"],
+        }
+    uri = f"file:{(resolved / STATE_DB).as_posix()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'post_attempts'"
+        ).fetchone()
+        if table_exists is None:
+            rows: list[sqlite3.Row] = []
+        else:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT id, room, expected_owner_did, message_hash, post_status,
+                           request_timestamp, response_status, nonce_used, seq,
+                           failure_classification
+                    FROM post_attempts
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+            )
+    return {
+        "ok": True,
+        "state_dir": str(resolved),
+        "state_write": False,
+        "network_action": False,
+        "limit": limit,
+        "posts": [dict(row) for row in rows],
+        "permission_issues": status["permission_issues"],
+    }
+
+
 def migrate(conn: sqlite3.Connection) -> list[int]:
     applied: list[int] = []
     conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)")
@@ -238,6 +286,25 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
             """
         )
         applied.append(3)
+    if current < 4:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS post_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                room TEXT NOT NULL,
+                expected_owner_did TEXT NOT NULL,
+                message_hash TEXT NOT NULL,
+                post_status TEXT NOT NULL,
+                request_timestamp TEXT NOT NULL,
+                response_status INTEGER,
+                nonce_used INTEGER,
+                seq INTEGER,
+                failure_classification TEXT
+            );
+            INSERT OR IGNORE INTO schema_migrations(version) VALUES (4);
+            """
+        )
+        applied.append(4)
     conn.commit()
     return applied
 
@@ -373,5 +440,89 @@ def update_service_activation(
             failure_classification,
             activation_id,
         ),
+    )
+    conn.commit()
+
+
+def next_post_nonce(conn: sqlite3.Connection) -> int:
+    now_ms = int(time.time() * 1000)
+    conn.execute("BEGIN IMMEDIATE")
+    row = conn.execute("SELECT value FROM metadata WHERE key = 'last_post_nonce'").fetchone()
+    try:
+        previous = int(row["value"]) if row is not None else 0
+    except (TypeError, ValueError):
+        previous = 0
+    nonce = max(now_ms, previous + 1)
+    conn.execute(
+        """
+        INSERT INTO metadata(key, value, updated_at)
+        VALUES ('last_post_nonce', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (str(nonce), datetime.now(UTC).isoformat()),
+    )
+    conn.commit()
+    return nonce
+
+
+def record_post_attempt(
+    conn: sqlite3.Connection,
+    *,
+    room: str,
+    expected_owner_did: str,
+    message_hash: str,
+    post_status: str,
+    response_status: int | None,
+    nonce_used: int | None,
+    seq: int | None,
+    failure_classification: str | None,
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO post_attempts(
+            room, expected_owner_did, message_hash, post_status, request_timestamp,
+            response_status, nonce_used, seq, failure_classification
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            room,
+            expected_owner_did,
+            message_hash,
+            post_status,
+            datetime.now(UTC).isoformat(),
+            response_status,
+            nonce_used,
+            seq,
+            failure_classification,
+        ),
+    )
+    conn.commit()
+    if cursor.lastrowid is None:
+        raise SafetyError("post audit insert did not return an id")
+    return int(cursor.lastrowid)
+
+
+def update_post_attempt(
+    conn: sqlite3.Connection,
+    *,
+    post_id: int,
+    post_status: str,
+    response_status: int | None,
+    nonce_used: int | None,
+    seq: int | None,
+    failure_classification: str | None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE post_attempts
+        SET post_status = ?,
+            response_status = ?,
+            nonce_used = ?,
+            seq = ?,
+            failure_classification = ?
+        WHERE id = ?
+        """,
+        (post_status, response_status, nonce_used, seq, failure_classification, post_id),
     )
     conn.commit()
