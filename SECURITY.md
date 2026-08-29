@@ -26,6 +26,8 @@ Request verification enforces target DID, signature validity, bounded timestamp 
 
 FLOP Bench must not print private keys, seed material, passphrases, tokens, or full environments. Captured stdout and stderr are redacted and size-limited. Production identity passphrases are collected only through interactive `getpass` prompts and are never accepted through argv, environment variables, config files, or specs.
 
+Writable state opens create or tighten `state.sqlite`, SQLite WAL/SHM sidecars, `ledger.jsonl`, and private state artifacts to mode `0600` where practical. Read-only commands report insecure private-state file permissions and must not chmod or otherwise modify state.
+
 ## Identity
 
 Production identity creation is local only and gated by an exact state directory, exact confirmation value, interactive passphrase entry, passphrase confirmation, existing-file refusal, and Scout isolation checks. The state directory must be `~/.flop_agents/bench` in production use, with directory mode `0700` and `identity.pem` / `identity.json` mode `0600`.
@@ -45,6 +47,8 @@ Scout, Bench, and Sentinel are related local agents under common operator contro
 `request inspect`, `request verify`, `response prepare`, `technocore plan-init`, and `technocore dry-run-sign` are local workflows. `plan-init` only describes intended room/mailbox actions and reports `state_write: false`. `dry-run-sign` signs local payloads after an interactive passphrase prompt but does not transmit them.
 
 `service doctor --read-only` performs read-only state inspection and must not create a directory, SQLite database, table, migration, ledger entry, or other state. `service doctor` without `--read-only` opens the local SQLite state and may create or migrate it; its output reports `state_write: true` and lists `migrations_applied`.
+
+`technocore activation-history` opens SQLite read-only, never migrates state, makes no network call, enforces bounded limits, and returns only safe activation audit fields. It excludes response bodies, response hashes, signatures, authorization data, cookies, passphrases, and private material.
 
 ## Live Activation Gate
 

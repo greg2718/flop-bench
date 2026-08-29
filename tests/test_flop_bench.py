@@ -76,7 +76,7 @@ from flop_bench.service import (
     verify_request,
     verify_signed_response,
 )
-from flop_bench.state import connect_state, migration_status
+from flop_bench.state import activation_history, connect_state, migration_status
 from flop_bench.transport import DisabledTechnocoreTransport
 
 REPO = Path(__file__).resolve().parents[1]
@@ -1464,6 +1464,7 @@ def test_service_doctor_read_only_does_not_create_or_migrate_state(tmp_path: Pat
     assert report["state_write"] is False
     assert report["state_dir_exists"] is False
     assert report["database_exists"] is False
+    assert report["permission_issues"] == []
     assert report["schema_migrations"] == []
     assert report["pending_migrations"] == [1, 2, 3]
     assert not state.exists()
@@ -1499,6 +1500,96 @@ def test_service_doctor_read_only_reports_outdated_state_without_migrating(tmp_p
     assert normal["state_write"] is True
     assert normal["migrations_applied"] == [2, 3]
     assert normal["schema_migrations"] == [1, 2, 3]
+
+
+def test_private_state_database_and_sidecar_permissions(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    with connect_state(state) as conn:
+        conn.execute("INSERT INTO metadata(key, value, updated_at) VALUES ('k', 'v', 'now')")
+        conn.commit()
+        assert (state / "state.sqlite").stat().st_mode & 0o777 == 0o600
+        for sidecar in (state / "state.sqlite-wal", state / "state.sqlite-shm"):
+            if sidecar.exists():
+                assert sidecar.stat().st_mode & 0o777 == 0o600
+
+
+def test_existing_permissive_database_tightened_on_writable_open(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    db = state / "state.sqlite"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_migrations(version) VALUES (1)")
+    db.chmod(0o644)
+    with connect_state(state):
+        pass
+    assert db.stat().st_mode & 0o777 == 0o600
+
+
+def test_read_only_state_inspection_detects_insecure_permissions_without_chmod(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    db = state / "state.sqlite"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_migrations(version) VALUES (1)")
+    db.chmod(0o644)
+    report = service_doctor(state_dir=state, read_only=True)
+    assert report["state_write"] is False
+    assert report["permission_issues"] == [
+        {"path": str(db), "mode": "0644", "expected_mode": "0600"}
+    ]
+    assert db.stat().st_mode & 0o777 == 0o644
+
+
+def test_ledger_file_mode_is_private(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    append_record(state, {"schema_version": "test", "value": "ok"})
+    assert (state / "ledger.jsonl").stat().st_mode & 0o777 == 0o600
+
+
+def test_activation_history_read_only_safe_fields_limits_and_missing_db(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing"
+    missing_report = activation_history(missing, limit=10)
+    assert missing_report["state_write"] is False
+    assert missing_report["network_action"] is False
+    assert missing_report["activations"] == []
+    assert not missing.exists()
+
+    state = tmp_path / "state"
+    with connect_state(state) as conn:
+        for idx in range(3):
+            conn.execute(
+                """
+                INSERT INTO service_activations(
+                    service_type, service_name, expected_owner_did, observed_owner_did,
+                    activation_status, request_timestamp, response_status, nonce_used,
+                    response_hash, failure_classification
+                )
+                VALUES ('room', 'd-flop-bench', ?, NULL, 'failed_preflight',
+                        '2026-01-01T00:00:00+00:00', 503, NULL, ?, ?)
+                """,
+                (BENCH_DID, f"secret-response-hash-{idx}", "remote_unavailable"),
+            )
+        conn.commit()
+    history = activation_history(state, limit=2)
+    assert history["state_write"] is False
+    assert history["network_action"] is False
+    assert len(history["activations"]) == 2
+    assert [item["id"] for item in history["activations"]] == [3, 2]
+    visible = json.dumps(history, sort_keys=True)
+    assert "response_hash" not in visible
+    assert "secret-response-hash" not in visible
+    assert "signature" not in visible
+    assert "passphrase" not in visible
+    with pytest.raises(SafetyError):
+        activation_history(state, limit=0)
+    with pytest.raises(SafetyError):
+        activation_history(state, limit=101)
 
 
 def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:

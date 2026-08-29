@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from datetime import UTC, datetime
@@ -10,6 +11,58 @@ from .exceptions import SafetyError
 
 SCHEMA_VERSION = 3
 STATE_DB = "state.sqlite"
+PRIVATE_FILE_MODE = 0o600
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_STATE_FILENAMES = (
+    STATE_DB,
+    f"{STATE_DB}-wal",
+    f"{STATE_DB}-shm",
+    "ledger.jsonl",
+    "observer.sqlite",
+    "activity.jsonl",
+)
+
+
+def private_state_paths(state_dir: Path) -> list[Path]:
+    return [state_dir / filename for filename in PRIVATE_STATE_FILENAMES]
+
+
+def ensure_private_state_permissions(state_dir: Path) -> None:
+    if state_dir.exists():
+        state_dir.chmod(PRIVATE_DIR_MODE)
+    for path in private_state_paths(state_dir):
+        if path.exists():
+            path.chmod(PRIVATE_FILE_MODE)
+
+
+def permission_issues(state_dir: Path) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    resolved = state_dir.expanduser().resolve(strict=False)
+    for path in private_state_paths(resolved):
+        if not path.exists():
+            continue
+        mode = path.stat().st_mode & 0o777
+        if mode != PRIVATE_FILE_MODE:
+            issues.append(
+                {
+                    "path": str(path),
+                    "mode": f"{mode:04o}",
+                    "expected_mode": f"{PRIVATE_FILE_MODE:04o}",
+                }
+            )
+    return issues
+
+
+def precreate_private_file(path: Path) -> None:
+    if path.exists():
+        path.chmod(PRIVATE_FILE_MODE)
+        return
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, PRIVATE_FILE_MODE)
+    except FileExistsError:
+        path.chmod(PRIVATE_FILE_MODE)
+        return
+    os.close(fd)
 
 
 def connect_state(state_dir: Path) -> sqlite3.Connection:
@@ -19,6 +72,10 @@ def connect_state(state_dir: Path) -> sqlite3.Connection:
 
 def connect_state_with_migrations(state_dir: Path) -> tuple[sqlite3.Connection, list[int]]:
     state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.chmod(PRIVATE_DIR_MODE)
+    precreate_private_file(state_dir / STATE_DB)
+    precreate_private_file(state_dir / f"{STATE_DB}-wal")
+    precreate_private_file(state_dir / f"{STATE_DB}-shm")
     deadline = time.monotonic() + 10.0
     while True:
         conn = sqlite3.connect(state_dir / STATE_DB, timeout=10.0)
@@ -28,6 +85,7 @@ def connect_state_with_migrations(state_dir: Path) -> tuple[sqlite3.Connection, 
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("PRAGMA journal_mode = WAL")
             applied = migrate(conn)
+            ensure_private_state_permissions(state_dir)
             return conn, applied
         except sqlite3.OperationalError as exc:
             conn.close()
@@ -45,6 +103,7 @@ def migration_status(state_dir: Path) -> dict[str, Any]:
             "database_exists": False,
             "schema_migrations": [],
             "pending_migrations": list(range(1, SCHEMA_VERSION + 1)),
+            "permission_issues": permission_issues(resolved),
         }
     uri = f"file:{db_path.as_posix()}?mode=ro"
     with sqlite3.connect(uri, uri=True) as conn:
@@ -65,6 +124,55 @@ def migration_status(state_dir: Path) -> dict[str, Any]:
         "database_exists": True,
         "schema_migrations": migrations,
         "pending_migrations": pending,
+        "permission_issues": permission_issues(resolved),
+    }
+
+
+def activation_history(state_dir: Path, *, limit: int) -> dict[str, Any]:
+    if limit < 1 or limit > 100:
+        raise SafetyError("activation history limit must be between 1 and 100")
+    resolved = state_dir.expanduser().resolve(strict=False)
+    status = migration_status(resolved)
+    if not status["database_exists"]:
+        return {
+            "ok": True,
+            "state_dir": str(resolved),
+            "state_write": False,
+            "network_action": False,
+            "limit": limit,
+            "activations": [],
+            "permission_issues": status["permission_issues"],
+        }
+    uri = f"file:{(resolved / STATE_DB).as_posix()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'service_activations'"
+        ).fetchone()
+        if table_exists is None:
+            rows: list[sqlite3.Row] = []
+        else:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT id, service_type, service_name, expected_owner_did,
+                           observed_owner_did, activation_status, request_timestamp,
+                           response_status, nonce_used, failure_classification
+                    FROM service_activations
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+            )
+    return {
+        "ok": True,
+        "state_dir": str(resolved),
+        "state_write": False,
+        "network_action": False,
+        "limit": limit,
+        "activations": [dict(row) for row in rows],
+        "permission_issues": status["permission_issues"],
     }
 
 
