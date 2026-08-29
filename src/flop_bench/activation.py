@@ -21,7 +21,7 @@ from .exceptions import SafetyError
 from .identity import b64u, is_valid_ed25519_did, load_production_identity_key
 from .ledger import append_record
 from .redaction import redact
-from .state import connect_state, record_service_activation
+from .state import connect_state, record_service_activation, update_service_activation
 
 TECHNOCORE_ORIGIN = "https://technocore.chat"
 USER_AGENT = "flop-bench/0.2-phase-b"
@@ -39,6 +39,19 @@ class TransportResponse:
     body: bytes
     headers: dict[str, str]
     final_url: str | None = None
+
+
+class ActivationRequestError(SafetyError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_classification: str,
+        response: TransportResponse | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.failure_classification = failure_classification
+        self.response = response
 
 
 class ActivationTransport(Protocol):
@@ -98,11 +111,36 @@ class UrlLibActivationTransport:
             status = int(exc.code)
             response_headers = dict(exc.headers.items())
         except (TimeoutError, urllib.error.URLError) as exc:
-            raise SafetyError("Technocore request timed out or failed before verification") from exc
+            reason = getattr(exc, "reason", None)
+            classification = "connectivity_failure" if reason is not None else "timeout"
+            raise ActivationRequestError(
+                "Technocore request timed out or failed before verification",
+                failure_classification=classification,
+            ) from exc
         if final_url and final_url != url:
-            raise SafetyError("Technocore redirect refused")
+            response = TransportResponse(
+                status=status,
+                body=raw,
+                headers=response_headers,
+                final_url=final_url,
+            )
+            raise ActivationRequestError(
+                "Technocore redirect refused",
+                failure_classification="redirect_rejected",
+                response=response,
+            )
         if len(raw) > MAX_RESPONSE_BYTES:
-            raise SafetyError("Technocore response exceeded local safety limit")
+            response = TransportResponse(
+                status=status,
+                body=raw[:MAX_RESPONSE_BYTES],
+                headers=response_headers,
+                final_url=final_url,
+            )
+            raise ActivationRequestError(
+                "Technocore response exceeded local safety limit",
+                failure_classification="oversized_response",
+                response=response,
+            )
         return TransportResponse(
             status=status,
             body=raw,
@@ -180,7 +218,10 @@ def parse_owner_note(raw: bytes | None) -> str | None:
         return next(iter(candidates))
     if not candidates:
         return None
-    raise SafetyError("ownership response contained multiple valid DIDs")
+    raise ActivationRequestError(
+        "ownership response contained multiple valid DIDs",
+        failure_classification="malformed_response",
+    )
 
 
 def response_hash(response: TransportResponse) -> str:
@@ -201,9 +242,17 @@ def request_text(
         timeout=timeout,
     )
     if response.final_url and response.final_url != url:
-        raise SafetyError("Technocore redirect refused")
+        raise ActivationRequestError(
+            "Technocore redirect refused",
+            failure_classification="redirect_rejected",
+            response=response,
+        )
     if len(response.body) > MAX_RESPONSE_BYTES:
-        raise SafetyError("Technocore response exceeded local safety limit")
+        raise ActivationRequestError(
+            "Technocore response exceeded local safety limit",
+            failure_classification="oversized_response",
+            response=response,
+        )
     return response
 
 
@@ -218,8 +267,17 @@ def get_note(
     if response.status == 404:
         return None, response
     if response.status != 200:
-        raise SafetyError(f"Technocore status check failed: HTTP {response.status}")
-    return parse_owner_note(response.body), response
+        raise ActivationRequestError(
+            f"Technocore status check failed: HTTP {response.status}",
+            failure_classification=classify_preflight_failure(response.status),
+            response=response,
+        )
+    try:
+        return parse_owner_note(response.body), response
+    except ActivationRequestError as exc:
+        if exc.response is None:
+            exc.response = response
+        raise
 
 
 def get_nonce(
@@ -232,7 +290,11 @@ def get_nonce(
     if response.status == 404:
         return 0, response
     if response.status != 200:
-        raise SafetyError(f"Technocore nonce check failed: HTTP {response.status}")
+        raise ActivationRequestError(
+            f"Technocore nonce check failed: HTTP {response.status}",
+            failure_classification="nonce_acquisition_failure",
+            response=response,
+        )
     digits = "".join(ch for ch in response.body.decode("utf-8", errors="replace") if ch.isdigit())
     return (int(digits) if digits else 0), response
 
@@ -257,9 +319,38 @@ def activation_status_for_existing(observed_owner: str | None, expected_owner: s
     return "name-conflict"
 
 
-def record_activation_audit(
+def classify_preflight_failure(status: int) -> str:
+    if status in {408, 429} or 500 <= status <= 599:
+        return "remote_unavailable"
+    return "preflight_rejected"
+
+
+def start_activation_audit(
     state_dir: Path,
     *,
+    service_type: str,
+    service_name: str,
+    expected_owner_did: str,
+) -> int:
+    with connect_state(state_dir) as conn:
+        return record_service_activation(
+            conn,
+            service_type=service_type,
+            service_name=service_name,
+            expected_owner_did=expected_owner_did,
+            observed_owner_did=None,
+            activation_status="started",
+            response_status=None,
+            nonce_used=None,
+            response_hash=None,
+            failure_classification=None,
+        )
+
+
+def update_activation_audit(
+    state_dir: Path,
+    *,
+    activation_id: int,
     service_type: str,
     service_name: str,
     expected_owner_did: str,
@@ -271,11 +362,9 @@ def record_activation_audit(
     failure_classification: str | None,
 ) -> None:
     with connect_state(state_dir) as conn:
-        record_service_activation(
+        update_service_activation(
             conn,
-            service_type=service_type,
-            service_name=service_name,
-            expected_owner_did=expected_owner_did,
+            activation_id=activation_id,
             observed_owner_did=observed_owner_did,
             activation_status=activation_status,
             response_status=response_status,
@@ -300,16 +389,20 @@ def record_activation_audit(
     )
 
 
+def safe_response_hash(response: TransportResponse | None) -> str | None:
+    if response is None:
+        return None
+    if len(response.body) > MAX_RESPONSE_BYTES:
+        return None
+    return response_hash(response)
+
+
 def classify_write_failure(status: int) -> str:
-    if status == 409:
-        return "name-conflict"
-    if status == 422:
-        return "duplicate-or-invalid"
     if status == 429:
-        return "rate-limited"
+        return "remote_unavailable"
     if 500 <= status <= 599:
-        return "server-error"
-    return "write-failed"
+        return "remote_unavailable"
+    return "creation_rejection"
 
 
 def create_service(
@@ -341,11 +434,49 @@ def create_service(
         expected_state_dir=expected_state_dir,
         expected_did=expected_bench_did,
     )
-    observed, read_response = get_note(transport, namespace, service_name)
+    activation_id = start_activation_audit(
+        resolved_state,
+        service_type=service_type,
+        service_name=service_name,
+        expected_owner_did=expected_bench_did,
+    )
+    try:
+        observed, read_response = get_note(transport, namespace, service_name)
+    except ActivationRequestError as exc:
+        update_activation_audit(
+            resolved_state,
+            activation_id=activation_id,
+            service_type=service_type,
+            service_name=service_name,
+            expected_owner_did=expected_bench_did,
+            observed_owner_did=None,
+            activation_status="failed_preflight",
+            response_status=exc.response.status if exc.response else None,
+            nonce_used=None,
+            response_body_hash=safe_response_hash(exc.response),
+            failure_classification=exc.failure_classification,
+        )
+        raise
+    except Exception as exc:
+        update_activation_audit(
+            resolved_state,
+            activation_id=activation_id,
+            service_type=service_type,
+            service_name=service_name,
+            expected_owner_did=expected_bench_did,
+            observed_owner_did=None,
+            activation_status="failed",
+            response_status=None,
+            nonce_used=None,
+            response_body_hash=None,
+            failure_classification="unexpected_local_failure",
+        )
+        raise SafetyError("unexpected local activation failure") from exc
     existing = activation_status_for_existing(observed, expected_bench_did)
     if existing == "already-owned":
-        record_activation_audit(
+        update_activation_audit(
             resolved_state,
+            activation_id=activation_id,
             service_type=service_type,
             service_name=service_name,
             expected_owner_did=expected_bench_did,
@@ -358,25 +489,73 @@ def create_service(
         )
         return {"ok": True, "status": existing, "service": service_name, "owner": observed}
     if existing == "name-conflict":
-        record_activation_audit(
+        update_activation_audit(
             resolved_state,
+            activation_id=activation_id,
             service_type=service_type,
             service_name=service_name,
             expected_owner_did=expected_bench_did,
             observed_owner_did=observed,
-            activation_status=existing,
+            activation_status="failed",
             response_status=read_response.status,
             nonce_used=None,
             response_body_hash=response_hash(read_response),
-            failure_classification="foreign-owner",
+            failure_classification="foreign_owner",
         )
         raise SafetyError(f"{service_name} is already owned by another DID")
-    nonce_base, _nonce_response = get_nonce(transport, service_name)
+    try:
+        nonce_base, _nonce_response = get_nonce(transport, service_name)
+    except ActivationRequestError as exc:
+        update_activation_audit(
+            resolved_state,
+            activation_id=activation_id,
+            service_type=service_type,
+            service_name=service_name,
+            expected_owner_did=expected_bench_did,
+            observed_owner_did=observed,
+            activation_status="failed",
+            response_status=exc.response.status if exc.response else None,
+            nonce_used=None,
+            response_body_hash=safe_response_hash(exc.response),
+            failure_classification="nonce_acquisition_failure",
+        )
+        raise
+    except Exception as exc:
+        update_activation_audit(
+            resolved_state,
+            activation_id=activation_id,
+            service_type=service_type,
+            service_name=service_name,
+            expected_owner_did=expected_bench_did,
+            observed_owner_did=observed,
+            activation_status="failed",
+            response_status=None,
+            nonce_used=None,
+            response_body_hash=None,
+            failure_classification="unexpected_local_failure",
+        )
+        raise SafetyError("unexpected local activation failure") from exc
     last_response: TransportResponse | None = None
     for attempt in range(max_attempts):
         nonce = nonce_base + 1 + attempt
-        preimage = signed_note_preimage(namespace, service_name, nonce, expected_bench_did)
-        sig = b64u(key.sign(preimage))
+        try:
+            preimage = signed_note_preimage(namespace, service_name, nonce, expected_bench_did)
+            sig = b64u(key.sign(preimage))
+        except Exception as exc:
+            update_activation_audit(
+                resolved_state,
+                activation_id=activation_id,
+                service_type=service_type,
+                service_name=service_name,
+                expected_owner_did=expected_bench_did,
+                observed_owner_did=observed,
+                activation_status="failed",
+                response_status=None,
+                nonce_used=nonce,
+                response_body_hash=None,
+                failure_classification="signing_failure",
+            )
+            raise SafetyError("Technocore activation signing failed") from exc
         url = signed_note_url(
             namespace,
             service_name,
@@ -385,26 +564,90 @@ def create_service(
             nonce,
             expected_bench_did,
         )
-        response = request_text(transport, "GET", url)
+        try:
+            response = request_text(transport, "GET", url)
+        except ActivationRequestError as exc:
+            update_activation_audit(
+                resolved_state,
+                activation_id=activation_id,
+                service_type=service_type,
+                service_name=service_name,
+                expected_owner_did=expected_bench_did,
+                observed_owner_did=observed,
+                activation_status="failed",
+                response_status=exc.response.status if exc.response else None,
+                nonce_used=nonce,
+                response_body_hash=safe_response_hash(exc.response),
+                failure_classification=exc.failure_classification,
+            )
+            raise
+        except Exception as exc:
+            update_activation_audit(
+                resolved_state,
+                activation_id=activation_id,
+                service_type=service_type,
+                service_name=service_name,
+                expected_owner_did=expected_bench_did,
+                observed_owner_did=observed,
+                activation_status="failed",
+                response_status=None,
+                nonce_used=nonce,
+                response_body_hash=None,
+                failure_classification="unexpected_local_failure",
+            )
+            raise SafetyError("unexpected local activation failure") from exc
         last_response = response
         if response.status in {200, 201, 204}:
-            verified, verify_response = get_note(transport, namespace, service_name)
-            if verified != expected_bench_did:
-                record_activation_audit(
+            try:
+                verified, verify_response = get_note(transport, namespace, service_name)
+            except ActivationRequestError as exc:
+                update_activation_audit(
                     resolved_state,
+                    activation_id=activation_id,
+                    service_type=service_type,
+                    service_name=service_name,
+                    expected_owner_did=expected_bench_did,
+                    observed_owner_did=None,
+                    activation_status="failed",
+                    response_status=exc.response.status if exc.response else None,
+                    nonce_used=nonce,
+                    response_body_hash=safe_response_hash(exc.response),
+                    failure_classification="unverifiable_owner",
+                )
+                raise SafetyError("created service ownership could not be verified") from exc
+            except Exception as exc:
+                update_activation_audit(
+                    resolved_state,
+                    activation_id=activation_id,
+                    service_type=service_type,
+                    service_name=service_name,
+                    expected_owner_did=expected_bench_did,
+                    observed_owner_did=None,
+                    activation_status="failed",
+                    response_status=None,
+                    nonce_used=nonce,
+                    response_body_hash=None,
+                    failure_classification="unexpected_local_failure",
+                )
+                raise SafetyError("unexpected local activation failure") from exc
+            if verified != expected_bench_did:
+                update_activation_audit(
+                    resolved_state,
+                    activation_id=activation_id,
                     service_type=service_type,
                     service_name=service_name,
                     expected_owner_did=expected_bench_did,
                     observed_owner_did=verified,
-                    activation_status="unverifiable",
+                    activation_status="failed",
                     response_status=verify_response.status,
                     nonce_used=nonce,
                     response_body_hash=response_hash(verify_response),
-                    failure_classification="ownership-verification-failed",
+                    failure_classification="unverifiable_owner",
                 )
                 raise SafetyError("created service ownership could not be verified")
-            record_activation_audit(
+            update_activation_audit(
                 resolved_state,
+                activation_id=activation_id,
                 service_type=service_type,
                 service_name=service_name,
                 expected_owner_did=expected_bench_did,
@@ -418,14 +661,77 @@ def create_service(
             return {"ok": True, "status": "created", "service": service_name, "owner": verified}
         if response.status == 429 and attempt < max_attempts - 1:
             backoff_for_429(response, sleep=sleep_on_429)
-            nonce_base, _ = get_nonce(transport, service_name)
+            try:
+                nonce_base, _ = get_nonce(transport, service_name)
+            except ActivationRequestError as exc:
+                update_activation_audit(
+                    resolved_state,
+                    activation_id=activation_id,
+                    service_type=service_type,
+                    service_name=service_name,
+                    expected_owner_did=expected_bench_did,
+                    observed_owner_did=observed,
+                    activation_status="failed",
+                    response_status=exc.response.status if exc.response else None,
+                    nonce_used=nonce,
+                    response_body_hash=safe_response_hash(exc.response),
+                    failure_classification="nonce_acquisition_failure",
+                )
+                raise
+            except Exception as exc:
+                update_activation_audit(
+                    resolved_state,
+                    activation_id=activation_id,
+                    service_type=service_type,
+                    service_name=service_name,
+                    expected_owner_did=expected_bench_did,
+                    observed_owner_did=observed,
+                    activation_status="failed",
+                    response_status=None,
+                    nonce_used=nonce,
+                    response_body_hash=None,
+                    failure_classification="unexpected_local_failure",
+                )
+                raise SafetyError("unexpected local activation failure") from exc
             continue
         if response.status in {409, 422} and attempt < max_attempts - 1:
-            nonce_base, _ = get_nonce(transport, service_name)
+            try:
+                nonce_base, _ = get_nonce(transport, service_name)
+            except ActivationRequestError as exc:
+                update_activation_audit(
+                    resolved_state,
+                    activation_id=activation_id,
+                    service_type=service_type,
+                    service_name=service_name,
+                    expected_owner_did=expected_bench_did,
+                    observed_owner_did=observed,
+                    activation_status="failed",
+                    response_status=exc.response.status if exc.response else None,
+                    nonce_used=nonce,
+                    response_body_hash=safe_response_hash(exc.response),
+                    failure_classification="nonce_acquisition_failure",
+                )
+                raise
+            except Exception as exc:
+                update_activation_audit(
+                    resolved_state,
+                    activation_id=activation_id,
+                    service_type=service_type,
+                    service_name=service_name,
+                    expected_owner_did=expected_bench_did,
+                    observed_owner_did=observed,
+                    activation_status="failed",
+                    response_status=None,
+                    nonce_used=nonce,
+                    response_body_hash=None,
+                    failure_classification="unexpected_local_failure",
+                )
+                raise SafetyError("unexpected local activation failure") from exc
             continue
         failure = classify_write_failure(response.status)
-        record_activation_audit(
+        update_activation_audit(
             resolved_state,
+            activation_id=activation_id,
             service_type=service_type,
             service_name=service_name,
             expected_owner_did=expected_bench_did,
@@ -439,6 +745,19 @@ def create_service(
         body = response.body.decode("utf-8", errors="replace")
         raise SafetyError(f"Technocore activation failed: {failure}: {redact(body, 512)}")
     status = last_response.status if last_response else None
+    update_activation_audit(
+        resolved_state,
+        activation_id=activation_id,
+        service_type=service_type,
+        service_name=service_name,
+        expected_owner_did=expected_bench_did,
+        observed_owner_did=observed,
+        activation_status="failed",
+        response_status=status,
+        nonce_used=None,
+        response_body_hash=safe_response_hash(last_response),
+        failure_classification="creation_rejection",
+    )
     raise SafetyError(f"Technocore activation failed after bounded retries: {status}")
 
 
