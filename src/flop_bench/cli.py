@@ -6,6 +6,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .activation import (
+    CREATE_MAILBOX_CONFIRMATION,
+    CREATE_ROOM_CONFIRMATION,
+    UrlLibActivationTransport,
+    create_mailbox,
+    create_room,
+    technocore_status,
+)
 from .config import BenchConfig, assert_isolated, isolation_boundaries
 from .engine import router_export, verify_spec
 from .exceptions import FlopBenchError, IsolationError, LedgerError, SafetyError, ValidationError
@@ -26,7 +34,7 @@ from .service import (
     service_doctor,
     verify_request,
 )
-from .state import connect_state
+from .state import connect_state_with_migrations
 
 
 def _print_json(value: Any) -> None:
@@ -35,9 +43,17 @@ def _print_json(value: Any) -> None:
 
 def doctor(state_dir: Path) -> dict[str, Any]:
     assert_isolated(BenchConfig(state_dir=state_dir))
-    with connect_state(state_dir) as conn:
+    conn, migrations_applied = connect_state_with_migrations(state_dir)
+    with conn:
         migrations = [row[0] for row in conn.execute("SELECT version FROM schema_migrations")]
-    return {"ok": True, "state_dir": str(state_dir), "schema_migrations": migrations}
+    return {
+        "ok": True,
+        "state_dir": str(state_dir.expanduser().resolve(strict=False)),
+        "schema_migrations": migrations,
+        "state_write": True,
+        "migrations_applied": migrations_applied,
+        "network_action": False,
+    }
 
 
 def isolation_report(config: BenchConfig) -> dict[str, Any]:
@@ -62,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     service_sub = service.add_subparsers(dest="service_cmd", required=True)
     service_doctor_cmd = service_sub.add_parser("doctor")
     service_doctor_cmd.add_argument("--state-dir", required=True, type=Path)
+    service_doctor_cmd.add_argument("--read-only", action="store_true")
     request = sub.add_parser("request")
     request_sub = request.add_subparsers(dest="request_cmd", required=True)
     request_verify = request_sub.add_parser("verify")
@@ -82,6 +99,18 @@ def build_parser() -> argparse.ArgumentParser:
     dry_run = technocore_sub.add_parser("dry-run-sign")
     dry_run.add_argument("payload", type=Path)
     dry_run.add_argument("--state-dir", required=True, type=Path)
+    create_room_cmd = technocore_sub.add_parser("create-room")
+    create_room_cmd.add_argument("--state-dir", required=True, type=Path)
+    create_room_cmd.add_argument("--live", action="store_true")
+    create_room_cmd.add_argument("--confirm", required=True, choices=[CREATE_ROOM_CONFIRMATION])
+    create_mailbox_cmd = technocore_sub.add_parser("create-mailbox")
+    create_mailbox_cmd.add_argument("--state-dir", required=True, type=Path)
+    create_mailbox_cmd.add_argument("--live", action="store_true")
+    create_mailbox_cmd.add_argument(
+        "--confirm", required=True, choices=[CREATE_MAILBOX_CONFIRMATION]
+    )
+    status_cmd = technocore_sub.add_parser("status")
+    status_cmd.add_argument("--state-dir", required=True, type=Path)
     ledger = sub.add_parser("ledger")
     ledger_sub = ledger.add_subparsers(dest="ledger_cmd", required=True)
     ledger_verify = ledger_sub.add_parser("verify")
@@ -122,7 +151,7 @@ def run(argv: list[str] | None = None) -> int:
                 )
             )
         elif args.cmd == "service" and args.service_cmd == "doctor":
-            _print_json(service_doctor(state_dir=args.state_dir))
+            _print_json(service_doctor(state_dir=args.state_dir, read_only=args.read_only))
         elif args.cmd == "request" and args.request_cmd == "verify":
             _print_json(verify_request(args.request, state_dir=args.state_dir))
         elif args.cmd == "request" and args.request_cmd == "inspect":
@@ -145,6 +174,32 @@ def run(argv: list[str] | None = None) -> int:
                     args.payload,
                     state_dir=args.state_dir,
                     passphrase=passphrase,
+                )
+            )
+        elif args.cmd == "technocore" and args.technocore_cmd == "create-room":
+            passphrase = read_interactive_existing_passphrase()
+            _print_json(
+                create_room(
+                    live=args.live,
+                    confirm=args.confirm,
+                    state_dir=args.state_dir,
+                    passphrase=passphrase,
+                    transport=UrlLibActivationTransport(),
+                )
+            )
+        elif args.cmd == "technocore" and args.technocore_cmd == "create-mailbox":
+            _print_json(
+                create_mailbox(
+                    live=args.live,
+                    confirm=args.confirm,
+                    state_dir=args.state_dir,
+                )
+            )
+        elif args.cmd == "technocore" and args.technocore_cmd == "status":
+            _print_json(
+                technocore_status(
+                    state_dir=args.state_dir,
+                    transport=UrlLibActivationTransport(),
                 )
             )
         elif args.cmd == "ledger" and args.ledger_cmd == "verify":

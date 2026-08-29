@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
+import urllib.parse
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -16,6 +18,19 @@ from jsonschema import Draft202012Validator
 
 from flop_bench import config as config_mod
 from flop_bench import engine
+from flop_bench.activation import (
+    CREATE_MAILBOX_CONFIRMATION,
+    CREATE_ROOM_CONFIRMATION,
+    MAX_RESPONSE_BYTES,
+    TECHNOCORE_ORIGIN,
+    TransportResponse,
+    create_mailbox,
+    create_room,
+    request_text,
+    room_owner_claim_preimage,
+    technocore_status,
+    validate_origin,
+)
 from flop_bench.adapters import run_local_command_step
 from flop_bench.config import (
     BENCH_DID,
@@ -54,11 +69,13 @@ from flop_bench.schemas import (
 from flop_bench.service import (
     dry_run_sign_payload,
     inspect_request,
+    plan_init,
     prepare_signed_response,
+    service_doctor,
     verify_request,
     verify_signed_response,
 )
-from flop_bench.state import connect_state
+from flop_bench.state import connect_state, migration_status
 from flop_bench.transport import DisabledTechnocoreTransport
 
 REPO = Path(__file__).resolve().parents[1]
@@ -95,6 +112,73 @@ def different_test_phrase() -> str:
 
 def weak_test_phrase() -> str:
     return "".join(["we", "ak"])
+
+
+class FakeActivationTransport:
+    def __init__(self) -> None:
+        self.notes: dict[tuple[str, str], str] = {}
+        self.nonces: dict[str, int] = {}
+        self.write_statuses: list[int] = []
+        self.requests: list[tuple[str, str]] = []
+        self.redirect_url: str | None = None
+        self.oversized = False
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float = 20.0,
+    ) -> TransportResponse:
+        del body, timeout
+        validate_origin(url)
+        assert headers is not None
+        assert headers["User-Agent"].startswith("flop-bench/")
+        self.requests.append((method, url))
+        if self.redirect_url is not None:
+            return TransportResponse(200, b"redirected", {}, final_url=self.redirect_url)
+        if self.oversized:
+            return TransportResponse(200, b"x" * (MAX_RESPONSE_BYTES + 1), {}, final_url=url)
+        parsed = urllib.parse.urlparse(url)
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) >= 3 and parts[0] == "kv":
+            namespace = urllib.parse.unquote(parts[1])
+            key = urllib.parse.unquote(parts[2])
+            if len(parts) == 3:
+                if namespace == "room-nonce":
+                    return TransportResponse(
+                        200,
+                        str(self.nonces.get(key, 0)).encode(),
+                        {},
+                        final_url=url,
+                    )
+                value = self.notes.get((namespace, key))
+                if value is None:
+                    return TransportResponse(404, b"", {}, final_url=url)
+                return TransportResponse(200, value.encode(), {}, final_url=url)
+            if len(parts) >= 8 and parts[3] == "set-signed":
+                status = self.write_statuses.pop(0) if self.write_statuses else 200
+                if status in {200, 201, 204}:
+                    self.notes[(namespace, key)] = urllib.parse.unquote(parts[7])
+                    self.nonces[key] = max(self.nonces.get(key, 0), int(parts[6]))
+                headers = {"Retry-After": "2"} if status == 429 else {}
+                return TransportResponse(status, b"duplicate token=abc123", headers, final_url=url)
+        return TransportResponse(400, b"bad request", {}, final_url=url)
+
+
+def temp_production_identity(tmp_path: Path) -> tuple[Path, str, str]:
+    state = tmp_path / "bench-identity"
+    passphrase = strong_test_phrase()
+    metadata = create_production_identity(
+        state_dir=state,
+        confirm=IDENTITY_CONFIRMATION,
+        passphrase=passphrase,
+        passphrase_confirmation=passphrase,
+        expected_state_dir=state,
+    )
+    return state, passphrase, str(metadata["did"])
 
 
 def signed_request(
@@ -979,6 +1063,329 @@ def test_dry_run_sign_and_protocol_error_redaction(tmp_path: Path) -> None:
     assert "abc123" not in parsed["body"]
 
 
+def test_activation_live_gate_refusals(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    transport = FakeActivationTransport()
+    with pytest.raises(SafetyError):
+        create_room(
+            live=False,
+            confirm=CREATE_ROOM_CONFIRMATION,
+            state_dir=state,
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    with pytest.raises(SafetyError):
+        create_room(
+            live=True,
+            confirm="WRONG",
+            state_dir=state,
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    with pytest.raises(SafetyError):
+        create_room(
+            live=True,
+            confirm=CREATE_ROOM_CONFIRMATION,
+            state_dir=tmp_path / "wrong-state",
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    with pytest.raises(SafetyError):
+        create_room(
+            live=True,
+            confirm=CREATE_ROOM_CONFIRMATION,
+            state_dir=state,
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=BENCH_DID,
+        )
+    assert transport.requests == []
+
+
+def test_room_activation_uses_scout_owner_preimage_and_endpoint(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    transport = FakeActivationTransport()
+    assert room_owner_claim_preimage("d-flop-bench", 42, did) == (
+        f"room-owners|d-flop-bench|42|{did}".encode()
+    )
+    create_room(
+        live=True,
+        confirm=CREATE_ROOM_CONFIRMATION,
+        state_dir=state,
+        passphrase=passphrase,
+        transport=transport,
+        expected_state_dir=state,
+        expected_bench_did=did,
+        sleep_on_429=False,
+    )
+    write_urls = [url for _method, url in transport.requests if "set-signed" in url]
+    assert len(write_urls) == 1
+    parsed = urllib.parse.urlparse(write_urls[0])
+    parts = parsed.path.strip("/").split("/")
+    assert [urllib.parse.unquote(part) for part in parts[:4]] == [
+        "kv",
+        "room-owners",
+        "d-flop-bench",
+        "set-signed",
+    ]
+    assert urllib.parse.parse_qs(parsed.query) == {"if_absent": ["1"]}
+
+
+def test_activation_origin_redirect_timeout_and_size_safety(tmp_path: Path) -> None:
+    transport = FakeActivationTransport()
+    with pytest.raises(SafetyError):
+        validate_origin("http://technocore.chat/kv/room-owners/d-flop-bench")
+    with pytest.raises(SafetyError):
+        validate_origin("https://evil.example/kv/room-owners/d-flop-bench")
+    transport.redirect_url = "https://technocore.chat/other"
+    with pytest.raises(SafetyError):
+        request_text(transport, "GET", f"{TECHNOCORE_ORIGIN}/kv/room-owners/d-flop-bench")
+    transport.redirect_url = None
+    transport.oversized = True
+    with pytest.raises(SafetyError):
+        request_text(transport, "GET", f"{TECHNOCORE_ORIGIN}/kv/room-owners/d-flop-bench")
+
+    class TimeoutTransport(FakeActivationTransport):
+        def request(self, *args: object, **kwargs: object) -> TransportResponse:
+            raise SafetyError("Technocore request timed out")
+
+    with pytest.raises(SafetyError):
+        request_text(
+            TimeoutTransport(),
+            "GET",
+            f"{TECHNOCORE_ORIGIN}/kv/room-owners/d-flop-bench",
+        )
+
+
+def test_successful_room_creation_with_audit(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    transport = FakeActivationTransport()
+    transport.nonces["d-flop-bench"] = 41
+    room = create_room(
+        live=True,
+        confirm=CREATE_ROOM_CONFIRMATION,
+        state_dir=state,
+        passphrase=passphrase,
+        transport=transport,
+        expected_state_dir=state,
+        expected_bench_did=did,
+        sleep_on_429=False,
+    )
+    assert room["status"] == "created"
+    with connect_state(state) as conn:
+        rows = conn.execute("SELECT * FROM service_activations").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["service_type"] == "room"
+    stored = json.dumps([dict(row) for row in rows], sort_keys=True)
+    assert passphrase not in stored
+    assert "signature" not in stored
+    assert (state / "ledger.jsonl").exists()
+
+
+def test_mailbox_creation_fails_closed_before_transport_signing_or_state(tmp_path: Path) -> None:
+    class ExplodingTransport(FakeActivationTransport):
+        def request(self, *args: object, **kwargs: object) -> TransportResponse:
+            raise AssertionError("mailbox transport must not be invoked")
+
+    state = tmp_path / "missing-state"
+    with pytest.raises(SafetyError) as exc:
+        create_mailbox(
+            live=True,
+            confirm=CREATE_MAILBOX_CONFIRMATION,
+            state_dir=state,
+            transport=ExplodingTransport(),
+            expected_state_dir=state,
+            expected_bench_did=public_did(Ed25519PrivateKey.generate()),
+            sleep_on_429=False,
+        )
+    assert "PROTOCOL_UNCONFIRMED" in str(exc.value)
+    assert not state.exists()
+
+
+def test_existing_owned_foreign_owned_and_unverifiable_activation(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    transport = FakeActivationTransport()
+    transport.notes[("room-owners", "d-flop-bench")] = did
+    already = create_room(
+        live=True,
+        confirm=CREATE_ROOM_CONFIRMATION,
+        state_dir=state,
+        passphrase=passphrase,
+        transport=transport,
+        expected_state_dir=state,
+        expected_bench_did=did,
+    )
+    assert already["status"] == "already-owned"
+    foreign = FakeActivationTransport()
+    foreign.notes[("room-owners", "d-flop-bench")] = public_did(Ed25519PrivateKey.generate())
+    with pytest.raises(SafetyError):
+        create_room(
+            live=True,
+            confirm=CREATE_ROOM_CONFIRMATION,
+            state_dir=state,
+            passphrase=passphrase,
+            transport=foreign,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    unverifiable = FakeActivationTransport()
+    original_request = unverifiable.request
+
+    def lose_verified_owner(*args: object, **kwargs: object) -> TransportResponse:
+        response = original_request(*args, **kwargs)
+        if len(unverifiable.requests) >= 4 and args[0] == "GET":
+            return TransportResponse(404, b"", {}, final_url=str(args[1]))
+        return response
+
+    unverifiable.request = lose_verified_owner  # type: ignore[method-assign]
+    with pytest.raises(SafetyError):
+        create_room(
+            live=True,
+            confirm=CREATE_ROOM_CONFIRMATION,
+            state_dir=state,
+            passphrase=passphrase,
+            transport=unverifiable,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+
+
+def test_activation_http_status_retry_nonce_and_redaction(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    transport = FakeActivationTransport()
+    transport.nonces["d-flop-bench"] = 10
+    transport.write_statuses = [409, 422, 200]
+    created = create_room(
+        live=True,
+        confirm=CREATE_ROOM_CONFIRMATION,
+        state_dir=state,
+        passphrase=passphrase,
+        transport=transport,
+        expected_state_dir=state,
+        expected_bench_did=did,
+        sleep_on_429=False,
+    )
+    assert created["status"] == "created"
+    write_urls = [url for _method, url in transport.requests if "set-signed" in url]
+    assert len(write_urls) == 3
+    assert "/11/" in write_urls[0]
+    assert "/12/" in write_urls[1]
+    assert "/13/" in write_urls[2]
+    rate_limited = FakeActivationTransport()
+    rate_limited.write_statuses = [429, 200]
+    create_room(
+        live=True,
+        confirm=CREATE_ROOM_CONFIRMATION,
+        state_dir=state,
+        passphrase=passphrase,
+        transport=rate_limited,
+        expected_state_dir=state,
+        expected_bench_did=did,
+        sleep_on_429=False,
+    )
+    failing = FakeActivationTransport()
+    failing.write_statuses = [422, 422, 422]
+    with pytest.raises(SafetyError) as exc:
+        create_room(
+            live=True,
+            confirm=CREATE_ROOM_CONFIRMATION,
+            state_dir=state,
+            passphrase=passphrase,
+            transport=failing,
+            expected_state_dir=state,
+            expected_bench_did=did,
+            sleep_on_429=False,
+        )
+    message = str(exc.value)
+    assert "abc123" not in message
+    assert "duplicate-or-invalid" in message
+
+
+def test_status_and_dry_run_do_not_invoke_network(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    plan = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "technocore",
+            "plan-init",
+            "--state-dir",
+            str(state),
+        ],
+        cwd=REPO,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert plan.returncode == 0
+    parsed_plan = json.loads(plan.stdout)
+    assert parsed_plan["network_action"] is False
+    assert parsed_plan["state_write"] is False
+    mailbox_action = [
+        action for action in parsed_plan["planned_actions"] if action["action"] == "create-mailbox"
+    ][0]
+    assert mailbox_action["will_execute"] is False
+    assert mailbox_action["protocol_status"] == "unconfirmed"
+    transport = FakeActivationTransport()
+    status = technocore_status(state_dir=state, transport=transport)
+    assert status["room"]["status"] == "unclaimed"
+    assert status["mailbox"]["status"] == "unknown"
+    assert status["mailbox"]["protocol_status"] == "unconfirmed"
+    assert all("mailbox-owners" not in url for _method, url in transport.requests)
+
+
+def test_service_doctor_read_only_does_not_create_or_migrate_state(tmp_path: Path) -> None:
+    state = tmp_path / "missing-state"
+    report = service_doctor(state_dir=state, read_only=True)
+    assert report["read_only"] is True
+    assert report["state_write"] is False
+    assert report["state_dir_exists"] is False
+    assert report["database_exists"] is False
+    assert report["schema_migrations"] == []
+    assert report["pending_migrations"] == [1, 2, 3]
+    assert not state.exists()
+
+
+def test_service_doctor_reports_migrations_applied_and_plan_is_read_only(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    report = service_doctor(state_dir=state)
+    assert report["read_only"] is False
+    assert report["state_write"] is True
+    assert report["migrations_applied"] == [1, 2, 3]
+    assert report["schema_migrations"] == [1, 2, 3]
+    status = migration_status(state)
+    assert status["pending_migrations"] == []
+    plan = plan_init(state_dir=state)
+    assert plan["state_write"] is False
+    assert plan["migrations_applied"] == []
+
+
+def test_service_doctor_read_only_reports_outdated_state_without_migrating(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    with sqlite3.connect(state / "state.sqlite") as conn:
+        conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO schema_migrations(version) VALUES (1)")
+    read_only = service_doctor(state_dir=state, read_only=True)
+    assert read_only["state_write"] is False
+    assert read_only["schema_migrations"] == [1]
+    assert read_only["pending_migrations"] == [2, 3]
+    after_read_only = migration_status(state)
+    assert after_read_only["schema_migrations"] == [1]
+    normal = service_doctor(state_dir=state)
+    assert normal["state_write"] is True
+    assert normal["migrations_applied"] == [2, 3]
+    assert normal["schema_migrations"] == [1, 2, 3]
+
+
 def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
     target = tmp_path / "data.txt"
     target.write_text("ok", encoding="utf-8")
@@ -998,6 +1405,16 @@ def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
         [sys.executable, "-m", "flop_bench.cli", "validate-spec", str(spec_path)],
         [sys.executable, "-m", "flop_bench.cli", "doctor", "--state-dir", str(state)],
         [sys.executable, "-m", "flop_bench.cli", "service", "doctor", "--state-dir", str(state)],
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "service",
+            "doctor",
+            "--state-dir",
+            str(tmp_path / "read-only-missing"),
+            "--read-only",
+        ],
         [sys.executable, "-m", "flop_bench.cli", "isolation-check", "--state-dir", str(state)],
         [
             sys.executable,
@@ -1128,6 +1545,28 @@ def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
         check=False,
     )
     assert dry_run_refusal.returncode == 4
+    mailbox_refusal = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "technocore",
+            "create-mailbox",
+            "--state-dir",
+            str(tmp_path / "no-production-access"),
+            "--live",
+            "--confirm",
+            CREATE_MAILBOX_CONFIRMATION,
+        ],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert mailbox_refusal.returncode == 4
+    assert "PROTOCOL_UNCONFIRMED" in mailbox_refusal.stderr
+    assert not (tmp_path / "read-only-missing").exists()
 
 
 def test_local_command_spec_cannot_enable_permission(tmp_path: Path) -> None:

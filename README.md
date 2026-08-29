@@ -1,8 +1,8 @@
-# FLOP Bench v0.2 Phase A
+# FLOP Bench v0.2 Phase B
 
 FLOP Bench is an offline-first testing, reproducibility, verification, and proof-of-work agent for the Technocore/FLOP ecosystem.
 
-v0.2 Phase A is deliberately local. It can load or verify the encrypted local Bench identity and prepare signed dry-run request/response envelopes, but it does not join rooms, create mailboxes, post outbound messages, fetch URLs, integrate wallets, transfer FLOP, submit Router records, or make live Technocore calls.
+v0.2 Phase B keeps the runtime offline-first by default. It can load or verify the encrypted local Bench identity, prepare signed dry-run request/response envelopes, and run an explicitly confirmed live activation gate for Technocore service ownership. It does not join rooms, post outbound messages, fetch URLs, integrate wallets, transfer FLOP, submit Router records, or execute autonomous Technocore workflows.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ FLOP Bench has four local layers:
 - An optional approved-local command adapter gated only by the human CLI flag `--allow-local-exec`.
 - Local state: portable evidence JSON, an append-only hash-chained JSONL ledger, request replay reservations, and a small SQLite database with migrations.
 
-The intended production state path is `~/.flop_agents/bench/`, but v0.1 write commands require an explicit `--state-dir` so accidental production initialization does not occur.
+The intended production state path is `~/.flop_agents/bench/`, but all write commands require an explicit `--state-dir` so accidental production initialization does not occur.
 
 ## Trust Boundaries
 
@@ -40,7 +40,7 @@ The generated identity is local only:
 - `identity.pem` is an encrypted PKCS#8 Ed25519 private key.
 - `identity.json` contains public metadata only.
 - Creating it does not register Bench with Technocore, create a room or mailbox, activate Bench, post anything, submit Router evidence, create a wallet, or transfer FLOP.
-- If the passphrase is lost, FLOP Bench cannot decrypt the private key. There is no backup or recovery path in v0.1.
+- If the passphrase is lost, FLOP Bench cannot decrypt the private key. There is no backup or recovery path in v0.2.
 
 The passphrase policy is: at least 16 characters and at least three of lowercase, uppercase, digit, and symbol.
 
@@ -85,9 +85,10 @@ Both identity commands require an interactive terminal so the passphrase is ente
 
 ## Dry-Run Service Runtime
 
-Phase A validates signed local request envelopes and prepares signed result envelopes without network I/O.
+Phase B validates signed local request envelopes and prepares signed result envelopes without network I/O.
 
 ```bash
+flop-bench service doctor --state-dir /tmp/flop-bench-state --read-only
 flop-bench service doctor --state-dir /tmp/flop-bench-state
 flop-bench request inspect REQUEST.json --state-dir /tmp/flop-bench-state
 flop-bench request verify REQUEST.json --state-dir /tmp/flop-bench-state
@@ -100,9 +101,30 @@ flop-bench technocore dry-run-sign PAYLOAD.json --state-dir ~/.flop_agents/bench
 
 `response prepare` signs a local evidence response. The deterministic `evidence_id` remains separate from the response timestamp and transport signature. Related-agent results include `independent_evidence = false` and a limitation stating that related-agent validation must not be counted as independent peer reputation.
 
-`technocore plan-init` displays the intended `d-flop-bench` and `mb-flop-bench` setup plan only. It does not create rooms, create mailboxes, post data, or transmit anything.
+`service doctor --read-only` inspects whether the state directory and SQLite database exist and reports pending migrations without creating directories, databases, tables, ledger entries, or migrations. Without `--read-only`, `service doctor` opens the state database and may create or migrate it; its JSON includes `state_write: true` and `migrations_applied`.
 
-Protocol patterns reused from FLOP Scout are Ed25519 `did:key` derivation, base64url Ed25519 signatures, canonical room/mailbox naming, integer nonce handling, and duplicate/error redaction. Bench request/response envelope preimages are Phase A local domain-separated canonical JSON because Scout only establishes Technocore room-post and room-owner preimages.
+`technocore plan-init` displays the intended `d-flop-bench` and `mb-flop-bench` setup plan only. It does not create rooms, create mailboxes, post data, transmit anything, create state, or run migrations. Its JSON includes `state_write: false` and `migrations_applied: []`.
+
+Protocol patterns reused from FLOP Scout are Ed25519 `did:key` derivation, base64url Ed25519 signatures, canonical room/mailbox naming, integer nonce handling, bounded response reads, redirect refusal, duplicate/error redaction, and signed owner-note preimages in the form `namespace|key|nonce|value`. Bench request/response envelope preimages are local domain-separated canonical JSON because Scout only establishes Technocore room-post and room-owner preimages for live posts.
+
+## Controlled Technocore Activation
+
+Live activation is limited to explicit room ownership claims. It requires the encrypted production identity, an interactive passphrase prompt, `--live`, the exact production state path, and the exact room confirmation string:
+
+```bash
+flop-bench technocore create-room \
+  --state-dir ~/.flop_agents/bench \
+  --live \
+  --confirm CREATE-D-FLOP-BENCH
+
+flop-bench technocore status --state-dir ~/.flop_agents/bench
+```
+
+The room activation gate checks current ownership before writing, refuses foreign ownership, retries only bounded nonce/conflict/rate-limit cases, and verifies ownership after a successful write. It records only public audit metadata in SQLite and the local ledger: service name, expected/observed owner DID, status, HTTP status, nonce, response hash, and failure classification. It does not log or store passphrases, private keys, signatures, or response bodies.
+
+Creating the local identity and claiming Technocore room ownership are separate steps. Identity creation alone does not register Bench with Technocore or activate Bench. Room activation does not authorize posting, create a wallet, move FLOP, submit Router records, or enable autonomous network behavior.
+
+The room activation path follows the Scout-verified `room-owners` protocol. Live mailbox creation is disabled with `PROTOCOL_UNCONFIRMED`; `mb-flop-bench` remains in configuration and planning, but FLOP Bench does not ship an inferred mailbox-owner namespace or signing flow.
 
 ## Evidence
 
@@ -116,8 +138,6 @@ Example specs live in `examples/`:
 
 ## Future Integration Points
 
-The Technocore transport is present only as a disabled fail-closed interface for `send`, `post`, `join`, `fetch`, `create-room`, `create-mailbox`, `fetch-URL`, wallet actions, and `transfer`. Agent Router integration starts with `flop-bench router-export EVIDENCE.json`, including common-operator disclosure.
-
-Live activation requires a future reviewed gate. Phase A does not create Technocore services or transmit data.
+Agent Router integration starts with `flop-bench router-export EVIDENCE.json`, including common-operator disclosure. Posting, joining rooms, fetching URLs, wallet actions, FLOP transfers, and autonomous sends remain disabled.
 
 Deletion or replacement of the entire ledger requires an external checkpoint to detect. The local hash chain detects edits, middle deletion, reordering, and broken linkage within the retained ledger.
