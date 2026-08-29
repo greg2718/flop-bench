@@ -1,8 +1,8 @@
-# FLOP Bench v0.1
+# FLOP Bench v0.2 Phase A
 
 FLOP Bench is an offline-first testing, reproducibility, verification, and proof-of-work agent for the Technocore/FLOP ecosystem.
 
-v0.1 is deliberately local. It can create an encrypted local Bench identity only after an explicit provisioning gate, but it does not join rooms, create mailboxes, post outbound messages, fetch URLs, integrate wallets, transfer FLOP, submit Router records, or make Technocore network calls.
+v0.2 Phase A is deliberately local. It can load or verify the encrypted local Bench identity and prepare signed dry-run request/response envelopes, but it does not join rooms, create mailboxes, post outbound messages, fetch URLs, integrate wallets, transfer FLOP, submit Router records, or make live Technocore calls.
 
 ## Architecture
 
@@ -11,13 +11,13 @@ FLOP Bench has four local layers:
 - JSON schemas and typed validation for test specs, evidence bundles, and Agent Router validation exports.
 - Deterministic adapters for passive checks: file existence, SHA-256, UTF-8 containment, JSON path equality, and JSON Schema validation.
 - An optional approved-local command adapter gated only by the human CLI flag `--allow-local-exec`.
-- Local state: portable evidence JSON, an append-only hash-chained JSONL ledger, and a small SQLite database with migrations.
+- Local state: portable evidence JSON, an append-only hash-chained JSONL ledger, request replay reservations, and a small SQLite database with migrations.
 
 The intended production state path is `~/.flop_agents/bench/`, but v0.1 write commands require an explicit `--state-dir` so accidental production initialization does not occur.
 
 ## Trust Boundaries
 
-All remote or agent-supplied content is untrusted data. Specifications cannot grant execution permission. URLs in specifications are rejected rather than fetched or followed. Captured command output is redacted for likely secrets and truncated.
+All remote or agent-supplied content is untrusted data. A valid Ed25519 signature proves control of a key, not trustworthiness, permission, or independence. Specifications cannot grant execution permission. URLs in specifications and request envelopes are inert data and are never fetched or followed automatically. Captured command output is redacted for likely secrets and truncated.
 
 The local command adapter uses `subprocess.run(..., shell=False)` with argv supplied as a JSON array, explicit cwd, timeout, limited environment, captured output, and no shell metacharacter interpretation. FLOP Bench does not claim portable network sandboxing for subprocesses; passive mode is the recommended default.
 
@@ -83,6 +83,27 @@ flop-bench identity verify --state-dir ~/.flop_agents/bench
 
 Both identity commands require an interactive terminal so the passphrase is entered through `getpass`. FLOP Bench never accepts the production passphrase through argv, environment variables, config files, or specs.
 
+## Dry-Run Service Runtime
+
+Phase A validates signed local request envelopes and prepares signed result envelopes without network I/O.
+
+```bash
+flop-bench service doctor --state-dir /tmp/flop-bench-state
+flop-bench request inspect REQUEST.json --state-dir /tmp/flop-bench-state
+flop-bench request verify REQUEST.json --state-dir /tmp/flop-bench-state
+flop-bench response prepare EVIDENCE.json --state-dir ~/.flop_agents/bench
+flop-bench technocore plan-init --state-dir /tmp/flop-bench-state
+flop-bench technocore dry-run-sign PAYLOAD.json --state-dir ~/.flop_agents/bench
+```
+
+`request verify` checks schema, target DID, sender signature, timestamp window, expiration, supported capability, request ID replay, and nonce replay. It reserves accepted request IDs/nonces atomically in SQLite but does not execute a test. Any execution still requires explicit policy approval and the existing `--allow-local-exec` gate.
+
+`response prepare` signs a local evidence response. The deterministic `evidence_id` remains separate from the response timestamp and transport signature. Related-agent results include `independent_evidence = false` and a limitation stating that related-agent validation must not be counted as independent peer reputation.
+
+`technocore plan-init` displays the intended `d-flop-bench` and `mb-flop-bench` setup plan only. It does not create rooms, create mailboxes, post data, or transmit anything.
+
+Protocol patterns reused from FLOP Scout are Ed25519 `did:key` derivation, base64url Ed25519 signatures, canonical room/mailbox naming, integer nonce handling, and duplicate/error redaction. Bench request/response envelope preimages are Phase A local domain-separated canonical JSON because Scout only establishes Technocore room-post and room-owner preimages.
+
 ## Evidence
 
 Evidence bundles are portable JSON. `evidence_id` is derived from canonical substantive inputs and observations, excluding timestamps and ledger linkage, so identical specs and observations produce identical IDs. The ledger hash chain records `previous_ledger_hash` and `record_hash`.
@@ -95,6 +116,8 @@ Example specs live in `examples/`:
 
 ## Future Integration Points
 
-The Technocore transport is present only as a disabled fail-closed interface for `send`, `post`, `join`, `fetch`, and `transfer`. Agent Router integration starts with `flop-bench router-export EVIDENCE.json`, including common-operator disclosure.
+The Technocore transport is present only as a disabled fail-closed interface for `send`, `post`, `join`, `fetch`, `create-room`, `create-mailbox`, `fetch-URL`, wallet actions, and `transfer`. Agent Router integration starts with `flop-bench router-export EVIDENCE.json`, including common-operator disclosure.
+
+Live activation requires a future reviewed gate. Phase A does not create Technocore services or transmit data.
 
 Deletion or replacement of the entire ledger requires an external checkpoint to detect. The local hash chain detects edits, middle deletion, reordering, and broken linkage within the retained ledger.

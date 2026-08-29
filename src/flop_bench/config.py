@@ -10,6 +10,7 @@ from .exceptions import IsolationError
 DEFAULT_PRODUCTION_STATE = Path.home() / ".flop_agents" / "bench"
 CANONICAL_ROOM = "d-flop-bench"
 MAILBOX = "mb-flop-bench"
+BENCH_DID = "did:key:z6MkqqqEMxujBTEAvoanSx6pVBMMZzLP7gMUcmNVdYHS3BVk"
 
 SCOUT_STATE = Path.home() / ".flop_agents" / "scout"
 LEGACY_SCOUT_STATE = Path.home() / ".flop_scout"
