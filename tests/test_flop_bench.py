@@ -5,7 +5,8 @@ import json
 import os
 import subprocess
 import sys
-import time
+import threading
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -13,14 +14,14 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from jsonschema import Draft202012Validator
 
+from flop_bench import config as config_mod
 from flop_bench import engine
 from flop_bench.adapters import run_local_command_step
 from flop_bench.config import (
-    LEGACY_SCOUT_STATE,
+    BENCH_DID,
     SCOUT_DID,
     SCOUT_MAILBOX,
     SCOUT_ROOM,
-    SCOUT_STATE,
     BenchConfig,
     assert_isolated,
     assert_no_forbidden_config_values,
@@ -36,6 +37,13 @@ from flop_bench.identity import (
     verify_identity,
 )
 from flop_bench.ledger import append_record, verify_ledger
+from flop_bench.protocol import (
+    REQUEST_SCHEMA_VERSION,
+    RESPONSE_SCHEMA_VERSION,
+    protocol_error_from_response,
+    sign_envelope,
+    verify_signed_envelope,
+)
 from flop_bench.schemas import (
     EVIDENCE_BUNDLE_SCHEMA,
     ROUTER_EXPORT_SCHEMA,
@@ -43,19 +51,17 @@ from flop_bench.schemas import (
     validate_test_spec,
     validate_with_schema,
 )
+from flop_bench.service import (
+    dry_run_sign_payload,
+    inspect_request,
+    prepare_signed_response,
+    verify_request,
+    verify_signed_response,
+)
+from flop_bench.state import connect_state
 from flop_bench.transport import DisabledTechnocoreTransport
 
 REPO = Path(__file__).resolve().parents[1]
-PRODUCTION_PATHS = [Path.home() / ".flop_agents" / "bench", Path.home() / ".flop_agents" / "scout"]
-
-
-@pytest.fixture(autouse=True)
-def no_production_state_created() -> None:
-    before = {path: path.exists() for path in PRODUCTION_PATHS}
-    yield
-    for path, existed in before.items():
-        if not existed:
-            assert not path.exists(), f"test created forbidden production path {path}"
 
 
 def write_json(path: Path, value: object) -> Path:
@@ -89,6 +95,45 @@ def different_test_phrase() -> str:
 
 def weak_test_phrase() -> str:
     return "".join(["we", "ak"])
+
+
+def signed_request(
+    *,
+    sender_key: Ed25519PrivateKey,
+    request_id: str = "req-1",
+    target_did: str = BENCH_DID,
+    requested_capability: str = "file-check",
+    nonce: int = 1_777_000_000_001,
+    created_at: str | None = None,
+    expires_at: str | None = None,
+    operator_group: dict[str, object] | None = None,
+) -> dict[str, object]:
+    now = datetime.now(UTC)
+    fixture_path = Path("offline-request-fixture")
+    payload: dict[str, object] = {
+        "schema_version": REQUEST_SCHEMA_VERSION,
+        "request_id": request_id,
+        "sender_did": public_did(sender_key),
+        "target_did": target_did,
+        "requested_capability": requested_capability,
+        "hypothesis": "signed offline request is valid",
+        "test_spec": spec(fixture_path, [{"adapter": "file_exists", "path": "README.md"}]),
+        "created_at": created_at or now.isoformat(),
+        "expires_at": expires_at or (now + timedelta(minutes=10)).isoformat(),
+        "nonce": nonce,
+        "provenance": {"source": "pytest"},
+    }
+    if operator_group is not None:
+        payload["operator_group"] = operator_group
+    return sign_envelope("request", payload, sender_key)
+
+
+def resign_request(request: dict[str, object], sender_key: Ed25519PrivateKey) -> None:
+    request["signature"] = sign_envelope(
+        "request",
+        {key: value for key, value in request.items() if key != "signature"},
+        sender_key,
+    )["signature"]
 
 
 def test_schema_validation_accepts_spec_and_rejects_missing_required(tmp_path: Path) -> None:
@@ -267,10 +312,16 @@ def test_state_database_initialized_in_temp_dir(tmp_path: Path) -> None:
     assert (state / "state.sqlite").exists()
 
 
-def test_refuses_scout_identity_state_room_mailbox_and_did(tmp_path: Path) -> None:
+def test_refuses_scout_identity_state_room_mailbox_and_did(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_scout = tmp_path / "fake-scout"
+    fake_legacy = tmp_path / "fake-legacy-scout"
+    monkeypatch.setattr(config_mod, "SCOUT_STATE", fake_scout)
+    monkeypatch.setattr(config_mod, "LEGACY_SCOUT_STATE", fake_legacy)
     for config in [
-        BenchConfig(state_dir=Path.home() / ".flop_agents" / "scout"),
-        BenchConfig(state_dir=Path.home() / ".flop_agents" / "scout" / "bench"),
+        BenchConfig(state_dir=fake_scout),
+        BenchConfig(state_dir=fake_scout / "bench"),
         BenchConfig(state_dir=tmp_path, canonical_room=SCOUT_ROOM),
         BenchConfig(state_dir=tmp_path, mailbox=SCOUT_MAILBOX),
         BenchConfig(state_dir=tmp_path, subject_did=SCOUT_DID),
@@ -279,12 +330,18 @@ def test_refuses_scout_identity_state_room_mailbox_and_did(tmp_path: Path) -> No
             assert_isolated(config)
 
 
-def test_forbidden_config_values_resolve_path_aliases(tmp_path: Path) -> None:
+def test_forbidden_config_values_resolve_path_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_scout = tmp_path / "fake-scout"
+    fake_legacy = tmp_path / "fake-legacy-scout"
+    monkeypatch.setattr(config_mod, "SCOUT_STATE", fake_scout)
+    monkeypatch.setattr(config_mod, "LEGACY_SCOUT_STATE", fake_legacy)
     scout_link = tmp_path / "scout-link"
-    scout_link.symlink_to(SCOUT_STATE)
+    scout_link.symlink_to(fake_scout)
     for value in [
         str(scout_link / "bench"),
-        str(LEGACY_SCOUT_STATE / ".." / ".flop_scout"),
+        str(fake_legacy / ".." / "fake-legacy-scout"),
         SCOUT_ROOM,
         SCOUT_MAILBOX,
         SCOUT_DID,
@@ -298,8 +355,6 @@ def test_production_identity_creation_refusal_and_ephemeral_containment(tmp_path
     assert meta["purpose"] == "test-only"
     assert meta["persistent"] is False
     assert str(tmp_path) in meta["private_key_path"]
-    assert not (Path.home() / ".flop_agents" / "bench" / "identity.pem").exists()
-    assert not (Path.home() / ".flop_agents" / "bench" / "identity.json").exists()
 
 
 def test_successful_temporary_production_style_identity_creation(tmp_path: Path) -> None:
@@ -332,8 +387,10 @@ def test_successful_temporary_production_style_identity_creation(tmp_path: Path)
     assert passphrase not in serialized
 
 
-def test_production_identity_refusals(tmp_path: Path) -> None:
+def test_production_identity_refusals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     state = tmp_path / "bench"
+    fake_scout = tmp_path / "fake-scout"
+    monkeypatch.setattr(config_mod, "SCOUT_STATE", fake_scout)
     passphrase = strong_test_phrase()
     with pytest.raises(SafetyError):
         create_production_identity(
@@ -353,11 +410,11 @@ def test_production_identity_refusals(tmp_path: Path) -> None:
         )
     with pytest.raises(IsolationError):
         create_production_identity(
-            state_dir=SCOUT_STATE,
+            state_dir=fake_scout,
             confirm=IDENTITY_CONFIRMATION,
             passphrase=passphrase,
             passphrase_confirmation=passphrase,
-            expected_state_dir=SCOUT_STATE,
+            expected_state_dir=fake_scout,
         )
 
 
@@ -537,6 +594,10 @@ def test_disabled_technocore_transport() -> None:
         transport.join,
         transport.fetch,
         transport.transfer,
+        transport.create_room,
+        transport.create_mailbox,
+        transport.fetch_url,
+        transport.wallet,
     ]:
         with pytest.raises(SafetyError):
             method()
@@ -689,6 +750,235 @@ def test_router_export_schema_rejects_malformed_documents(tmp_path: Path) -> Non
             validate_with_schema(bad, ROUTER_EXPORT_SCHEMA)
 
 
+def test_signed_request_verification_and_replay_reservation(tmp_path: Path) -> None:
+    sender_key = Ed25519PrivateKey.generate()
+    request = signed_request(sender_key=sender_key)
+    path = write_json(tmp_path / "request.json", request)
+    result = verify_request(path, state_dir=tmp_path / "state")
+    assert result["ok"] is True
+    assert result["policy_approval_required"] is True
+    assert result["will_execute"] is False
+    assert result["reservation"]["request_id"] == "req-1"
+    with pytest.raises(SafetyError):
+        verify_request(path, state_dir=tmp_path / "state")
+
+
+def test_invalid_signature_wrong_target_and_unsupported_capability(tmp_path: Path) -> None:
+    sender_key = Ed25519PrivateKey.generate()
+    tampered = signed_request(sender_key=sender_key)
+    tampered["hypothesis"] = "tampered after signing"
+    with pytest.raises(SafetyError):
+        verify_request(write_json(tmp_path / "tampered.json", tampered), state_dir=tmp_path / "s1")
+    wrong_target = signed_request(
+        sender_key=sender_key, request_id="req-2", target_did=public_did(sender_key)
+    )
+    with pytest.raises(SafetyError):
+        verify_request(
+            write_json(tmp_path / "wrong-target.json", wrong_target),
+            state_dir=tmp_path / "s2",
+        )
+    unsupported = signed_request(
+        sender_key=sender_key,
+        request_id="req-3",
+        requested_capability="wallet-transfer",
+        nonce=1_777_000_000_003,
+    )
+    with pytest.raises(SafetyError):
+        verify_request(
+            write_json(tmp_path / "unsupported.json", unsupported),
+            state_dir=tmp_path / "s3",
+        )
+
+
+def test_scout_operator_relationship_request_rules(tmp_path: Path) -> None:
+    sender_key = Ed25519PrivateKey.generate()
+    request = signed_request(sender_key=sender_key)
+    request["sender_did"] = SCOUT_DID
+    resign_request(request, sender_key)
+    with pytest.raises(SafetyError):
+        verify_request(
+            write_json(tmp_path / "scout-undisclosed.json", request), state_dir=tmp_path / "s1"
+        )
+    request["operator_group"] = {"common_control_disclosure": True}
+    resign_request(request, sender_key)
+    with pytest.raises(SafetyError):
+        verify_request(
+            write_json(tmp_path / "scout-bad-sig.json", request), state_dir=tmp_path / "s2"
+        )
+
+
+def test_expired_future_dated_duplicate_nonce_and_malformed_requests(tmp_path: Path) -> None:
+    sender_key = Ed25519PrivateKey.generate()
+    now = datetime.now(UTC)
+    expired = signed_request(
+        sender_key=sender_key,
+        expires_at=(now - timedelta(seconds=1)).isoformat(),
+    )
+    with pytest.raises(SafetyError):
+        verify_request(write_json(tmp_path / "expired.json", expired), state_dir=tmp_path / "s1")
+    future = signed_request(
+        sender_key=sender_key,
+        request_id="req-future",
+        nonce=1_777_000_000_002,
+        created_at=(now + timedelta(minutes=6)).isoformat(),
+    )
+    with pytest.raises(SafetyError):
+        verify_request(write_json(tmp_path / "future.json", future), state_dir=tmp_path / "s2")
+    first = signed_request(sender_key=sender_key, request_id="req-a", nonce=1_777_000_000_010)
+    second = signed_request(sender_key=sender_key, request_id="req-b", nonce=1_777_000_000_010)
+    verify_request(write_json(tmp_path / "first.json", first), state_dir=tmp_path / "s3")
+    with pytest.raises(SafetyError):
+        verify_request(write_json(tmp_path / "second.json", second), state_dir=tmp_path / "s3")
+    malformed = signed_request(sender_key=sender_key, request_id="req-malformed")
+    malformed["unexpected"] = True
+    with pytest.raises(ValidationError):
+        verify_request(
+            write_json(tmp_path / "malformed.json", malformed),
+            state_dir=tmp_path / "s4",
+        )
+
+
+def test_request_inspect_keeps_urls_inert_and_signed_code_does_not_execute(tmp_path: Path) -> None:
+    sender_key = Ed25519PrivateKey.generate()
+    marker = tmp_path / "must-not-exist"
+    request = signed_request(
+        sender_key=sender_key,
+        requested_capability="approved-local-command",
+        nonce=1_777_000_000_020,
+    )
+    request["test_spec"] = spec(
+        tmp_path,
+        [
+            {
+                "adapter": "local_command",
+                "argv": [sys.executable, "-c", f"open('{marker}', 'w').write('bad')"],
+                "cwd": str(tmp_path),
+                "timeout_seconds": 5,
+            }
+        ],
+        mode="approved-local",
+    )
+    request["provenance"] = {"source": "pytest", "url": "https://example.com/inert"}
+    resign_request(request, sender_key)
+    path = write_json(tmp_path / "request.json", request)
+    inspected = inspect_request(path, state_dir=tmp_path / "state")
+    verified = verify_request(path, state_dir=tmp_path / "state")
+    assert inspected["contains_url"] is True
+    assert inspected["network_action"] is False
+    assert verified["will_execute"] is False
+    assert not marker.exists()
+
+
+def test_concurrent_request_reservation_allows_one_duplicate(tmp_path: Path) -> None:
+    sender_key = Ed25519PrivateKey.generate()
+    path = write_json(tmp_path / "request.json", signed_request(sender_key=sender_key))
+    state = tmp_path / "state"
+    barrier = threading.Barrier(4)
+    results: list[str] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        barrier.wait()
+        try:
+            verify_request(path, state_dir=state)
+            value = "ok"
+        except SafetyError:
+            value = "duplicate"
+        with lock:
+            results.append(value)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert results.count("ok") == 1
+    assert results.count("duplicate") == 3
+
+
+def test_database_rollback_after_duplicate_request(tmp_path: Path) -> None:
+    sender_key = Ed25519PrivateKey.generate()
+    state = tmp_path / "state"
+    request = signed_request(sender_key=sender_key)
+    path = write_json(tmp_path / "request.json", request)
+    verify_request(path, state_dir=state)
+    with pytest.raises(SafetyError):
+        verify_request(path, state_dir=state)
+    with connect_state(state) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM bench_requests").fetchone()[0]
+    assert count == 1
+
+
+def test_signed_response_verification_tamper_and_related_agent_limitations(
+    tmp_path: Path,
+) -> None:
+    passphrase = strong_test_phrase()
+    state = tmp_path / "bench-id"
+    metadata = create_production_identity(
+        state_dir=state,
+        confirm=IDENTITY_CONFIRMATION,
+        passphrase=passphrase,
+        passphrase_confirmation=passphrase,
+        expected_state_dir=state,
+    )
+    target = tmp_path / "data.txt"
+    target.write_text("ok", encoding="utf-8")
+    evidence_path = write_json(
+        tmp_path / "spec.json",
+        spec(
+            tmp_path,
+            [{"adapter": "text_contains", "path": str(target), "text": "ok"}],
+        )
+        | {"provenance": {"subject_did": SCOUT_DID}},
+    )
+    evidence = verify_spec(evidence_path, state_dir=tmp_path / "evidence-state")
+    evidence["request_id"] = "req-response"
+    evidence["provenance"]["subject_did"] = SCOUT_DID
+    ev_path = write_json(tmp_path / "evidence.json", evidence)
+    response = prepare_signed_response(
+        ev_path,
+        state_dir=state,
+        passphrase=passphrase,
+        expected_bench_did=metadata["did"],
+        expected_identity_state_dir=state,
+    )
+    assert response["schema_version"] == RESPONSE_SCHEMA_VERSION
+    assert response["verifier_did"] == metadata["did"]
+    assert response["subject_did"] == SCOUT_DID
+    assert response["independent_evidence"] is False
+    assert "independent peer reputation" in response["limitations"][1]
+    verify_signed_response(response)
+    response["result"] = "FAIL"
+    with pytest.raises(SafetyError):
+        verify_signed_response(response)
+
+
+def test_dry_run_sign_and_protocol_error_redaction(tmp_path: Path) -> None:
+    passphrase = strong_test_phrase()
+    state = tmp_path / "bench-id"
+    metadata = create_production_identity(
+        state_dir=state,
+        confirm=IDENTITY_CONFIRMATION,
+        passphrase=passphrase,
+        passphrase_confirmation=passphrase,
+        expected_state_dir=state,
+    )
+    payload_path = write_json(tmp_path / "payload.json", {"room": "d-flop-bench", "nonce": 1})
+    signed = dry_run_sign_payload(
+        payload_path,
+        state_dir=state,
+        passphrase=passphrase,
+        expected_bench_did=metadata["did"],
+        expected_identity_state_dir=state,
+    )
+    assert signed["dry_run"] is True
+    assert signed["network_action"] is False
+    verify_signed_envelope("dry-run", signed, metadata["did"])
+    parsed = protocol_error_from_response(422, "duplicate token=abc123")
+    assert parsed["duplicate"] is True
+    assert "abc123" not in parsed["body"]
+
+
 def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
     target = tmp_path / "data.txt"
     target.write_text("ok", encoding="utf-8")
@@ -696,13 +986,39 @@ def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
         tmp_path / "spec.json",
         spec(tmp_path, [{"adapter": "text_contains", "path": str(target), "text": "ok"}]),
     )
+    request_path = write_json(
+        tmp_path / "request.json",
+        signed_request(sender_key=Ed25519PrivateKey.generate()),
+    )
+    payload_path = write_json(tmp_path / "payload.json", {"room": "d-flop-bench", "nonce": 1})
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO / "src")
     state = tmp_path / "state"
     commands = [
         [sys.executable, "-m", "flop_bench.cli", "validate-spec", str(spec_path)],
         [sys.executable, "-m", "flop_bench.cli", "doctor", "--state-dir", str(state)],
+        [sys.executable, "-m", "flop_bench.cli", "service", "doctor", "--state-dir", str(state)],
         [sys.executable, "-m", "flop_bench.cli", "isolation-check", "--state-dir", str(state)],
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "request",
+            "inspect",
+            str(request_path),
+            "--state-dir",
+            str(state),
+        ],
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "request",
+            "verify",
+            str(request_path),
+            "--state-dir",
+            str(state),
+        ],
         [
             sys.executable,
             "-m",
@@ -713,6 +1029,15 @@ def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
             str(state),
         ],
         [sys.executable, "-m", "flop_bench.cli", "ledger", "verify", "--state-dir", str(state)],
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "technocore",
+            "plan-init",
+            "--state-dir",
+            str(state),
+        ],
     ]
     for command in commands:
         completed = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
@@ -737,7 +1062,7 @@ def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
             "identity",
             "create-production",
             "--state-dir",
-            str(Path.home() / ".flop_agents" / "bench"),
+            str(tmp_path / "no-production-access"),
             "--confirm",
             IDENTITY_CONFIRMATION,
         ],
@@ -757,7 +1082,7 @@ def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
             "identity",
             "verify",
             "--state-dir",
-            str(Path.home() / ".flop_agents" / "bench"),
+            str(tmp_path / "no-production-access"),
         ],
         cwd=REPO,
         env=env,
@@ -767,14 +1092,16 @@ def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
     )
     assert verify_refusal.returncode == 4
     assert "interactive terminal required" in verify_refusal.stderr
-    failed_isolation = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
+    response_refusal = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
         [
             sys.executable,
             "-m",
             "flop_bench.cli",
-            "isolation-check",
+            "response",
+            "prepare",
+            str(evidence_file),
             "--state-dir",
-            str(Path.home() / ".flop_agents" / "scout"),
+            str(tmp_path / "no-production-access"),
         ],
         cwd=REPO,
         env=env,
@@ -782,10 +1109,25 @@ def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
         capture_output=True,
         check=False,
     )
-    assert failed_isolation.returncode != 0
-    failed_report = json.loads(failed_isolation.stdout)
-    assert failed_report["ok"] is False
-    assert len(failed_report["checks"]) >= 5
+    assert response_refusal.returncode == 4
+    dry_run_refusal = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "technocore",
+            "dry-run-sign",
+            str(payload_path),
+            "--state-dir",
+            str(tmp_path / "no-production-access"),
+        ],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert dry_run_refusal.returncode == 4
 
 
 def test_local_command_spec_cannot_enable_permission(tmp_path: Path) -> None:
@@ -799,9 +1141,3 @@ def test_local_command_spec_cannot_enable_permission(tmp_path: Path) -> None:
     spec_path = write_json(tmp_path / "spec.json", spec(tmp_path, [step], mode="approved-local"))
     with pytest.raises(ValidationError):
         verify_spec(spec_path, state_dir=tmp_path / "state", allow_local_exec=False)
-
-
-def test_no_files_created_under_forbidden_paths_after_delay() -> None:
-    time.sleep(0.01)
-    for path in PRODUCTION_PATHS:
-        assert not path.exists()

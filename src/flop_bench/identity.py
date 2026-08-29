@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from .canonical import atomic_write_text, canonical_json_bytes
 from .config import (
+    BENCH_DID,
     CANONICAL_ROOM,
     DEFAULT_PRODUCTION_STATE,
     MAILBOX,
@@ -271,6 +272,7 @@ def verify_identity(
     state_dir: Path,
     passphrase: str,
     expected_state_dir: Path = DEFAULT_PRODUCTION_STATE,
+    expected_did: str | None = None,
 ) -> dict[str, Any]:
     resolved_state = _assert_production_state_gate(state_dir, expected_state_dir)
     pem_path = resolved_state / IDENTITY_PEM
@@ -291,6 +293,8 @@ def verify_identity(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw
     )
     did = public_did(key)
+    if expected_did is not None and did != expected_did:
+        raise SafetyError("identity DID does not match expected Bench DID")
     if metadata.get("did") == SCOUT_DID:
         raise IsolationError("identity.json contains the known Scout DID")
     expected_metadata = {
@@ -321,6 +325,24 @@ def verify_identity(
         "key_type": "Ed25519",
         "pem_encrypted": True,
     }
+
+
+def load_production_identity_key(
+    *,
+    state_dir: Path,
+    passphrase: str,
+    expected_state_dir: Path = DEFAULT_PRODUCTION_STATE,
+    expected_did: str = BENCH_DID,
+) -> Ed25519PrivateKey:
+    verify_identity(
+        state_dir=state_dir,
+        passphrase=passphrase,
+        expected_state_dir=expected_state_dir,
+        expected_did=expected_did,
+    )
+    return _load_private_key(
+        state_dir.expanduser().resolve(strict=False) / IDENTITY_PEM, passphrase
+    )
 
 
 def read_interactive_new_passphrase() -> tuple[str, str]:

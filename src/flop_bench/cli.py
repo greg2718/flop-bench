@@ -18,6 +18,14 @@ from .identity import (
 )
 from .ledger import verify_ledger
 from .schemas import validate_test_spec
+from .service import (
+    dry_run_sign_payload,
+    inspect_request,
+    plan_init,
+    prepare_signed_response,
+    service_doctor,
+    verify_request,
+)
 from .state import connect_state
 
 
@@ -50,6 +58,30 @@ def build_parser() -> argparse.ArgumentParser:
     ver.add_argument("spec", type=Path)
     ver.add_argument("--state-dir", required=True, type=Path)
     ver.add_argument("--allow-local-exec", action="store_true")
+    service = sub.add_parser("service")
+    service_sub = service.add_subparsers(dest="service_cmd", required=True)
+    service_doctor_cmd = service_sub.add_parser("doctor")
+    service_doctor_cmd.add_argument("--state-dir", required=True, type=Path)
+    request = sub.add_parser("request")
+    request_sub = request.add_subparsers(dest="request_cmd", required=True)
+    request_verify = request_sub.add_parser("verify")
+    request_verify.add_argument("request", type=Path)
+    request_verify.add_argument("--state-dir", required=True, type=Path)
+    request_inspect = request_sub.add_parser("inspect")
+    request_inspect.add_argument("request", type=Path)
+    request_inspect.add_argument("--state-dir", required=True, type=Path)
+    response = sub.add_parser("response")
+    response_sub = response.add_subparsers(dest="response_cmd", required=True)
+    response_prepare = response_sub.add_parser("prepare")
+    response_prepare.add_argument("evidence", type=Path)
+    response_prepare.add_argument("--state-dir", required=True, type=Path)
+    technocore = sub.add_parser("technocore")
+    technocore_sub = technocore.add_subparsers(dest="technocore_cmd", required=True)
+    plan = technocore_sub.add_parser("plan-init")
+    plan.add_argument("--state-dir", required=True, type=Path)
+    dry_run = technocore_sub.add_parser("dry-run-sign")
+    dry_run.add_argument("payload", type=Path)
+    dry_run.add_argument("--state-dir", required=True, type=Path)
     ledger = sub.add_parser("ledger")
     ledger_sub = ledger.add_subparsers(dest="ledger_cmd", required=True)
     ledger_verify = ledger_sub.add_parser("verify")
@@ -87,6 +119,32 @@ def run(argv: list[str] | None = None) -> int:
                     args.spec,
                     state_dir=args.state_dir,
                     allow_local_exec=args.allow_local_exec,
+                )
+            )
+        elif args.cmd == "service" and args.service_cmd == "doctor":
+            _print_json(service_doctor(state_dir=args.state_dir))
+        elif args.cmd == "request" and args.request_cmd == "verify":
+            _print_json(verify_request(args.request, state_dir=args.state_dir))
+        elif args.cmd == "request" and args.request_cmd == "inspect":
+            _print_json(inspect_request(args.request, state_dir=args.state_dir))
+        elif args.cmd == "response" and args.response_cmd == "prepare":
+            passphrase = read_interactive_existing_passphrase()
+            _print_json(
+                prepare_signed_response(
+                    args.evidence,
+                    state_dir=args.state_dir,
+                    passphrase=passphrase,
+                )
+            )
+        elif args.cmd == "technocore" and args.technocore_cmd == "plan-init":
+            _print_json(plan_init(state_dir=args.state_dir))
+        elif args.cmd == "technocore" and args.technocore_cmd == "dry-run-sign":
+            passphrase = read_interactive_existing_passphrase()
+            _print_json(
+                dry_run_sign_payload(
+                    args.payload,
+                    state_dir=args.state_dir,
+                    passphrase=passphrase,
                 )
             )
         elif args.cmd == "ledger" and args.ledger_cmd == "verify":
