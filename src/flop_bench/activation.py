@@ -24,7 +24,7 @@ from .redaction import redact
 from .state import connect_state, record_service_activation, update_service_activation
 
 TECHNOCORE_ORIGIN = "https://technocore.chat"
-USER_AGENT = "flop-bench/0.2-phase-b"
+USER_AGENT = "flop-bench/0.2-phase-c"
 MAX_RESPONSE_BYTES = 1_000_000
 REQUEST_TIMEOUT_SECONDS = 20.0
 MAX_RETRY_AFTER_SECONDS = 30.0

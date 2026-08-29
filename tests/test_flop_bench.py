@@ -53,10 +53,25 @@ from flop_bench.identity import (
     verify_identity,
 )
 from flop_bench.ledger import append_record, verify_ledger
+from flop_bench.posting import (
+    MAX_POST_BYTES,
+    POST_CONFIRMATION,
+    post_room_url,
+    preview_post,
+    proposed_initial_announcement,
+    send_post,
+    service_manifest,
+    signed_post_preimage,
+)
+from flop_bench.posting import (
+    history as post_history,
+)
 from flop_bench.protocol import (
     REQUEST_SCHEMA_VERSION,
     RESPONSE_SCHEMA_VERSION,
+    b64u_decode,
     protocol_error_from_response,
+    public_key_from_did,
     sign_envelope,
     verify_signed_envelope,
 )
@@ -122,7 +137,9 @@ class FakeActivationTransport:
         self.nonce_statuses: dict[str, int] = {}
         self.nonces: dict[str, int] = {}
         self.write_statuses: list[int] = []
+        self.post_statuses: list[int] = []
         self.requests: list[tuple[str, str]] = []
+        self.post_bodies: list[dict[str, object]] = []
         self.redirect_url: str | None = None
         self.oversized = False
 
@@ -135,7 +152,7 @@ class FakeActivationTransport:
         headers: dict[str, str] | None = None,
         timeout: float = 20.0,
     ) -> TransportResponse:
-        del body, timeout
+        del timeout
         validate_origin(url)
         assert headers is not None
         assert headers["User-Agent"].startswith("flop-bench/")
@@ -146,6 +163,32 @@ class FakeActivationTransport:
             return TransportResponse(200, b"x" * (MAX_RESPONSE_BYTES + 1), {}, final_url=url)
         parsed = urllib.parse.urlparse(url)
         parts = parsed.path.strip("/").split("/")
+        if method == "POST" and parts == ["r", "d-flop-bench"]:
+            assert headers["Accept"] == "application/json"
+            assert headers["Content-Type"] == "application/json; charset=utf-8"
+            assert body is not None
+            payload = json.loads(body.decode("utf-8"))
+            self.post_bodies.append(payload)
+            status = self.post_statuses.pop(0) if self.post_statuses else 200
+            if status != 200:
+                headers = {"Retry-After": "2"} if status == 429 else {}
+                return TransportResponse(
+                    status, b"post rejected token=abc123", headers, final_url=url
+                )
+            response = {
+                "posted": {
+                    "from": payload["did"],
+                    "text": payload["text"],
+                    "nonce": payload["nonce"],
+                    "seq": 123,
+                }
+            }
+            return TransportResponse(
+                200,
+                json.dumps(response, separators=(",", ":")).encode(),
+                {},
+                final_url=url,
+            )
         if len(parts) >= 3 and parts[0] == "kv":
             namespace = urllib.parse.unquote(parts[1])
             key = urllib.parse.unquote(parts[2])
@@ -1423,6 +1466,277 @@ def test_activation_http_status_retry_nonce_and_redaction(tmp_path: Path) -> Non
     assert row["failure_classification"] == "creation_rejection"
 
 
+def test_post_manifest_and_preview_are_pure(tmp_path: Path) -> None:
+    message_path = tmp_path / "message.txt"
+    message_path.write_text(f"{proposed_initial_announcement()}\n", encoding="utf-8")
+    state = tmp_path / "missing-state"
+    preview = preview_post(message_path, state_dir=state)
+    manifest = service_manifest()
+    assert preview["room"] == "d-flop-bench"
+    assert preview["will_sign"] is False
+    assert preview["will_acquire_nonce"] is False
+    assert preview["network_action"] is False
+    assert preview["state_write"] is False
+    assert preview["manifest"] == manifest
+    assert manifest["bench_did"] == BENCH_DID
+    assert manifest["room"] == "d-flop-bench"
+    assert manifest["mailbox"]["status"] == "protocol-unconfirmed"
+    assert manifest["safety"]["url_following"] is False
+    assert manifest["safety"]["automatic_code_execution"] is False
+    assert manifest["safety"]["wallets"] is False
+    assert manifest["safety"]["flop_transfers"] is False
+    assert manifest["safety"]["autonomous_outbound_posting"] is False
+    assert manifest["safety"]["requests_accepted"] is False
+    assert "https://" not in proposed_initial_announcement()
+    assert not state.exists()
+
+
+def test_post_message_validation_rejects_url_control_length_and_utf8(tmp_path: Path) -> None:
+    for name, data in {
+        "url.txt": b"Visit https://example.test",
+        "control.txt": b"hello\nworld",
+        "long.txt": b"x" * (MAX_POST_BYTES + 1),
+    }.items():
+        path = tmp_path / name
+        path.write_bytes(data)
+        with pytest.raises((SafetyError, ValidationError)):
+            preview_post(path, state_dir=tmp_path / "state")
+    invalid = tmp_path / "invalid.txt"
+    invalid.write_bytes(b"\xff")
+    with pytest.raises(ValidationError):
+        preview_post(invalid, state_dir=tmp_path / "state")
+
+
+def test_post_local_gates_do_not_create_audit(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    message = tmp_path / "message.txt"
+    message.write_text("FLOP Bench test announcement", encoding="utf-8")
+    transport = FakeActivationTransport()
+    with pytest.raises(SafetyError):
+        send_post(
+            message,
+            state_dir=state,
+            live=False,
+            confirm=POST_CONFIRMATION,
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    with pytest.raises(SafetyError):
+        send_post(
+            message,
+            state_dir=state,
+            live=True,
+            confirm="WRONG",
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    with pytest.raises(SafetyError):
+        signed_post_preimage("d-other", 1, "hello")
+    with connect_state(state) as conn:
+        rows = conn.execute("SELECT * FROM post_attempts").fetchall()
+    assert rows == []
+    assert transport.requests == []
+
+
+def test_post_send_uses_scout_preimage_body_nonce_and_one_audit_row(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    message = tmp_path / "message.txt"
+    text = "FLOP Bench test announcement"
+    message.write_text(text, encoding="utf-8")
+    transport = FakeActivationTransport()
+    transport.notes[("room-owners", "d-flop-bench")] = did
+    result = send_post(
+        message,
+        state_dir=state,
+        live=True,
+        confirm=POST_CONFIRMATION,
+        passphrase=passphrase,
+        transport=transport,
+        expected_state_dir=state,
+        expected_bench_did=did,
+    )
+    assert result["ok"] is True
+    assert result["room"] == "d-flop-bench"
+    assert result["seq"] == 123
+    assert len(transport.post_bodies) == 1
+    body = transport.post_bodies[0]
+    assert body["did"] == did
+    assert body["text"] == text
+    assert isinstance(body["nonce"], int)
+    assert signed_post_preimage("d-flop-bench", int(body["nonce"]), text) == (
+        f"d-flop-bench|{body['nonce']}|{text}".encode()
+    )
+    public_key_from_did(did).verify(
+        b64u_decode(str(body["sig"])),
+        signed_post_preimage("d-flop-bench", int(body["nonce"]), text),
+    )
+    post_urls = [url for method, url in transport.requests if method == "POST"]
+    assert post_urls == [post_room_url()]
+    with connect_state(state) as conn:
+        rows = conn.execute("SELECT * FROM post_attempts").fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["post_status"] == "posted"
+    assert row["nonce_used"] == body["nonce"]
+    assert row["seq"] == 123
+    stored = json.dumps([dict(row)], sort_keys=True)
+    assert text not in stored
+    assert str(body["sig"]) not in stored
+    assert passphrase not in stored
+
+
+def test_post_send_requires_verified_room_owner_and_audits_preflight_failures(
+    tmp_path: Path,
+) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    message = tmp_path / "message.txt"
+    message.write_text("FLOP Bench test announcement", encoding="utf-8")
+    unavailable = FakeActivationTransport()
+    unavailable.note_statuses[("room-owners", "d-flop-bench")] = 503
+    with pytest.raises(SafetyError):
+        send_post(
+            message,
+            state_dir=state,
+            live=True,
+            confirm=POST_CONFIRMATION,
+            passphrase=passphrase,
+            transport=unavailable,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    foreign = FakeActivationTransport()
+    foreign.notes[("room-owners", "d-flop-bench")] = public_did(Ed25519PrivateKey.generate())
+    with pytest.raises(SafetyError):
+        send_post(
+            message,
+            state_dir=state,
+            live=True,
+            confirm=POST_CONFIRMATION,
+            passphrase=passphrase,
+            transport=foreign,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    with connect_state(state) as conn:
+        rows = conn.execute(
+            "SELECT post_status, response_status, nonce_used, failure_classification "
+            "FROM post_attempts ORDER BY id"
+        ).fetchall()
+    assert rows[0]["post_status"] == "failed_preflight"
+    assert rows[0]["response_status"] == 503
+    assert rows[0]["nonce_used"] is None
+    assert rows[0]["failure_classification"] == "remote_unavailable"
+    assert rows[1]["post_status"] == "failed_preflight"
+    assert rows[1]["nonce_used"] is None
+    assert rows[1]["failure_classification"] == "ownership_not_verified"
+
+
+def test_post_preflight_timeout_and_malformed_owner_are_audited(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    message = tmp_path / "message.txt"
+    message.write_text("FLOP Bench test announcement", encoding="utf-8")
+
+    class TimeoutTransport(FakeActivationTransport):
+        def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            body: bytes | None = None,
+            headers: dict[str, str] | None = None,
+            timeout: float = 20.0,
+        ) -> TransportResponse:
+            del method, url, body, headers, timeout
+            raise ActivationRequestError(
+                "Technocore request timed out",
+                failure_classification="timeout",
+            )
+
+    timeout_transport = TimeoutTransport()
+    with pytest.raises(SafetyError):
+        send_post(
+            message,
+            state_dir=state,
+            live=True,
+            confirm=POST_CONFIRMATION,
+            passphrase=passphrase,
+            transport=timeout_transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    malformed = FakeActivationTransport()
+    malformed.notes[("room-owners", "d-flop-bench")] = "not-a-did"
+    with pytest.raises(SafetyError):
+        send_post(
+            message,
+            state_dir=state,
+            live=True,
+            confirm=POST_CONFIRMATION,
+            passphrase=passphrase,
+            transport=malformed,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    assert timeout_transport.post_bodies == []
+    assert malformed.post_bodies == []
+    with connect_state(state) as conn:
+        rows = conn.execute(
+            "SELECT post_status, response_status, nonce_used, failure_classification "
+            "FROM post_attempts ORDER BY id"
+        ).fetchall()
+    assert rows[-2]["post_status"] == "failed_preflight"
+    assert rows[-2]["response_status"] is None
+    assert rows[-2]["nonce_used"] is None
+    assert rows[-2]["failure_classification"] == "timeout"
+    assert rows[-1]["post_status"] == "failed_preflight"
+    assert rows[-1]["response_status"] == 200
+    assert rows[-1]["nonce_used"] is None
+    assert rows[-1]["failure_classification"] == "malformed_response"
+
+
+def test_post_send_429_failure_audit_and_history_redaction(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    message = tmp_path / "message.txt"
+    text = "FLOP Bench test announcement"
+    message.write_text(text, encoding="utf-8")
+    transport = FakeActivationTransport()
+    transport.notes[("room-owners", "d-flop-bench")] = did
+    transport.post_statuses = [429]
+    with pytest.raises(SafetyError):
+        send_post(
+            message,
+            state_dir=state,
+            live=True,
+            confirm=POST_CONFIRMATION,
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    hist = post_history(state_dir=state, limit=10)
+    assert hist["state_write"] is False
+    assert hist["network_action"] is False
+    assert len(hist["posts"]) == 1
+    post = hist["posts"][0]
+    assert post["post_status"] == "failed"
+    assert post["response_status"] == 429
+    assert post["failure_classification"] == "remote_unavailable"
+    visible = json.dumps(hist, sort_keys=True)
+    assert text not in visible
+    assert "abc123" not in visible
+    assert "sig" not in visible
+    assert passphrase not in visible
+    missing = post_history(state_dir=tmp_path / "missing", limit=5)
+    assert missing["posts"] == []
+    assert not (tmp_path / "missing").exists()
+    with pytest.raises(SafetyError):
+        post_history(state_dir=state, limit=0)
+
+
 def test_status_and_dry_run_do_not_invoke_network(tmp_path: Path) -> None:
     state = tmp_path / "state"
     plan = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
@@ -1466,7 +1780,7 @@ def test_service_doctor_read_only_does_not_create_or_migrate_state(tmp_path: Pat
     assert report["database_exists"] is False
     assert report["permission_issues"] == []
     assert report["schema_migrations"] == []
-    assert report["pending_migrations"] == [1, 2, 3]
+    assert report["pending_migrations"] == [1, 2, 3, 4]
     assert not state.exists()
 
 
@@ -1475,8 +1789,8 @@ def test_service_doctor_reports_migrations_applied_and_plan_is_read_only(tmp_pat
     report = service_doctor(state_dir=state)
     assert report["read_only"] is False
     assert report["state_write"] is True
-    assert report["migrations_applied"] == [1, 2, 3]
-    assert report["schema_migrations"] == [1, 2, 3]
+    assert report["migrations_applied"] == [1, 2, 3, 4]
+    assert report["schema_migrations"] == [1, 2, 3, 4]
     status = migration_status(state)
     assert status["pending_migrations"] == []
     plan = plan_init(state_dir=state)
@@ -1493,13 +1807,13 @@ def test_service_doctor_read_only_reports_outdated_state_without_migrating(tmp_p
     read_only = service_doctor(state_dir=state, read_only=True)
     assert read_only["state_write"] is False
     assert read_only["schema_migrations"] == [1]
-    assert read_only["pending_migrations"] == [2, 3]
+    assert read_only["pending_migrations"] == [2, 3, 4]
     after_read_only = migration_status(state)
     assert after_read_only["schema_migrations"] == [1]
     normal = service_doctor(state_dir=state)
     assert normal["state_write"] is True
-    assert normal["migrations_applied"] == [2, 3]
-    assert normal["schema_migrations"] == [1, 2, 3]
+    assert normal["migrations_applied"] == [2, 3, 4]
+    assert normal["schema_migrations"] == [1, 2, 3, 4]
 
 
 def test_private_state_database_and_sidecar_permissions(tmp_path: Path) -> None:
@@ -1604,6 +1918,8 @@ def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
         signed_request(sender_key=Ed25519PrivateKey.generate()),
     )
     payload_path = write_json(tmp_path / "payload.json", {"room": "d-flop-bench", "nonce": 1})
+    message_path = tmp_path / "message.txt"
+    message_path.write_text("FLOP Bench test announcement", encoding="utf-8")
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO / "src")
     state = tmp_path / "state"
@@ -1660,6 +1976,27 @@ def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
             "plan-init",
             "--state-dir",
             str(state),
+        ],
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "post",
+            "preview",
+            str(message_path),
+            "--state-dir",
+            str(tmp_path / "preview-missing"),
+        ],
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "post",
+            "history",
+            "--state-dir",
+            str(tmp_path / "post-history-missing"),
+            "--limit",
+            "5",
         ],
     ]
     for command in commands:
@@ -1751,6 +2088,28 @@ def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
         check=False,
     )
     assert dry_run_refusal.returncode == 4
+    post_send_refusal = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "post",
+            "send",
+            str(message_path),
+            "--state-dir",
+            str(tmp_path / "no-production-access"),
+            "--live",
+            "--confirm",
+            POST_CONFIRMATION,
+        ],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert post_send_refusal.returncode == 4
+    assert "interactive terminal required" in post_send_refusal.stderr
     mailbox_refusal = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
         [
             sys.executable,
@@ -1773,6 +2132,8 @@ def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
     assert mailbox_refusal.returncode == 4
     assert "PROTOCOL_UNCONFIRMED" in mailbox_refusal.stderr
     assert not (tmp_path / "read-only-missing").exists()
+    assert not (tmp_path / "preview-missing").exists()
+    assert not (tmp_path / "post-history-missing").exists()
 
 
 def test_local_command_spec_cannot_enable_permission(tmp_path: Path) -> None:

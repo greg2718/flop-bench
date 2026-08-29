@@ -25,6 +25,8 @@ from .identity import (
     verify_identity,
 )
 from .ledger import verify_ledger
+from .posting import POST_CONFIRMATION, preview_post, send_post
+from .posting import history as post_history
 from .schemas import validate_test_spec
 from .service import (
     dry_run_sign_payload,
@@ -128,6 +130,19 @@ def build_parser() -> argparse.ArgumentParser:
     create_identity.add_argument("--confirm", required=True, choices=[IDENTITY_CONFIRMATION])
     verify_identity_cmd = identity_sub.add_parser("verify")
     verify_identity_cmd.add_argument("--state-dir", required=True, type=Path)
+    post = sub.add_parser("post")
+    post_sub = post.add_subparsers(dest="post_cmd", required=True)
+    post_preview = post_sub.add_parser("preview")
+    post_preview.add_argument("message", type=Path)
+    post_preview.add_argument("--state-dir", required=True, type=Path)
+    post_send = post_sub.add_parser("send")
+    post_send.add_argument("message", type=Path)
+    post_send.add_argument("--state-dir", required=True, type=Path)
+    post_send.add_argument("--live", action="store_true")
+    post_send.add_argument("--confirm", required=True, choices=[POST_CONFIRMATION])
+    post_history_cmd = post_sub.add_parser("history")
+    post_history_cmd.add_argument("--state-dir", required=True, type=Path)
+    post_history_cmd.add_argument("--limit", required=True, type=int)
     return parser
 
 
@@ -226,6 +241,22 @@ def run(argv: list[str] | None = None) -> int:
         elif args.cmd == "identity" and args.identity_cmd == "verify":
             passphrase = read_interactive_existing_passphrase()
             _print_json(verify_identity(state_dir=args.state_dir, passphrase=passphrase))
+        elif args.cmd == "post" and args.post_cmd == "preview":
+            _print_json(preview_post(args.message, state_dir=args.state_dir))
+        elif args.cmd == "post" and args.post_cmd == "send":
+            passphrase = read_interactive_existing_passphrase()
+            _print_json(
+                send_post(
+                    args.message,
+                    state_dir=args.state_dir,
+                    live=args.live,
+                    confirm=args.confirm,
+                    passphrase=passphrase,
+                    transport=UrlLibActivationTransport(),
+                )
+            )
+        elif args.cmd == "post" and args.post_cmd == "history":
+            _print_json(post_history(state_dir=args.state_dir, limit=args.limit))
         else:
             raise FlopBenchError("unknown command")
     except LedgerError as exc:
