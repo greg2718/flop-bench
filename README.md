@@ -120,7 +120,7 @@ flop-bench technocore create-room \
 flop-bench technocore status --state-dir ~/.flop_agents/bench
 ```
 
-The room activation gate checks current ownership before writing, refuses foreign ownership, retries only bounded nonce/conflict/rate-limit cases, and verifies ownership after a successful write. It records only public audit metadata in SQLite and the local ledger: service name, expected/observed owner DID, status, HTTP status, nonce, response hash, and failure classification. It does not log or store passphrases, private keys, signatures, or response bodies.
+The room activation gate creates a local audit row immediately after local authorization and identity verification pass, before the first network request. A crash at that point leaves the row as `started`; normal completion updates the same row to the terminal state. The gate checks current ownership before writing, refuses foreign ownership, retries only bounded nonce/conflict/rate-limit cases, and verifies ownership after a successful write. It records only public audit metadata in SQLite and the local ledger: service name, expected/observed owner DID, status, HTTP status, nonce, response hash, and failure classification. It does not log or store passphrases, private keys, signatures, authorization data, cookies, or response bodies.
 
 Creating the local identity and claiming Technocore room ownership are separate steps. Identity creation alone does not register Bench with Technocore or activate Bench. Room activation does not authorize posting, create a wallet, move FLOP, submit Router records, or enable autonomous network behavior.
 

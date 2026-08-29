@@ -23,6 +23,7 @@ from flop_bench.activation import (
     CREATE_ROOM_CONFIRMATION,
     MAX_RESPONSE_BYTES,
     TECHNOCORE_ORIGIN,
+    ActivationRequestError,
     TransportResponse,
     create_mailbox,
     create_room,
@@ -117,6 +118,8 @@ def weak_test_phrase() -> str:
 class FakeActivationTransport:
     def __init__(self) -> None:
         self.notes: dict[tuple[str, str], str] = {}
+        self.note_statuses: dict[tuple[str, str], int] = {}
+        self.nonce_statuses: dict[str, int] = {}
         self.nonces: dict[str, int] = {}
         self.write_statuses: list[int] = []
         self.requests: list[tuple[str, str]] = []
@@ -147,7 +150,20 @@ class FakeActivationTransport:
             namespace = urllib.parse.unquote(parts[1])
             key = urllib.parse.unquote(parts[2])
             if len(parts) == 3:
+                status = self.note_statuses.get((namespace, key))
+                if status is not None:
+                    return TransportResponse(
+                        status, b"remote password=supersecret", {}, final_url=url
+                    )
                 if namespace == "room-nonce":
+                    nonce_status = self.nonce_statuses.get(key)
+                    if nonce_status is not None:
+                        return TransportResponse(
+                            nonce_status,
+                            b"nonce unavailable password=supersecret",
+                            {},
+                            final_url=url,
+                        )
                     return TransportResponse(
                         200,
                         str(self.nonces.get(key, 0)).encode(),
@@ -1107,6 +1123,7 @@ def test_activation_live_gate_refusals(tmp_path: Path) -> None:
             expected_bench_did=BENCH_DID,
         )
     assert transport.requests == []
+    assert not (state / "state.sqlite").exists()
 
 
 def test_room_activation_uses_scout_owner_preimage_and_endpoint(tmp_path: Path) -> None:
@@ -1164,6 +1181,97 @@ def test_activation_origin_redirect_timeout_and_size_safety(tmp_path: Path) -> N
         )
 
 
+def test_room_preflight_503_creates_single_failed_audit_without_signing(
+    tmp_path: Path,
+) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    transport = FakeActivationTransport()
+    transport.note_statuses[("room-owners", "d-flop-bench")] = 503
+    with pytest.raises(SafetyError) as exc:
+        create_room(
+            live=True,
+            confirm=CREATE_ROOM_CONFIRMATION,
+            state_dir=state,
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+            sleep_on_429=False,
+        )
+    assert "HTTP 503" in str(exc.value)
+    with connect_state(state) as conn:
+        rows = conn.execute("SELECT * FROM service_activations").fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["service_type"] == "room"
+    assert row["service_name"] == "d-flop-bench"
+    assert row["expected_owner_did"] == did
+    assert row["observed_owner_did"] is None
+    assert row["activation_status"] == "failed_preflight"
+    assert row["response_status"] == 503
+    assert row["nonce_used"] is None
+    assert row["failure_classification"] == "remote_unavailable"
+    assert row["response_hash"] is not None
+    assert all("room-nonce" not in url for _method, url in transport.requests)
+    assert all("set-signed" not in url for _method, url in transport.requests)
+    stored = json.dumps([dict(row)], sort_keys=True)
+    assert passphrase not in stored
+    assert "supersecret" not in stored
+    assert "signature" not in stored
+
+
+def test_room_preflight_timeout_and_malformed_response_are_audited(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+
+    class TimeoutTransport(FakeActivationTransport):
+        def request(self, *args: object, **kwargs: object) -> TransportResponse:
+            raise ActivationRequestError(
+                "Technocore request timed out",
+                failure_classification="timeout",
+            )
+
+    with pytest.raises(SafetyError):
+        create_room(
+            live=True,
+            confirm=CREATE_ROOM_CONFIRMATION,
+            state_dir=state,
+            passphrase=passphrase,
+            transport=TimeoutTransport(),
+            expected_state_dir=state,
+            expected_bench_did=did,
+            sleep_on_429=False,
+        )
+    other_did = public_did(Ed25519PrivateKey.generate())
+    malformed = FakeActivationTransport()
+    malformed.notes[("room-owners", "d-flop-bench")] = f"{did} {other_did}"
+    with pytest.raises(SafetyError):
+        create_room(
+            live=True,
+            confirm=CREATE_ROOM_CONFIRMATION,
+            state_dir=state,
+            passphrase=passphrase,
+            transport=malformed,
+            expected_state_dir=state,
+            expected_bench_did=did,
+            sleep_on_429=False,
+        )
+    with connect_state(state) as conn:
+        rows = conn.execute(
+            "SELECT activation_status, response_status, nonce_used, failure_classification "
+            "FROM service_activations ORDER BY id"
+        ).fetchall()
+    assert [row["activation_status"] for row in rows] == [
+        "failed_preflight",
+        "failed_preflight",
+    ]
+    assert rows[0]["response_status"] is None
+    assert rows[0]["nonce_used"] is None
+    assert rows[0]["failure_classification"] == "timeout"
+    assert rows[1]["response_status"] == 200
+    assert rows[1]["nonce_used"] is None
+    assert rows[1]["failure_classification"] == "malformed_response"
+
+
 def test_successful_room_creation_with_audit(tmp_path: Path) -> None:
     state, passphrase, did = temp_production_identity(tmp_path)
     transport = FakeActivationTransport()
@@ -1183,6 +1291,8 @@ def test_successful_room_creation_with_audit(tmp_path: Path) -> None:
         rows = conn.execute("SELECT * FROM service_activations").fetchall()
     assert len(rows) == 1
     assert rows[0]["service_type"] == "room"
+    assert rows[0]["activation_status"] == "created"
+    assert rows[0]["nonce_used"] == 42
     stored = json.dumps([dict(row) for row in rows], sort_keys=True)
     assert passphrase not in stored
     assert "signature" not in stored
@@ -1305,7 +1415,12 @@ def test_activation_http_status_retry_nonce_and_redaction(tmp_path: Path) -> Non
         )
     message = str(exc.value)
     assert "abc123" not in message
-    assert "duplicate-or-invalid" in message
+    assert "creation_rejection" in message
+    with connect_state(state) as conn:
+        row = conn.execute(
+            "SELECT failure_classification FROM service_activations ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert row["failure_classification"] == "creation_rejection"
 
 
 def test_status_and_dry_run_do_not_invoke_network(tmp_path: Path) -> None:

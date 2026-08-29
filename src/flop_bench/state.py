@@ -205,8 +205,8 @@ def record_service_activation(
     nonce_used: int | None,
     response_hash: str | None,
     failure_classification: str | None,
-) -> None:
-    conn.execute(
+) -> int:
+    cursor = conn.execute(
         """
         INSERT INTO service_activations(
             service_type, service_name, expected_owner_did, observed_owner_did,
@@ -226,6 +226,44 @@ def record_service_activation(
             nonce_used,
             response_hash,
             failure_classification,
+        ),
+    )
+    conn.commit()
+    if cursor.lastrowid is None:
+        raise SafetyError("activation audit insert did not return an id")
+    return int(cursor.lastrowid)
+
+
+def update_service_activation(
+    conn: sqlite3.Connection,
+    *,
+    activation_id: int,
+    observed_owner_did: str | None,
+    activation_status: str,
+    response_status: int | None,
+    nonce_used: int | None,
+    response_hash: str | None,
+    failure_classification: str | None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE service_activations
+        SET observed_owner_did = ?,
+            activation_status = ?,
+            response_status = ?,
+            nonce_used = ?,
+            response_hash = ?,
+            failure_classification = ?
+        WHERE id = ?
+        """,
+        (
+            observed_owner_did,
+            activation_status,
+            response_status,
+            nonce_used,
+            response_hash,
+            failure_classification,
+            activation_id,
         ),
     )
     conn.commit()

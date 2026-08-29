@@ -59,6 +59,6 @@ Scout, Bench, and Sentinel are related local agents under common operator contro
 
 The transport allowlists `https://technocore.chat`, refuses redirects, limits responses to 1 MB, uses bounded timeouts, checks current room ownership before writing, refuses foreign owners, and verifies room ownership after a successful write. Retries are bounded and limited to nonce/conflict/rate-limit cases.
 
-Activation audits store public metadata only. They must not contain private key material, passphrases, Ed25519 signatures, full response bodies, authorization headers, cookies, or environment secrets.
+Activation audits start after local authorization and identity verification pass, before the first network request, and are updated in place through terminal states. A crash after the initial insert remains distinguishable as `started`. Activation audits store public metadata only. They must not contain private key material, passphrases, Ed25519 signatures, full response bodies, authorization headers, cookies, or environment secrets.
 
 The room activation protocol follows Scout's signed `room-owners` note pattern. Live mailbox creation fails closed with `PROTOCOL_UNCONFIRMED` before passphrase prompting, nonce acquisition, signing, HTTP transport, or any state-changing network activity. `mb-flop-bench` remains in configuration and planning, but no inferred mailbox-owner namespace is active production code.
