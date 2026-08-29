@@ -29,7 +29,7 @@ from .protocol import (
     validate_timestamp_window,
     verify_signed_envelope,
 )
-from .state import connect_state, reserve_request
+from .state import connect_state, connect_state_with_migrations, migration_status, reserve_request
 
 REQUEST_REQUIRED = {
     "schema_version",
@@ -197,21 +197,49 @@ def plan_init(*, state_dir: Path) -> dict[str, Any]:
         "mailbox": MAILBOX,
         "planned_actions": [
             {"action": "create-room", "room": CANONICAL_ROOM, "will_execute": False},
-            {"action": "create-mailbox", "room": MAILBOX, "will_execute": False},
+            {
+                "action": "create-mailbox",
+                "room": MAILBOX,
+                "will_execute": False,
+                "protocol_status": "unconfirmed",
+            },
         ],
         "network_action": False,
+        "state_write": False,
+        "migrations_applied": [],
     }
 
 
-def service_doctor(*, state_dir: Path) -> dict[str, Any]:
+def service_doctor(*, state_dir: Path, read_only: bool = False) -> dict[str, Any]:
     assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
-    with connect_state(state_dir) as conn:
+    if read_only:
+        status = migration_status(state_dir)
+        return {
+            "ok": True,
+            "dry_run": True,
+            "read_only": True,
+            "state_dir": str(state_dir.expanduser().resolve(strict=False)),
+            "schema_migrations": status["schema_migrations"],
+            "pending_migrations": status["pending_migrations"],
+            "state_dir_exists": status["state_dir_exists"],
+            "database_exists": status["database_exists"],
+            "state_write": False,
+            "migrations_applied": [],
+            "live_transport": False,
+            "network_action": False,
+        }
+    conn, migrations_applied = connect_state_with_migrations(state_dir)
+    with conn:
         migrations = [row[0] for row in conn.execute("SELECT version FROM schema_migrations")]
     return {
         "ok": True,
         "dry_run": True,
-        "state_dir": str(state_dir),
+        "read_only": False,
+        "state_dir": str(state_dir.expanduser().resolve(strict=False)),
         "schema_migrations": migrations,
+        "pending_migrations": [],
+        "state_write": True,
+        "migrations_applied": migrations_applied,
         "live_transport": False,
         "network_action": False,
     }
