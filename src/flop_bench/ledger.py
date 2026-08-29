@@ -7,6 +7,7 @@ from typing import Any
 
 from .canonical import canonical_json_bytes, sha256_bytes
 from .exceptions import LedgerError
+from .state import PRIVATE_FILE_MODE
 
 
 def ledger_path(state_dir: Path) -> Path:
@@ -37,8 +38,9 @@ def append_record(state_dir: Path, record: dict[str, Any]) -> dict[str, Any]:
     path = ledger_path(state_dir)
     line = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-    fd = os.open(path, flags, 0o600)
+    fd = os.open(path, flags, PRIVATE_FILE_MODE)
     try:
+        os.fchmod(fd, PRIVATE_FILE_MODE)
         written = os.write(fd, line)
         if written != len(line):
             raise LedgerError("short write while appending ledger record")

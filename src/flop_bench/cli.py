@@ -34,7 +34,7 @@ from .service import (
     service_doctor,
     verify_request,
 )
-from .state import connect_state_with_migrations
+from .state import activation_history, connect_state_with_migrations
 
 
 def _print_json(value: Any) -> None:
@@ -50,6 +50,7 @@ def doctor(state_dir: Path) -> dict[str, Any]:
         "ok": True,
         "state_dir": str(state_dir.expanduser().resolve(strict=False)),
         "schema_migrations": migrations,
+        "permission_issues": [],
         "state_write": True,
         "migrations_applied": migrations_applied,
         "network_action": False,
@@ -111,6 +112,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     status_cmd = technocore_sub.add_parser("status")
     status_cmd.add_argument("--state-dir", required=True, type=Path)
+    activation_history_cmd = technocore_sub.add_parser("activation-history")
+    activation_history_cmd.add_argument("--state-dir", required=True, type=Path)
+    activation_history_cmd.add_argument("--limit", required=True, type=int)
     ledger = sub.add_parser("ledger")
     ledger_sub = ledger.add_subparsers(dest="ledger_cmd", required=True)
     ledger_verify = ledger_sub.add_parser("verify")
@@ -202,6 +206,8 @@ def run(argv: list[str] | None = None) -> int:
                     transport=UrlLibActivationTransport(),
                 )
             )
+        elif args.cmd == "technocore" and args.technocore_cmd == "activation-history":
+            _print_json(activation_history(args.state_dir, limit=args.limit))
         elif args.cmd == "ledger" and args.ledger_cmd == "verify":
             _print_json(verify_ledger(args.state_dir))
         elif args.cmd == "router-export":

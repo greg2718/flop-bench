@@ -39,6 +39,7 @@ The generated identity is local only:
 
 - `identity.pem` is an encrypted PKCS#8 Ed25519 private key.
 - `identity.json` contains public metadata only.
+- `state.sqlite`, SQLite WAL/SHM sidecars, `ledger.jsonl`, and private state artifacts are created or tightened to mode `0600` during writable opens. Read-only inspection reports insecure modes without changing them.
 - Creating it does not register Bench with Technocore, create a room or mailbox, activate Bench, post anything, submit Router evidence, create a wallet, or transfer FLOP.
 - If the passphrase is lost, FLOP Bench cannot decrypt the private key. There is no backup or recovery path in v0.2.
 
@@ -95,6 +96,7 @@ flop-bench request verify REQUEST.json --state-dir /tmp/flop-bench-state
 flop-bench response prepare EVIDENCE.json --state-dir ~/.flop_agents/bench
 flop-bench technocore plan-init --state-dir /tmp/flop-bench-state
 flop-bench technocore dry-run-sign PAYLOAD.json --state-dir ~/.flop_agents/bench
+flop-bench technocore activation-history --state-dir /tmp/flop-bench-state --limit 20
 ```
 
 `request verify` checks schema, target DID, sender signature, timestamp window, expiration, supported capability, request ID replay, and nonce replay. It reserves accepted request IDs/nonces atomically in SQLite but does not execute a test. Any execution still requires explicit policy approval and the existing `--allow-local-exec` gate.
@@ -104,6 +106,8 @@ flop-bench technocore dry-run-sign PAYLOAD.json --state-dir ~/.flop_agents/bench
 `service doctor --read-only` inspects whether the state directory and SQLite database exist and reports pending migrations without creating directories, databases, tables, ledger entries, or migrations. Without `--read-only`, `service doctor` opens the state database and may create or migrate it; its JSON includes `state_write: true` and `migrations_applied`.
 
 `technocore plan-init` displays the intended `d-flop-bench` and `mb-flop-bench` setup plan only. It does not create rooms, create mailboxes, post data, transmit anything, create state, or run migrations. Its JSON includes `state_write: false` and `migrations_applied: []`.
+
+`technocore activation-history` opens SQLite in read-only mode and never creates or migrates state or performs network I/O. It returns bounded activation audit rows with safe fields only and omits response hashes, response bodies, signatures, tokens, cookies, passphrases, and private material.
 
 Protocol patterns reused from FLOP Scout are Ed25519 `did:key` derivation, base64url Ed25519 signatures, canonical room/mailbox naming, integer nonce handling, bounded response reads, redirect refusal, duplicate/error redaction, and signed owner-note preimages in the form `namespace|key|nonce|value`. Bench request/response envelope preimages are local domain-separated canonical JSON because Scout only establishes Technocore room-post and room-owner preimages for live posts.
 

@@ -216,10 +216,8 @@ def parse_owner_note(raw: bytes | None) -> str | None:
     }
     if len(candidates) == 1:
         return next(iter(candidates))
-    if not candidates:
-        return None
     raise ActivationRequestError(
-        "ownership response contained multiple valid DIDs",
+        "ownership response did not contain exactly one valid DID",
         failure_classification="malformed_response",
     )
 
