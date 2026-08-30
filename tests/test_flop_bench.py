@@ -197,6 +197,7 @@ class FakeActivationTransport:
         self.nonces: dict[str, int] = {}
         self.write_statuses: list[int] = []
         self.post_statuses: list[int] = []
+        self.room_history_statuses: list[int] = []
         self.requests: list[tuple[str, str]] = []
         self.post_bodies: list[dict[str, object]] = []
         self.room_messages: dict[str, list[dict[str, object]]] = {}
@@ -226,6 +227,13 @@ class FakeActivationTransport:
         parsed = urllib.parse.urlparse(url)
         parts = parsed.path.strip("/").split("/")
         if method == "GET" and parts == ["r", "d-flop-bench"]:
+            if self.room_history_statuses:
+                return TransportResponse(
+                    self.room_history_statuses.pop(0),
+                    b"history unavailable token=abc123",
+                    {},
+                    final_url=url,
+                )
             query = urllib.parse.parse_qs(parsed.query)
             limit = int(query.get("limit", ["200"])[0])
             since = int(query.get("since", ["0"])[0])
@@ -322,6 +330,43 @@ class FakeActivationTransport:
                 headers = {"Retry-After": "2"} if status == 429 else {}
                 return TransportResponse(status, b"duplicate token=abc123", headers, final_url=url)
         return TransportResponse(400, b"bad request", {}, final_url=url)
+
+
+def insert_post_attempt_for_test(
+    state: Path,
+    *,
+    did: str,
+    text: str,
+    nonce: int,
+    status: str,
+    seq: int | None = None,
+    failure_classification: str | None = None,
+) -> int:
+    with connect_state(state) as conn:
+        attempt_id = conn.execute(
+            """
+            INSERT INTO post_attempts(
+                room, expected_owner_did, message_hash, post_status,
+                request_timestamp, response_status, nonce_used, seq,
+                failure_classification
+            )
+            VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)
+            """,
+            (
+                "d-flop-bench",
+                did,
+                message_hash(text),
+                status,
+                datetime.now(UTC).isoformat(),
+                nonce,
+                seq,
+                failure_classification,
+            ),
+        ).lastrowid
+        conn.commit()
+    if attempt_id is None:
+        raise AssertionError("missing test attempt id")
+    return int(attempt_id)
 
 
 def temp_production_identity(tmp_path: Path) -> tuple[Path, str, str]:
@@ -2278,6 +2323,245 @@ def test_reconcile_pagination_and_delayed_visibility_by_nonce(tmp_path: Path) ->
     assert result["matched_nonce"] == nonce
     assert result["seq"] == 201
     assert result["pages_scanned"] == 2
+
+
+def test_confirmed_posted_reconcile_http_503_preserves_audit(tmp_path: Path) -> None:
+    state, _passphrase, did = temp_production_identity(tmp_path)
+    text = "FLOP Bench confirmed survives 503"
+    attempt_id = insert_post_attempt_for_test(
+        state,
+        did=did,
+        text=text,
+        nonce=444,
+        status="reconciled_posted",
+        seq=1,
+        failure_classification=None,
+    )
+    transport = FakeActivationTransport()
+    transport.room_history_statuses = [503]
+    before = post_history(state_dir=state, limit=1)["posts"][0]
+    result = reconcile_post(
+        state_dir=state,
+        attempt_id=attempt_id,
+        transport=transport,
+        expected_bench_did=did,
+    )
+    after = post_history(state_dir=state, limit=1)["posts"][0]
+    assert result["history_scan_complete"] is False
+    assert result["reconciliation_status"] == "reconciliation_incomplete"
+    assert result["audit_transition"] == "preserved"
+    assert result["state_write"] is False
+    assert after == before
+
+
+def test_confirmed_posted_incomplete_pagination_preserves_audit(tmp_path: Path) -> None:
+    state, _passphrase, did = temp_production_identity(tmp_path)
+    text = "FLOP Bench confirmed survives incomplete"
+    attempt_id = insert_post_attempt_for_test(
+        state,
+        did=did,
+        text=text,
+        nonce=555,
+        status="posted",
+        seq=2,
+        failure_classification=None,
+    )
+    transport = FakeActivationTransport()
+    other = public_did(Ed25519PrivateKey.generate())
+    transport.room_messages["d-flop-bench"] = [
+        {"seq": idx + 1, "from": other, "text": f"filler {idx}", "nonce": idx + 1}
+        for idx in range(2000)
+    ]
+    before = post_history(state_dir=state, limit=1)["posts"][0]
+    result = reconcile_post(
+        state_dir=state,
+        attempt_id=attempt_id,
+        transport=transport,
+        expected_bench_did=did,
+    )
+    after = post_history(state_dir=state, limit=1)["posts"][0]
+    assert result["history_scan_complete"] is False
+    assert result["audit_transition"] == "preserved"
+    assert after == before
+
+
+def test_confirmed_posted_absent_scan_preserves_seq_and_success(tmp_path: Path) -> None:
+    state, _passphrase, did = temp_production_identity(tmp_path)
+    text = "FLOP Bench confirmed survives absent"
+    attempt_id = insert_post_attempt_for_test(
+        state,
+        did=did,
+        text=text,
+        nonce=666,
+        status="already-posted",
+        seq=3,
+        failure_classification=None,
+    )
+    transport = FakeActivationTransport()
+    before = post_history(state_dir=state, limit=1)["posts"][0]
+    result = reconcile_post(
+        state_dir=state,
+        attempt_id=attempt_id,
+        transport=transport,
+        expected_bench_did=did,
+    )
+    after = post_history(state_dir=state, limit=1)["posts"][0]
+    assert result["reconciliation_status"] == "reconciled_absent"
+    assert result["audit_transition"] == "preserved"
+    assert result["state_write"] is False
+    assert after == before
+    assert after["seq"] == 3
+    assert after["failure_classification"] is None
+
+
+def test_reconcile_absent_upgraded_by_exact_nonce_match(tmp_path: Path) -> None:
+    state, _passphrase, did = temp_production_identity(tmp_path)
+    text = "FLOP Bench absent later visible"
+    attempt_id = insert_post_attempt_for_test(
+        state,
+        did=did,
+        text=text,
+        nonce=777,
+        status="reconciled_absent",
+        seq=None,
+        failure_classification="absent_not_proven_rejected",
+    )
+    transport = FakeActivationTransport()
+    transport.room_messages["d-flop-bench"] = [{"seq": 4, "from": did, "text": text, "nonce": 777}]
+    result = reconcile_post(
+        state_dir=state,
+        attempt_id=attempt_id,
+        transport=transport,
+        expected_bench_did=did,
+    )
+    row = post_history(state_dir=state, limit=1)["posts"][0]
+    assert result["reconciliation_status"] == "reconciled_posted"
+    assert result["state_write"] is True
+    assert row["post_status"] == "reconciled_posted"
+    assert row["seq"] == 4
+    assert row["failure_classification"] is None
+
+
+def test_different_nonce_observation_preserves_confirmed_status(tmp_path: Path) -> None:
+    state, _passphrase, did = temp_production_identity(tmp_path)
+    text = "FLOP Bench confirmed different nonce"
+    attempt_id = insert_post_attempt_for_test(
+        state,
+        did=did,
+        text=text,
+        nonce=888,
+        status="reconciled_posted",
+        seq=5,
+        failure_classification=None,
+    )
+    transport = FakeActivationTransport()
+    transport.room_messages["d-flop-bench"] = [{"seq": 6, "from": did, "text": text, "nonce": 999}]
+    before = post_history(state_dir=state, limit=1)["posts"][0]
+    result = reconcile_post(
+        state_dir=state,
+        attempt_id=attempt_id,
+        transport=transport,
+        expected_bench_did=did,
+    )
+    after = post_history(state_dir=state, limit=1)["posts"][0]
+    assert result["reconciliation_status"] == "matching_message_different_nonce"
+    assert result["matching_message_other_nonce"] == {"seq": 6, "nonce": 999}
+    assert result["audit_transition"] == "preserved"
+    assert after == before
+
+
+def test_repeated_reconciliation_is_idempotent(tmp_path: Path) -> None:
+    state, _passphrase, did = temp_production_identity(tmp_path)
+    text = "FLOP Bench repeated reconcile"
+    attempt_id = insert_post_attempt_for_test(
+        state,
+        did=did,
+        text=text,
+        nonce=1001,
+        status="unknown_outcome",
+        seq=None,
+        failure_classification="post_outcome_unknown_timeout",
+    )
+    transport = FakeActivationTransport()
+    transport.room_messages["d-flop-bench"] = [{"seq": 7, "from": did, "text": text, "nonce": 1001}]
+    first = reconcile_post(
+        state_dir=state,
+        attempt_id=attempt_id,
+        transport=transport,
+        expected_bench_did=did,
+    )
+    second = reconcile_post(
+        state_dir=state,
+        attempt_id=attempt_id,
+        transport=transport,
+        expected_bench_did=did,
+    )
+    row = post_history(state_dir=state, limit=1)["posts"][0]
+    assert first["audit_transition"] == "updated"
+    assert second["audit_transition"] == "preserved"
+    assert second["state_write"] is False
+    assert row["post_status"] == "reconciled_posted"
+    assert row["seq"] == 7
+    assert row["failure_classification"] is None
+
+
+def test_out_of_order_reconciliation_results_are_monotonic(tmp_path: Path) -> None:
+    state, _passphrase, did = temp_production_identity(tmp_path)
+    text = "FLOP Bench out of order reconcile"
+    attempt_id = insert_post_attempt_for_test(
+        state,
+        did=did,
+        text=text,
+        nonce=1002,
+        status="unknown_outcome",
+        seq=None,
+        failure_classification="post_outcome_unknown_timeout",
+    )
+    exact = FakeActivationTransport()
+    exact.room_messages["d-flop-bench"] = [{"seq": 8, "from": did, "text": text, "nonce": 1002}]
+    reconcile_post(
+        state_dir=state,
+        attempt_id=attempt_id,
+        transport=exact,
+        expected_bench_did=did,
+    )
+    weaker_results = []
+    unavailable = FakeActivationTransport()
+    unavailable.room_history_statuses = [503]
+    weaker_results.append(
+        reconcile_post(
+            state_dir=state,
+            attempt_id=attempt_id,
+            transport=unavailable,
+            expected_bench_did=did,
+        )
+    )
+    absent = FakeActivationTransport()
+    weaker_results.append(
+        reconcile_post(
+            state_dir=state,
+            attempt_id=attempt_id,
+            transport=absent,
+            expected_bench_did=did,
+        )
+    )
+    other_nonce = FakeActivationTransport()
+    other_nonce.room_messages["d-flop-bench"] = [
+        {"seq": 9, "from": did, "text": text, "nonce": 1003}
+    ]
+    weaker_results.append(
+        reconcile_post(
+            state_dir=state,
+            attempt_id=attempt_id,
+            transport=other_nonce,
+            expected_bench_did=did,
+        )
+    )
+    row = post_history(state_dir=state, limit=1)["posts"][0]
+    assert all(item["audit_transition"] == "preserved" for item in weaker_results)
+    assert row["post_status"] == "reconciled_posted"
+    assert row["seq"] == 8
+    assert row["failure_classification"] is None
 
 
 def test_reconcile_does_not_nonce_sign_post_or_expose_remote_text(tmp_path: Path) -> None:

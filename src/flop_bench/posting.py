@@ -45,6 +45,7 @@ MAX_HISTORY_ITEMS = 2_000
 MAX_HISTORY_BYTES = 1_000_000
 MAX_HISTORY_SCAN_SECONDS = 20.0
 URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
+STRONG_POST_STATUSES = frozenset({"posted", "reconciled_posted", "already-posted"})
 
 
 def service_manifest() -> dict[str, Any]:
@@ -462,6 +463,61 @@ def classify_post_transport_failure(classification: str) -> tuple[str, str]:
     return "confirmed_rejected", classification
 
 
+def monotonic_reconciliation_transition(
+    current: dict[str, Any],
+    *,
+    observed_status: str,
+    observed_seq: int | None,
+    observed_failure_classification: str | None,
+) -> dict[str, Any]:
+    current_status = str(current["post_status"])
+    current_seq = current["seq"] if isinstance(current["seq"], int) else None
+    current_failure = current["failure_classification"]
+    if observed_status == "reconciled_posted":
+        next_status = "reconciled_posted"
+        next_seq = observed_seq if observed_seq is not None else current_seq
+        next_failure = None
+        return {
+            "state_write": (
+                current_status != next_status
+                or current_seq != next_seq
+                or current_failure is not None
+            ),
+            "post_status": next_status,
+            "seq": next_seq,
+            "failure_classification": next_failure,
+        }
+    if current_status in STRONG_POST_STATUSES:
+        return {
+            "state_write": False,
+            "post_status": current_status,
+            "seq": current_seq,
+            "failure_classification": current_failure,
+        }
+    if observed_status in {"reconciliation_incomplete", "matching_message_different_nonce"}:
+        return {
+            "state_write": False,
+            "post_status": current_status,
+            "seq": current_seq,
+            "failure_classification": current_failure,
+        }
+    if observed_status == "reconciled_absent":
+        next_status = "reconciled_absent"
+        next_failure = observed_failure_classification
+        return {
+            "state_write": current_status != next_status or current_failure != next_failure,
+            "post_status": next_status,
+            "seq": current_seq,
+            "failure_classification": next_failure,
+        }
+    return {
+        "state_write": False,
+        "post_status": current_status,
+        "seq": current_seq,
+        "failure_classification": current_failure,
+    }
+
+
 def protocol_check_post(message_path: Path, *, state_dir: Path) -> dict[str, Any]:
     text = read_message(message_path)
     byte_count = len(text.encode("utf-8"))
@@ -778,40 +834,44 @@ def reconcile_post(
         digest=digest,
         attempt_nonce=attempt_nonce,
     )
+    observed_seq: int | None
     if scan["exact_attempt_match"]:
-        status = "reconciled_posted"
-        classification = None
-        seq = int(scan["exact_attempt_seq"])
-        state_write = True
+        observed_status = "reconciled_posted"
+        observed_classification = None
+        observed_seq = int(scan["exact_attempt_seq"])
     elif scan["matching_message_different_nonce"]:
-        status = "matching_message_different_nonce"
-        classification = (
-            str(attempt["failure_classification"])
-            if attempt["failure_classification"] is not None
-            else None
-        )
-        seq = attempt["seq"]
-        state_write = False
+        observed_status = "matching_message_different_nonce"
+        observed_classification = None
+        observed_seq = attempt["seq"] if isinstance(attempt["seq"], int) else None
     elif scan["history_scan_complete"]:
-        status = "reconciled_absent"
-        classification = "absent_not_proven_rejected"
-        seq = None
-        state_write = True
+        observed_status = "reconciled_absent"
+        observed_classification = "absent_not_proven_rejected"
+        observed_seq = None
     else:
-        status = "reconciliation_incomplete"
-        classification = str(scan["failure_classification"] or "history_scan_incomplete")
-        seq = attempt["seq"]
-        state_write = True
+        observed_status = "reconciliation_incomplete"
+        observed_classification = str(scan["failure_classification"] or "history_scan_incomplete")
+        observed_seq = attempt["seq"] if isinstance(attempt["seq"], int) else None
+    transition = monotonic_reconciliation_transition(
+        attempt,
+        observed_status=observed_status,
+        observed_seq=observed_seq,
+        observed_failure_classification=observed_classification,
+    )
+    state_write = bool(transition["state_write"])
     if state_write:
         with connect_state(resolved_state) as conn:
             update_post_attempt(
                 conn,
                 post_id=attempt_id,
-                post_status=status,
+                post_status=str(transition["post_status"]),
                 response_status=attempt["response_status"],
                 nonce_used=attempt["nonce_used"],
-                seq=seq,
-                failure_classification=classification,
+                seq=transition["seq"] if isinstance(transition["seq"], int) else None,
+                failure_classification=(
+                    str(transition["failure_classification"])
+                    if transition["failure_classification"] is not None
+                    else None
+                ),
             )
     return {
         "ok": scan["history_scan_complete"],
@@ -826,11 +886,13 @@ def reconcile_post(
         "matching_message_other_nonce": scan["matching_message_other_nonce"],
         "matching_message_different_nonce": scan["matching_message_different_nonce"],
         "matching_message_unattributable_nonce": scan["matching_message_unattributable_nonce"],
-        "seq": seq if scan["exact_attempt_match"] else scan["seq"],
+        "seq": observed_seq if scan["exact_attempt_match"] else scan["seq"],
         "history_scan_complete": scan["history_scan_complete"],
         "pages_scanned": scan["pages_scanned"],
         "nonce_observation": None,
-        "reconciliation_status": status,
+        "reconciliation_status": observed_status,
+        "audit_status": transition["post_status"],
+        "audit_transition": "updated" if state_write else "preserved",
         "state_write": state_write,
         "network_action": "bounded_read_only",
     }
