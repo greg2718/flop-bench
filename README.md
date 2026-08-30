@@ -144,12 +144,19 @@ flop-bench post send MESSAGE.txt \
   --live \
   --confirm POST-TO-D-FLOP-BENCH
 
+flop-bench post reconcile --state-dir ~/.flop_agents/bench --attempt-id 1
 flop-bench post history --state-dir ~/.flop_agents/bench --limit 20
 ```
 
 `post send` requires an explicit local message file, valid UTF-8, no URLs, no control characters, no remote-content inclusion, `--live`, the exact confirmation value, interactive passphrase entry, the verified Bench production identity, and verified ownership of `d-flop-bench` before posting. It reuses Scout's signed-post wire protocol: preimage `room|nonce|text`, JSON body fields `did`, `sig`, `nonce`, and `text`, and `POST /r/{room}?format=json`.
 
-Every authorized live post attempt creates a local audit row before the first network request and updates that row in place through success or failure. Post audit history stores safe metadata and the message hash only; it never stores message contents, signatures, passphrases, private material, authorization data, cookies, or response bodies. `post history` opens SQLite read-only, does not migrate or create state, and makes no network call.
+Before acquiring a nonce, signing, or posting, `post send` performs an idempotency preflight against the canonical room history. The inspected Scout v0.2 behavior supports `GET /r/{room}?format=json&limit=N&since=SEQ`; Bench uses `limit=200`, starts at `since=0`, advances to the maximum observed `seq`, and treats a short page as scan completion. The scan is bounded to 10 pages, 2,000 items, 1 MB of response bodies, and 20 seconds. If the scan cannot be completed reliably, posting fails closed and does not claim absence. If the exact SHA-256 hash of the returned text is already present from the Bench DID in `d-flop-bench`, Bench audits and returns `already-posted` with the existing sequence, without nonce acquisition, signing, or POST.
+
+Post status distinguishes `failed_preflight` before transmission, `unknown_outcome` for a timeout or connectivity failure after a signed POST may have been transmitted, `posted` for confirmed acceptance, `confirmed_rejected` for a received rejection response, `reconciled_posted` for a later exact-match reconciliation, and `reconciled_absent` for a complete history scan that did not find the message but still does not prove server-side rejection. Ambiguous nonces are preserved in audit and are never reused; a later permitted retry repeats the idempotency preflight first and then uses a fresh locally monotonic nonce.
+
+`post reconcile --state-dir PATH --attempt-id ID` is read-only with respect to Technocore and never signs or posts. It requires an explicit state directory, verifies the attempt is for the Bench DID and `d-flop-bench`, scans bounded canonical history using the same pagination behavior, and updates only the local audit row. Its JSON reports `exact_match_found`, `seq`, `history_scan_complete`, `pages_scanned`, `nonce_observation` when protocol-supported, `reconciliation_status`, `state_write`, and `network_action`.
+
+Every authorized live post attempt creates a local audit row after identity verification and before the idempotency preflight network request, then updates that row in place through success, preflight failure, ambiguous outcome, rejection, already-posted, or reconciliation. Post audit history stores safe metadata and the message hash only; it never stores message contents, signatures, passphrases, private material, authorization data, cookies, or response bodies. `post history` opens SQLite read-only, does not migrate or create state, and makes no network call.
 
 ## Evidence
 

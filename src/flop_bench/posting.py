@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -27,11 +28,22 @@ from .config import (
 )
 from .exceptions import SafetyError, ValidationError
 from .identity import b64u, load_production_identity_key
-from .state import connect_state, post_history, record_post_attempt, update_post_attempt
+from .state import (
+    connect_state,
+    post_attempt,
+    post_history,
+    record_post_attempt,
+    update_post_attempt,
+)
 
 POST_CONFIRMATION = "POST-TO-D-FLOP-BENCH"
 MAX_POST_CHARS = 4096
 MAX_POST_BYTES = 4096
+ROOM_HISTORY_PAGE_LIMIT = 200
+MAX_HISTORY_PAGES = 10
+MAX_HISTORY_ITEMS = 2_000
+MAX_HISTORY_BYTES = 1_000_000
+MAX_HISTORY_SCAN_SECONDS = 20.0
 URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
 
 
@@ -129,6 +141,42 @@ def message_hash(text: str) -> str:
     return sha256_bytes(text.encode("utf-8"))
 
 
+def extract_room_messages(obj: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("messages", "items", "posts", "log"):
+        value = obj.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    room = obj.get("room")
+    if isinstance(room, dict):
+        return extract_room_messages(room)
+    return []
+
+
+def message_sender(raw: dict[str, Any]) -> str:
+    sender = raw.get("from") or raw.get("did") or raw.get("nick") or raw.get("nickname")
+    return str(sender) if sender is not None else "unknown"
+
+
+def message_seq(raw: dict[str, Any]) -> int | None:
+    value = raw.get("seq")
+    if value is None:
+        return None
+    try:
+        seq = int(value)
+    except (TypeError, ValueError):
+        return None
+    return seq if seq > 0 else None
+
+
+def exact_message_match(raw: dict[str, Any], *, expected_did: str, digest: str) -> int | None:
+    if message_sender(raw) != expected_did:
+        return None
+    text = raw.get("text")
+    if not isinstance(text, str) or message_hash(text) != digest:
+        return None
+    return message_seq(raw)
+
+
 def signed_post_preimage(room: str, nonce: int, text: str) -> bytes:
     if room != CANONICAL_ROOM:
         raise SafetyError("signed posts are restricted to d-flop-bench")
@@ -139,6 +187,116 @@ def post_room_url(room: str = CANONICAL_ROOM) -> str:
     if room != CANONICAL_ROOM:
         raise SafetyError("signed posts are restricted to d-flop-bench")
     return f"{TECHNOCORE_ORIGIN}/r/{quote(room)}?format=json"
+
+
+def room_history_url(room: str = CANONICAL_ROOM, *, limit: int, since: int | None = None) -> str:
+    if room != CANONICAL_ROOM:
+        raise SafetyError("room history is restricted to d-flop-bench")
+    if not 1 <= limit <= ROOM_HISTORY_PAGE_LIMIT:
+        raise SafetyError("room history limit is outside the supported bound")
+    query = f"format=json&limit={limit}"
+    if since is not None:
+        query += f"&since={max(0, since)}"
+    return f"{TECHNOCORE_ORIGIN}/r/{quote(room)}?{query}"
+
+
+def scan_room_history_for_hash(
+    transport: ActivationTransport,
+    *,
+    expected_did: str,
+    digest: str,
+    max_pages: int = MAX_HISTORY_PAGES,
+    page_limit: int = ROOM_HISTORY_PAGE_LIMIT,
+    max_items: int = MAX_HISTORY_ITEMS,
+    max_bytes: int = MAX_HISTORY_BYTES,
+    max_seconds: float = MAX_HISTORY_SCAN_SECONDS,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    pages_scanned = 0
+    items_scanned = 0
+    bytes_scanned = 0
+    since = 0
+    exact_seq: int | None = None
+    complete = False
+    failure: str | None = None
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    while pages_scanned < max_pages and items_scanned < max_items:
+        if time.monotonic() - started > max_seconds:
+            failure = "history_scan_timeout"
+            break
+        url = room_history_url(limit=page_limit, since=since)
+        try:
+            response = transport.request("GET", url, headers=headers)
+        except ActivationRequestError as exc:
+            failure = exc.failure_classification
+            break
+        if response.final_url and response.final_url != url:
+            failure = "redirect_rejected"
+            break
+        bytes_scanned += len(response.body)
+        if bytes_scanned > max_bytes:
+            failure = "history_scan_oversized"
+            break
+        if response.status != 200:
+            failure = classify_post_status(response.status)
+            break
+        try:
+            parsed = json.loads(response.body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            failure = "malformed_response"
+            break
+        if not isinstance(parsed, dict):
+            failure = "malformed_response"
+            break
+        messages = extract_room_messages(parsed)
+        pages_scanned += 1
+        items_scanned += len(messages)
+        max_seq = since
+        for raw in messages:
+            seq = exact_message_match(raw, expected_did=expected_did, digest=digest)
+            if seq is not None:
+                exact_seq = seq if exact_seq is None else min(exact_seq, seq)
+            observed_seq = message_seq(raw)
+            if observed_seq is not None:
+                max_seq = max(max_seq, observed_seq)
+        if len(messages) < page_limit:
+            complete = True
+            break
+        if max_seq <= since:
+            failure = "history_pagination_stalled"
+            break
+        since = max_seq
+    else:
+        failure = "history_scan_incomplete"
+    if not complete and failure is None:
+        failure = "history_scan_incomplete"
+    return {
+        "exact_match_found": exact_seq is not None,
+        "seq": exact_seq,
+        "history_scan_complete": complete,
+        "pages_scanned": pages_scanned,
+        "items_scanned": items_scanned,
+        "bytes_scanned": bytes_scanned,
+        "failure_classification": failure,
+        "network_action": True,
+        "followed_urls": False,
+        "interpreted_remote_text_as_instructions": False,
+    }
+
+
+def idempotency_preflight(
+    transport: ActivationTransport,
+    *,
+    expected_did: str,
+    digest: str,
+) -> dict[str, Any]:
+    scan = scan_room_history_for_hash(transport, expected_did=expected_did, digest=digest)
+    if not scan["history_scan_complete"]:
+        raise ActivationRequestError(
+            "Technocore room history could not be completely searched",
+            failure_classification=str(scan["failure_classification"] or "history_scan_incomplete"),
+        )
+    return scan
 
 
 def preview_post(message_path: Path, *, state_dir: Path) -> dict[str, Any]:
@@ -160,12 +318,14 @@ def preview_post(message_path: Path, *, state_dir: Path) -> dict[str, Any]:
     }
 
 
-def start_post_audit(state_dir: Path, *, message_hash_value: str) -> int:
+def start_post_audit(
+    state_dir: Path, *, message_hash_value: str, expected_owner_did: str = BENCH_DID
+) -> int:
     with connect_state(state_dir) as conn:
         return record_post_attempt(
             conn,
             room=CANONICAL_ROOM,
-            expected_owner_did=BENCH_DID,
+            expected_owner_did=expected_owner_did,
             message_hash=message_hash_value,
             post_status="started",
             response_status=None,
@@ -238,7 +398,51 @@ def send_post(
         expected_state_dir=expected_state_dir,
         expected_did=expected_bench_did,
     )
-    post_id = start_post_audit(resolved_state, message_hash_value=digest)
+    post_id = start_post_audit(
+        resolved_state,
+        message_hash_value=digest,
+        expected_owner_did=expected_bench_did,
+    )
+    try:
+        preflight = idempotency_preflight(
+            transport,
+            expected_did=expected_bench_did,
+            digest=digest,
+        )
+    except ActivationRequestError as exc:
+        update_post_audit(
+            resolved_state,
+            post_id=post_id,
+            post_status="failed_preflight",
+            response_status=exc.response.status if exc.response else None,
+            nonce_used=None,
+            seq=None,
+            failure_classification=exc.failure_classification,
+        )
+        raise
+    if preflight["exact_match_found"]:
+        update_post_audit(
+            resolved_state,
+            post_id=post_id,
+            post_status="already-posted",
+            response_status=None,
+            nonce_used=None,
+            seq=int(preflight["seq"]),
+            failure_classification=None,
+        )
+        return {
+            "ok": True,
+            "room": CANONICAL_ROOM,
+            "did": expected_bench_did,
+            "post_status": "already-posted",
+            "message_hash": digest,
+            "nonce": None,
+            "seq": preflight["seq"],
+            "attempt_id": post_id,
+            "idempotency_preflight": preflight,
+            "network_action": True,
+            "state_write": True,
+        }
     try:
         owner, owner_response = get_note(transport, "room-owners", CANONICAL_ROOM)
     except ActivationRequestError as exc:
@@ -310,14 +514,26 @@ def send_post(
             )
         parsed = json.loads(response.body.decode("utf-8"))
     except ActivationRequestError as exc:
+        ambiguous = exc.response is None and exc.failure_classification in {
+            "timeout",
+            "connectivity_failure",
+        }
         update_post_audit(
             resolved_state,
             post_id=post_id,
-            post_status="failed",
+            post_status="unknown_outcome" if ambiguous else "confirmed_rejected",
             response_status=exc.response.status if exc.response else None,
             nonce_used=nonce,
             seq=None,
-            failure_classification=exc.failure_classification,
+            failure_classification=(
+                "timeout_after_transmission"
+                if exc.failure_classification == "timeout" and ambiguous
+                else (
+                    "connectivity_failure_after_transmission"
+                    if exc.failure_classification == "connectivity_failure" and ambiguous
+                    else exc.failure_classification
+                )
+            ),
         )
         raise
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -386,11 +602,66 @@ def send_post(
         "ok": True,
         "room": CANONICAL_ROOM,
         "did": expected_bench_did,
+        "post_status": "posted",
         "message_hash": digest,
         "nonce": nonce,
         "seq": seq,
         "network_action": True,
         "state_write": True,
+    }
+
+
+def reconcile_post(
+    *,
+    state_dir: Path,
+    attempt_id: int,
+    transport: ActivationTransport,
+    expected_bench_did: str = BENCH_DID,
+) -> dict[str, Any]:
+    resolved_state = state_dir.expanduser().resolve(strict=False)
+    attempt = post_attempt(resolved_state, attempt_id=attempt_id)
+    if attempt["room"] != CANONICAL_ROOM:
+        raise SafetyError("post reconcile is restricted to d-flop-bench attempts")
+    if attempt["expected_owner_did"] != expected_bench_did:
+        raise SafetyError("post reconcile attempt DID does not match Bench DID")
+    digest = str(attempt["message_hash"])
+    scan = scan_room_history_for_hash(transport, expected_did=expected_bench_did, digest=digest)
+    if scan["exact_match_found"]:
+        status = "reconciled_posted"
+        classification = None
+        seq = int(scan["seq"])
+    elif scan["history_scan_complete"]:
+        status = "reconciled_absent"
+        classification = "absent_not_proven_rejected"
+        seq = None
+    else:
+        status = "reconciliation_incomplete"
+        classification = str(scan["failure_classification"] or "history_scan_incomplete")
+        seq = attempt["seq"]
+    with connect_state(resolved_state) as conn:
+        update_post_attempt(
+            conn,
+            post_id=attempt_id,
+            post_status=status,
+            response_status=attempt["response_status"],
+            nonce_used=attempt["nonce_used"],
+            seq=seq,
+            failure_classification=classification,
+        )
+    return {
+        "ok": scan["history_scan_complete"],
+        "attempt_id": attempt_id,
+        "room": CANONICAL_ROOM,
+        "bench_did": expected_bench_did,
+        "message_hash": digest,
+        "exact_match_found": scan["exact_match_found"],
+        "seq": seq,
+        "history_scan_complete": scan["history_scan_complete"],
+        "pages_scanned": scan["pages_scanned"],
+        "nonce_observation": None,
+        "reconciliation_status": status,
+        "state_write": True,
+        "network_action": "bounded_read_only",
     }
 
 

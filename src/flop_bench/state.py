@@ -224,6 +224,31 @@ def post_history(state_dir: Path, *, limit: int) -> dict[str, Any]:
     }
 
 
+def post_attempt(state_dir: Path, *, attempt_id: int) -> dict[str, Any]:
+    if attempt_id < 1:
+        raise SafetyError("post attempt id must be positive")
+    resolved = state_dir.expanduser().resolve(strict=False)
+    status = migration_status(resolved)
+    if not status["database_exists"]:
+        raise SafetyError("post attempt state database does not exist")
+    uri = f"file:{(resolved / STATE_DB).as_posix()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT id, room, expected_owner_did, message_hash, post_status,
+                   request_timestamp, response_status, nonce_used, seq,
+                   failure_classification
+            FROM post_attempts
+            WHERE id = ?
+            """,
+            (attempt_id,),
+        ).fetchone()
+    if row is None:
+        raise SafetyError("post attempt not found")
+    return dict(row)
+
+
 def migrate(conn: sqlite3.Connection) -> list[int]:
     applied: list[int] = []
     conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)")

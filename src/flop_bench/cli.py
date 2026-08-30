@@ -25,7 +25,7 @@ from .identity import (
     verify_identity,
 )
 from .ledger import verify_ledger
-from .posting import POST_CONFIRMATION, preview_post, send_post
+from .posting import POST_CONFIRMATION, preview_post, reconcile_post, send_post
 from .posting import history as post_history
 from .schemas import validate_test_spec
 from .service import (
@@ -143,6 +143,9 @@ def build_parser() -> argparse.ArgumentParser:
     post_history_cmd = post_sub.add_parser("history")
     post_history_cmd.add_argument("--state-dir", required=True, type=Path)
     post_history_cmd.add_argument("--limit", required=True, type=int)
+    post_reconcile = post_sub.add_parser("reconcile")
+    post_reconcile.add_argument("--state-dir", required=True, type=Path)
+    post_reconcile.add_argument("--attempt-id", required=True, type=int)
     return parser
 
 
@@ -257,6 +260,14 @@ def run(argv: list[str] | None = None) -> int:
             )
         elif args.cmd == "post" and args.post_cmd == "history":
             _print_json(post_history(state_dir=args.state_dir, limit=args.limit))
+        elif args.cmd == "post" and args.post_cmd == "reconcile":
+            _print_json(
+                reconcile_post(
+                    state_dir=args.state_dir,
+                    attempt_id=args.attempt_id,
+                    transport=UrlLibActivationTransport(),
+                )
+            )
         else:
             raise FlopBenchError("unknown command")
     except LedgerError as exc:
