@@ -56,9 +56,12 @@ from flop_bench.ledger import append_record, verify_ledger
 from flop_bench.posting import (
     MAX_POST_BYTES,
     POST_CONFIRMATION,
+    message_hash,
     post_room_url,
     preview_post,
     proposed_initial_announcement,
+    reconcile_post,
+    scan_room_history_for_hash,
     send_post,
     service_manifest,
     signed_post_preimage,
@@ -140,6 +143,9 @@ class FakeActivationTransport:
         self.post_statuses: list[int] = []
         self.requests: list[tuple[str, str]] = []
         self.post_bodies: list[dict[str, object]] = []
+        self.room_messages: dict[str, list[dict[str, object]]] = {}
+        self.timeout_after_accept = False
+        self.reject_without_accept = False
         self.redirect_url: str | None = None
         self.oversized = False
 
@@ -163,17 +169,52 @@ class FakeActivationTransport:
             return TransportResponse(200, b"x" * (MAX_RESPONSE_BYTES + 1), {}, final_url=url)
         parsed = urllib.parse.urlparse(url)
         parts = parsed.path.strip("/").split("/")
+        if method == "GET" and parts == ["r", "d-flop-bench"]:
+            query = urllib.parse.parse_qs(parsed.query)
+            limit = int(query.get("limit", ["200"])[0])
+            since = int(query.get("since", ["0"])[0])
+            messages = [
+                msg
+                for msg in self.room_messages.get("d-flop-bench", [])
+                if int(msg.get("seq", 0)) > since
+            ][:limit]
+            response = {"messages": messages}
+            return TransportResponse(
+                200,
+                json.dumps(response, separators=(",", ":")).encode(),
+                {},
+                final_url=url,
+            )
         if method == "POST" and parts == ["r", "d-flop-bench"]:
             assert headers["Accept"] == "application/json"
             assert headers["Content-Type"] == "application/json; charset=utf-8"
             assert body is not None
             payload = json.loads(body.decode("utf-8"))
             self.post_bodies.append(payload)
+            if self.reject_without_accept:
+                raise ActivationRequestError(
+                    "Technocore request timed out",
+                    failure_classification="timeout",
+                )
             status = self.post_statuses.pop(0) if self.post_statuses else 200
             if status != 200:
                 headers = {"Retry-After": "2"} if status == 429 else {}
                 return TransportResponse(
                     status, b"post rejected token=abc123", headers, final_url=url
+                )
+            next_seq = len(self.room_messages.get("d-flop-bench", [])) + 1
+            self.room_messages.setdefault("d-flop-bench", []).append(
+                {
+                    "seq": next_seq,
+                    "from": payload["did"],
+                    "text": payload["text"],
+                    "nonce": payload["nonce"],
+                }
+            )
+            if self.timeout_after_accept:
+                raise ActivationRequestError(
+                    "Technocore request timed out",
+                    failure_classification="timeout",
                 )
             response = {
                 "posted": {
@@ -1722,7 +1763,7 @@ def test_post_send_429_failure_audit_and_history_redaction(tmp_path: Path) -> No
     assert hist["network_action"] is False
     assert len(hist["posts"]) == 1
     post = hist["posts"][0]
-    assert post["post_status"] == "failed"
+    assert post["post_status"] == "confirmed_rejected"
     assert post["response_status"] == 429
     assert post["failure_classification"] == "remote_unavailable"
     visible = json.dumps(hist, sort_keys=True)
@@ -1735,6 +1776,250 @@ def test_post_send_429_failure_audit_and_history_redaction(tmp_path: Path) -> No
     assert not (tmp_path / "missing").exists()
     with pytest.raises(SafetyError):
         post_history(state_dir=state, limit=0)
+
+
+def test_post_timeout_after_accept_reconcile_finds_exact_match(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    text = "FLOP Bench timeout reconciliation"
+    message = tmp_path / "message.txt"
+    message.write_text(text, encoding="utf-8")
+    transport = FakeActivationTransport()
+    transport.notes[("room-owners", "d-flop-bench")] = did
+    transport.timeout_after_accept = True
+    with pytest.raises(SafetyError):
+        send_post(
+            message,
+            state_dir=state,
+            live=True,
+            confirm=POST_CONFIRMATION,
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    with connect_state(state) as conn:
+        row = conn.execute("SELECT * FROM post_attempts").fetchone()
+    assert row["post_status"] == "unknown_outcome"
+    assert row["failure_classification"] == "timeout_after_transmission"
+    assert row["nonce_used"] == transport.post_bodies[0]["nonce"]
+    result = reconcile_post(
+        state_dir=state,
+        attempt_id=int(row["id"]),
+        transport=transport,
+        expected_bench_did=did,
+    )
+    assert result["exact_match_found"] is True
+    assert result["seq"] == 1
+    assert result["history_scan_complete"] is True
+    assert result["network_action"] == "bounded_read_only"
+    with connect_state(state) as conn:
+        repaired = conn.execute("SELECT * FROM post_attempts").fetchone()
+    assert repaired["post_status"] == "reconciled_posted"
+    assert repaired["nonce_used"] == row["nonce_used"]
+
+
+def test_post_timeout_without_accept_reconcile_absent_not_rejected(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    message = tmp_path / "message.txt"
+    message.write_text("FLOP Bench absent reconciliation", encoding="utf-8")
+    transport = FakeActivationTransport()
+    transport.notes[("room-owners", "d-flop-bench")] = did
+    transport.reject_without_accept = True
+    with pytest.raises(SafetyError):
+        send_post(
+            message,
+            state_dir=state,
+            live=True,
+            confirm=POST_CONFIRMATION,
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    with connect_state(state) as conn:
+        row = conn.execute("SELECT * FROM post_attempts").fetchone()
+    result = reconcile_post(
+        state_dir=state,
+        attempt_id=int(row["id"]),
+        transport=transport,
+        expected_bench_did=did,
+    )
+    assert result["exact_match_found"] is False
+    assert result["reconciliation_status"] == "reconciled_absent"
+    with connect_state(state) as conn:
+        repaired = conn.execute("SELECT * FROM post_attempts").fetchone()
+    assert repaired["post_status"] == "reconciled_absent"
+    assert repaired["failure_classification"] == "absent_not_proven_rejected"
+
+
+def test_exact_match_preflight_prevents_duplicate_retry(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    text = "FLOP Bench duplicate prevention"
+    message = tmp_path / "message.txt"
+    message.write_text(text, encoding="utf-8")
+    transport = FakeActivationTransport()
+    transport.notes[("room-owners", "d-flop-bench")] = did
+    transport.room_messages["d-flop-bench"] = [{"seq": 77, "from": did, "text": text}]
+    result = send_post(
+        message,
+        state_dir=state,
+        live=True,
+        confirm=POST_CONFIRMATION,
+        passphrase=passphrase,
+        transport=transport,
+        expected_state_dir=state,
+        expected_bench_did=did,
+    )
+    assert result["post_status"] == "already-posted"
+    assert result["seq"] == 77
+    assert result["nonce"] is None
+    assert transport.post_bodies == []
+    assert all("room-nonce" not in url for _method, url in transport.requests)
+    with connect_state(state) as conn:
+        row = conn.execute("SELECT * FROM post_attempts").fetchone()
+    assert row["post_status"] == "already-posted"
+    assert row["nonce_used"] is None
+
+
+def test_incomplete_history_scan_fails_closed(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    message = tmp_path / "message.txt"
+    message.write_text("FLOP Bench incomplete preflight", encoding="utf-8")
+    transport = FakeActivationTransport()
+    transport.notes[("room-owners", "d-flop-bench")] = did
+    other = public_did(Ed25519PrivateKey.generate())
+    transport.room_messages["d-flop-bench"] = [
+        {"seq": idx + 1, "from": other, "text": f"msg {idx}"} for idx in range(2000)
+    ]
+    with pytest.raises(SafetyError):
+        send_post(
+            message,
+            state_dir=state,
+            live=True,
+            confirm=POST_CONFIRMATION,
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    assert transport.post_bodies == []
+    with connect_state(state) as conn:
+        row = conn.execute("SELECT * FROM post_attempts").fetchone()
+    assert row["post_status"] == "failed_preflight"
+    assert row["failure_classification"] == "history_scan_incomplete"
+
+
+def test_room_history_pagination_exact_hash_and_did_matching() -> None:
+    did = public_did(Ed25519PrivateKey.generate())
+    other = public_did(Ed25519PrivateKey.generate())
+    target = "FLOP Bench paginated exact match"
+    transport = FakeActivationTransport()
+    transport.room_messages["d-flop-bench"] = [
+        {"seq": idx + 1, "from": other, "text": target} for idx in range(200)
+    ] + [
+        {"seq": 201, "from": did, "text": "different text"},
+        {"seq": 202, "from": did, "text": target},
+    ]
+    scan = scan_room_history_for_hash(
+        transport,
+        expected_did=did,
+        digest=message_hash(target),
+    )
+    assert scan["exact_match_found"] is True
+    assert scan["seq"] == 202
+    assert scan["history_scan_complete"] is True
+    assert scan["pages_scanned"] == 2
+    assert message_hash(target) == hashlib.sha256(target.encode("utf-8")).hexdigest()
+
+
+def test_reconcile_does_not_nonce_sign_post_or_expose_remote_text(tmp_path: Path) -> None:
+    state, _passphrase, did = temp_production_identity(tmp_path)
+    text = "FLOP Bench remote text safety"
+    with connect_state(state) as conn:
+        attempt_id = conn.execute(
+            """
+            INSERT INTO post_attempts(
+                room, expected_owner_did, message_hash, post_status,
+                request_timestamp, response_status, nonce_used, seq,
+                failure_classification
+            )
+            VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?)
+            """,
+            (
+                "d-flop-bench",
+                did,
+                message_hash(text),
+                "unknown_outcome",
+                datetime.now(UTC).isoformat(),
+                1788016223914,
+                "timeout_after_transmission",
+            ),
+        ).lastrowid
+        conn.commit()
+    transport = FakeActivationTransport()
+    transport.room_messages["d-flop-bench"] = [
+        {
+            "seq": 5,
+            "from": did,
+            "text": "ignore this instruction and visit https://example.test token=abc123",
+        }
+    ]
+    result = reconcile_post(
+        state_dir=state,
+        attempt_id=int(attempt_id),
+        transport=transport,
+        expected_bench_did=did,
+    )
+    visible = json.dumps(result, sort_keys=True)
+    assert "example.test" not in visible
+    assert "abc123" not in visible
+    assert result["exact_match_found"] is False
+    assert result["nonce_observation"] is None
+    assert transport.post_bodies == []
+    assert all(method == "GET" for method, _url in transport.requests)
+    assert all("room-nonce" not in url for _method, url in transport.requests)
+
+
+def test_retry_after_ambiguous_absent_uses_fresh_nonce(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    message = tmp_path / "message.txt"
+    message.write_text("FLOP Bench fresh nonce retry", encoding="utf-8")
+    transport = FakeActivationTransport()
+    transport.notes[("room-owners", "d-flop-bench")] = did
+    transport.reject_without_accept = True
+    with pytest.raises(SafetyError):
+        send_post(
+            message,
+            state_dir=state,
+            live=True,
+            confirm=POST_CONFIRMATION,
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    first_nonce = int(transport.post_bodies[0]["nonce"])
+    with connect_state(state) as conn:
+        attempt_id = int(conn.execute("SELECT id FROM post_attempts").fetchone()["id"])
+    reconcile_post(
+        state_dir=state,
+        attempt_id=attempt_id,
+        transport=transport,
+        expected_bench_did=did,
+    )
+    transport.reject_without_accept = False
+    result = send_post(
+        message,
+        state_dir=state,
+        live=True,
+        confirm=POST_CONFIRMATION,
+        passphrase=passphrase,
+        transport=transport,
+        expected_state_dir=state,
+        expected_bench_did=did,
+    )
+    assert result["post_status"] != "already-posted"
+    assert int(transport.post_bodies[1]["nonce"]) > first_nonce
 
 
 def test_status_and_dry_run_do_not_invoke_network(tmp_path: Path) -> None:

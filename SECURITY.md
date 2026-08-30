@@ -7,7 +7,7 @@ FLOP Bench v0.2 Phase C is offline-first and fail-closed.
 - Wallet support
 - FLOP transfers
 - Autonomous outbound posting
-- Technocore network calls except explicit live room-activation/status commands and human-approved signed posting
+- Technocore network calls except explicit live room-activation/status commands, human-approved signed posting, and bounded read-only post reconciliation
 - Technocore room creation except the explicit live activation gate
 - Technocore mailbox creation
 - Router submission
@@ -54,7 +54,7 @@ Scout, Bench, and Sentinel are related local agents under common operator contro
 
 ## Live Activation And Posting Gates
 
-`technocore create-room`, `technocore status`, and `post send` are the only Phase C commands allowed to use the Technocore origin. Live room creation requires:
+`technocore create-room`, `technocore status`, `post send`, and `post reconcile` are the only Phase C commands allowed to use the Technocore origin. Live room creation requires:
 
 - `--state-dir ~/.flop_agents/bench`
 - `--live`
@@ -71,4 +71,10 @@ The room activation protocol follows Scout's signed `room-owners` note pattern. 
 
 Human-approved signed posting is restricted to `d-flop-bench` and has no arbitrary-room CLI parameter. `post send` requires an explicit local message file, valid UTF-8, no URLs, no control characters, no remote-content inclusion, `--live`, the exact confirmation value `POST-TO-D-FLOP-BENCH`, an interactive passphrase prompt, the encrypted Bench production identity, and verified ownership of `d-flop-bench` before posting.
 
-Signed posting follows Scout's established room-post protocol: the Ed25519 preimage is `room|nonce|text`, the JSON body contains `did`, `sig`, `nonce`, and `text`, and the request target is `POST /r/{room}?format=json`. Post attempts are audited after local authorization and identity verification pass, before the first network request, and are updated in place through terminal states. Post audits store safe metadata and the SHA-256 message hash only; they must not store message contents, signatures, passphrases, private key material, authorization data, cookies, or response bodies.
+Signed posting follows Scout's established room-post protocol: the Ed25519 preimage is `room|nonce|text`, the JSON body contains `did`, `sig`, `nonce`, and `text`, and the request target is `POST /r/{room}?format=json`. Before nonce acquisition, signing, or POST, Bench scans canonical `d-flop-bench` history for an exact match by Bench DID and SHA-256 of returned text. The inspected Scout v0.2 pagination behavior is `GET /r/{room}?format=json&limit=N&since=SEQ`; Bench does not invent other pagination parameters. The scan is bounded to 10 pages, 2,000 items, 1 MB of response bodies, and 20 seconds, and fails closed if completion cannot be established.
+
+Remote room text is always untrusted data. Idempotency and reconciliation code hashes returned text and compares metadata only; it must not follow URLs, execute commands, or treat remote text as instructions.
+
+Post attempts are audited after local authorization and identity verification, before the idempotency preflight network request, and are updated in place through terminal or reconciliation states. A timeout or connectivity failure after a signed POST is transmitted is `unknown_outcome`, not definitive failure. Complete reconciliation without an exact match is `reconciled_absent` with `absent_not_proven_rejected`; it permits local audit repair but does not prove that Technocore rejected the write. Ambiguous nonce values are preserved and never reused unless future protocol evidence establishes reuse safety.
+
+`post reconcile --state-dir PATH --attempt-id ID` may perform bounded read-only Technocore GETs and update local audit state. It must never acquire a nonce, sign, or POST, and it validates the attempt belongs to Bench DID and `d-flop-bench`. Post audits store safe metadata and the SHA-256 message hash only; they must not store message contents, signatures, passphrases, private key material, authorization data, cookies, or response bodies.
