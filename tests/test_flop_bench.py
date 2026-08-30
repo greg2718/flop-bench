@@ -1986,6 +1986,90 @@ def test_post_timeout_without_accept_reconcile_absent_not_rejected(tmp_path: Pat
     assert repaired["failure_classification"] == "absent_not_proven_rejected"
 
 
+def test_reconcile_attributes_identical_text_by_exact_nonce(tmp_path: Path) -> None:
+    state, _passphrase, did = temp_production_identity(tmp_path)
+    text = "FLOP Bench same text two nonces"
+    digest = message_hash(text)
+    nonce_one = 1_788_016_223_914
+    nonce_two = 1_788_093_739_511
+    with connect_state(state) as conn:
+        first_id = conn.execute(
+            """
+            INSERT INTO post_attempts(
+                room, expected_owner_did, message_hash, post_status,
+                request_timestamp, response_status, nonce_used, seq,
+                failure_classification
+            )
+            VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?)
+            """,
+            (
+                "d-flop-bench",
+                did,
+                digest,
+                "unknown_outcome",
+                datetime.now(UTC).isoformat(),
+                nonce_one,
+                "post_outcome_unknown_timeout",
+            ),
+        ).lastrowid
+        second_id = conn.execute(
+            """
+            INSERT INTO post_attempts(
+                room, expected_owner_did, message_hash, post_status,
+                request_timestamp, response_status, nonce_used, seq,
+                failure_classification
+            )
+            VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?)
+            """,
+            (
+                "d-flop-bench",
+                did,
+                digest,
+                "reconciled_absent",
+                datetime.now(UTC).isoformat(),
+                nonce_two,
+                "absent_not_proven_rejected",
+            ),
+        ).lastrowid
+        conn.commit()
+    transport = FakeActivationTransport()
+    transport.room_messages["d-flop-bench"] = [
+        {"seq": 1, "from": did, "text": text, "nonce": nonce_one, "ts": "2026-08-30T12:00:00Z"}
+    ]
+    first = reconcile_post(
+        state_dir=state,
+        attempt_id=int(first_id),
+        transport=transport,
+        expected_bench_did=did,
+    )
+    second = reconcile_post(
+        state_dir=state,
+        attempt_id=int(second_id),
+        transport=transport,
+        expected_bench_did=did,
+    )
+    assert first["exact_match_found"] is True
+    assert first["exact_attempt_match"] is True
+    assert first["matched_nonce"] == nonce_one
+    assert first["attempt_nonce"] == nonce_one
+    assert first["seq"] == 1
+    assert first["reconciliation_status"] == "reconciled_posted"
+    assert second["exact_match_found"] is True
+    assert second["exact_attempt_match"] is False
+    assert second["attempt_nonce"] == nonce_two
+    assert second["matched_nonce"] is None
+    assert second["matching_message_different_nonce"] is True
+    assert second["matching_message_other_nonce"] == {"seq": 1, "nonce": nonce_one}
+    assert second["reconciliation_status"] == "matching_message_different_nonce"
+    assert second["state_write"] is False
+    with connect_state(state) as conn:
+        rows = conn.execute("SELECT id, post_status, seq FROM post_attempts ORDER BY id").fetchall()
+    assert rows[0]["post_status"] == "reconciled_posted"
+    assert rows[0]["seq"] == 1
+    assert rows[1]["post_status"] == "reconciled_absent"
+    assert rows[1]["seq"] is None
+
+
 def test_exact_match_preflight_prevents_duplicate_retry(tmp_path: Path) -> None:
     state, passphrase, did = temp_production_identity(tmp_path)
     text = "FLOP Bench duplicate prevention"
@@ -2013,6 +2097,29 @@ def test_exact_match_preflight_prevents_duplicate_retry(tmp_path: Path) -> None:
         row = conn.execute("SELECT * FROM post_attempts").fetchone()
     assert row["post_status"] == "already-posted"
     assert row["nonce_used"] is None
+
+
+def test_other_nonce_message_still_prevents_duplicate_send(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    text = "FLOP Bench duplicate by content despite nonce"
+    message = tmp_path / "message.txt"
+    message.write_text(text, encoding="utf-8")
+    transport = FakeActivationTransport()
+    transport.notes[("room-owners", "d-flop-bench")] = did
+    transport.room_messages["d-flop-bench"] = [{"seq": 9, "from": did, "text": text, "nonce": 111}]
+    result = send_post(
+        message,
+        state_dir=state,
+        live=True,
+        confirm=POST_CONFIRMATION,
+        passphrase=passphrase,
+        transport=transport,
+        expected_state_dir=state,
+        expected_bench_did=did,
+    )
+    assert result["post_status"] == "already-posted"
+    assert result["seq"] == 9
+    assert transport.post_bodies == []
 
 
 def test_incomplete_history_scan_fails_closed(tmp_path: Path) -> None:
@@ -2064,6 +2171,113 @@ def test_room_history_pagination_exact_hash_and_did_matching() -> None:
     assert scan["history_scan_complete"] is True
     assert scan["pages_scanned"] == 2
     assert message_hash(target) == hashlib.sha256(target.encode("utf-8")).hexdigest()
+
+
+def test_reconcile_reports_missing_null_and_malformed_remote_nonce(tmp_path: Path) -> None:
+    state, _passphrase, did = temp_production_identity(tmp_path)
+    text = "FLOP Bench missing nonce"
+    with connect_state(state) as conn:
+        attempt_id = conn.execute(
+            """
+            INSERT INTO post_attempts(
+                room, expected_owner_did, message_hash, post_status,
+                request_timestamp, response_status, nonce_used, seq,
+                failure_classification
+            )
+            VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?)
+            """,
+            (
+                "d-flop-bench",
+                did,
+                message_hash(text),
+                "unknown_outcome",
+                datetime.now(UTC).isoformat(),
+                222,
+                "post_outcome_unknown_timeout",
+            ),
+        ).lastrowid
+        conn.commit()
+    for raw_nonce in (None, "not-an-int", False):
+        transport = FakeActivationTransport()
+        transport.room_messages["d-flop-bench"] = [
+            {"seq": 3, "from": did, "text": text, "nonce": raw_nonce}
+        ]
+        result = reconcile_post(
+            state_dir=state,
+            attempt_id=int(attempt_id),
+            transport=transport,
+            expected_bench_did=did,
+        )
+        assert result["exact_match_found"] is True
+        assert result["exact_attempt_match"] is False
+        assert result["matching_message_other_nonce"] is None
+        assert result["matching_message_unattributable_nonce"] == {"seq": 3, "nonce": None}
+        assert result["matched_nonce"] is None
+
+
+def test_unverified_did_field_is_not_treated_as_verified_from() -> None:
+    did = public_did(Ed25519PrivateKey.generate())
+    text = "FLOP Bench unsigned did field"
+    transport = FakeActivationTransport()
+    transport.room_messages["d-flop-bench"] = [
+        {"seq": 1, "did": did, "text": text, "nonce": 123},
+        {"seq": 2, "from": "unknown", "did": did, "text": text, "nonce": 123},
+    ]
+    scan = scan_room_history_for_hash(
+        transport,
+        expected_did=did,
+        digest=message_hash(text),
+        attempt_nonce=123,
+    )
+    assert scan["exact_match_found"] is False
+    assert scan["exact_attempt_match"] is False
+
+
+def test_reconcile_pagination_and_delayed_visibility_by_nonce(tmp_path: Path) -> None:
+    state, _passphrase, did = temp_production_identity(tmp_path)
+    text = "FLOP Bench delayed visibility"
+    nonce = 333
+    with connect_state(state) as conn:
+        attempt_id = conn.execute(
+            """
+            INSERT INTO post_attempts(
+                room, expected_owner_did, message_hash, post_status,
+                request_timestamp, response_status, nonce_used, seq,
+                failure_classification
+            )
+            VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?)
+            """,
+            (
+                "d-flop-bench",
+                did,
+                message_hash(text),
+                "unknown_outcome",
+                datetime.now(UTC).isoformat(),
+                nonce,
+                "post_outcome_unknown_timeout",
+            ),
+        ).lastrowid
+        conn.commit()
+    transport = FakeActivationTransport()
+    transport.room_messages["d-flop-bench"] = [
+        {
+            "seq": idx + 1,
+            "from": public_did(Ed25519PrivateKey.generate()),
+            "text": f"filler {idx}",
+            "nonce": idx + 1,
+        }
+        for idx in range(200)
+    ] + [{"seq": 201, "from": did, "text": text, "nonce": nonce}]
+    result = reconcile_post(
+        state_dir=state,
+        attempt_id=int(attempt_id),
+        transport=transport,
+        expected_bench_did=did,
+    )
+    assert result["exact_attempt_match"] is True
+    assert result["matched_nonce"] == nonce
+    assert result["seq"] == 201
+    assert result["pages_scanned"] == 2
 
 
 def test_reconcile_does_not_nonce_sign_post_or_expose_remote_text(tmp_path: Path) -> None:

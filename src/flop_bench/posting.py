@@ -153,7 +153,7 @@ def extract_room_messages(obj: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def message_sender(raw: dict[str, Any]) -> str:
-    sender = raw.get("from") or raw.get("did") or raw.get("nick") or raw.get("nickname")
+    sender = raw.get("from")
     return str(sender) if sender is not None else "unknown"
 
 
@@ -168,13 +168,36 @@ def message_seq(raw: dict[str, Any]) -> int | None:
     return seq if seq > 0 else None
 
 
-def exact_message_match(raw: dict[str, Any], *, expected_did: str, digest: str) -> int | None:
-    if message_sender(raw) != expected_did:
+def message_nonce(raw: dict[str, Any]) -> int | None:
+    value = raw.get("nonce")
+    if isinstance(value, bool) or value is None:
         return None
+    try:
+        nonce = int(value)
+    except (TypeError, ValueError):
+        return None
+    return nonce if nonce > 0 else None
+
+
+def canonical_room_message(raw: dict[str, Any]) -> dict[str, Any]:
     text = raw.get("text")
+    return {
+        "seq": message_seq(raw),
+        "from": message_sender(raw),
+        "nonce": message_nonce(raw),
+        "text": text if isinstance(text, str) else None,
+        "ts": str(raw["ts"]) if raw.get("ts") is not None else None,
+    }
+
+
+def exact_message_match(raw: dict[str, Any], *, expected_did: str, digest: str) -> int | None:
+    parsed = canonical_room_message(raw)
+    if parsed["from"] != expected_did:
+        return None
+    text = parsed["text"]
     if not isinstance(text, str) or message_hash(text) != digest:
         return None
-    return message_seq(raw)
+    return parsed["seq"] if isinstance(parsed["seq"], int) else None
 
 
 def signed_post_preimage(room: str, nonce: int, text: str) -> bytes:
@@ -225,6 +248,7 @@ def scan_room_history_for_hash(
     *,
     expected_did: str,
     digest: str,
+    attempt_nonce: int | None = None,
     max_pages: int = MAX_HISTORY_PAGES,
     page_limit: int = ROOM_HISTORY_PAGE_LIMIT,
     max_items: int = MAX_HISTORY_ITEMS,
@@ -237,6 +261,10 @@ def scan_room_history_for_hash(
     bytes_scanned = 0
     since = 0
     exact_seq: int | None = None
+    exact_attempt_seq: int | None = None
+    matched_nonce: int | None = None
+    other_nonce_match: dict[str, int] | None = None
+    unattributable_nonce_match: dict[str, Any] | None = None
     complete = False
     failure: str | None = None
     headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
@@ -273,10 +301,29 @@ def scan_room_history_for_hash(
         items_scanned += len(messages)
         max_seq = since
         for raw in messages:
-            seq = exact_message_match(raw, expected_did=expected_did, digest=digest)
-            if seq is not None:
+            parsed_message = canonical_room_message(raw)
+            seq = parsed_message["seq"]
+            text = parsed_message["text"]
+            nonce = parsed_message["nonce"]
+            did_hash_match = (
+                parsed_message["from"] == expected_did
+                and isinstance(text, str)
+                and isinstance(seq, int)
+                and message_hash(text) == digest
+            )
+            if did_hash_match:
                 exact_seq = seq if exact_seq is None else min(exact_seq, seq)
-            observed_seq = message_seq(raw)
+                if attempt_nonce is not None and nonce == attempt_nonce:
+                    exact_attempt_seq = (
+                        seq if exact_attempt_seq is None else min(exact_attempt_seq, seq)
+                    )
+                    matched_nonce = nonce
+                elif attempt_nonce is not None and isinstance(nonce, int):
+                    if other_nonce_match is None or seq < other_nonce_match["seq"]:
+                        other_nonce_match = {"seq": seq, "nonce": nonce}
+                elif attempt_nonce is not None and unattributable_nonce_match is None:
+                    unattributable_nonce_match = {"seq": seq, "nonce": None}
+            observed_seq = seq
             if observed_seq is not None:
                 max_seq = max(max_seq, observed_seq)
         if len(messages) < page_limit:
@@ -293,6 +340,13 @@ def scan_room_history_for_hash(
     return {
         "exact_match_found": exact_seq is not None,
         "seq": exact_seq,
+        "attempt_nonce": attempt_nonce,
+        "matched_nonce": matched_nonce,
+        "exact_attempt_match": exact_attempt_seq is not None,
+        "exact_attempt_seq": exact_attempt_seq,
+        "matching_message_other_nonce": other_nonce_match,
+        "matching_message_different_nonce": other_nonce_match is not None,
+        "matching_message_unattributable_nonce": unattributable_nonce_match,
         "history_scan_complete": complete,
         "pages_scanned": pages_scanned,
         "items_scanned": items_scanned,
@@ -715,29 +769,50 @@ def reconcile_post(
     if attempt["expected_owner_did"] != expected_bench_did:
         raise SafetyError("post reconcile attempt DID does not match Bench DID")
     digest = str(attempt["message_hash"])
-    scan = scan_room_history_for_hash(transport, expected_did=expected_bench_did, digest=digest)
-    if scan["exact_match_found"]:
+    attempt_nonce = attempt["nonce_used"]
+    if not isinstance(attempt_nonce, int):
+        raise SafetyError("post reconcile attempt has no recorded nonce")
+    scan = scan_room_history_for_hash(
+        transport,
+        expected_did=expected_bench_did,
+        digest=digest,
+        attempt_nonce=attempt_nonce,
+    )
+    if scan["exact_attempt_match"]:
         status = "reconciled_posted"
         classification = None
-        seq = int(scan["seq"])
+        seq = int(scan["exact_attempt_seq"])
+        state_write = True
+    elif scan["matching_message_different_nonce"]:
+        status = "matching_message_different_nonce"
+        classification = (
+            str(attempt["failure_classification"])
+            if attempt["failure_classification"] is not None
+            else None
+        )
+        seq = attempt["seq"]
+        state_write = False
     elif scan["history_scan_complete"]:
         status = "reconciled_absent"
         classification = "absent_not_proven_rejected"
         seq = None
+        state_write = True
     else:
         status = "reconciliation_incomplete"
         classification = str(scan["failure_classification"] or "history_scan_incomplete")
         seq = attempt["seq"]
-    with connect_state(resolved_state) as conn:
-        update_post_attempt(
-            conn,
-            post_id=attempt_id,
-            post_status=status,
-            response_status=attempt["response_status"],
-            nonce_used=attempt["nonce_used"],
-            seq=seq,
-            failure_classification=classification,
-        )
+        state_write = True
+    if state_write:
+        with connect_state(resolved_state) as conn:
+            update_post_attempt(
+                conn,
+                post_id=attempt_id,
+                post_status=status,
+                response_status=attempt["response_status"],
+                nonce_used=attempt["nonce_used"],
+                seq=seq,
+                failure_classification=classification,
+            )
     return {
         "ok": scan["history_scan_complete"],
         "attempt_id": attempt_id,
@@ -745,12 +820,18 @@ def reconcile_post(
         "bench_did": expected_bench_did,
         "message_hash": digest,
         "exact_match_found": scan["exact_match_found"],
-        "seq": seq,
+        "exact_attempt_match": scan["exact_attempt_match"],
+        "attempt_nonce": attempt_nonce,
+        "matched_nonce": scan["matched_nonce"],
+        "matching_message_other_nonce": scan["matching_message_other_nonce"],
+        "matching_message_different_nonce": scan["matching_message_different_nonce"],
+        "matching_message_unattributable_nonce": scan["matching_message_unattributable_nonce"],
+        "seq": seq if scan["exact_attempt_match"] else scan["seq"],
         "history_scan_complete": scan["history_scan_complete"],
         "pages_scanned": scan["pages_scanned"],
         "nonce_observation": None,
         "reconciliation_status": status,
-        "state_write": True,
+        "state_write": state_write,
         "network_action": "bounded_read_only",
     }
 
