@@ -183,6 +183,26 @@ def signed_post_preimage(room: str, nonce: int, text: str) -> bytes:
     return f"{room}|{nonce}|{text}".encode()
 
 
+def signed_post_body(*, did: str, sig: str, nonce: int, text: str) -> bytes:
+    return json.dumps(
+        {"did": did, "sig": sig, "nonce": nonce, "text": text},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def signed_post_headers(*, user_agent: str = USER_AGENT) -> dict[str, str]:
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": user_agent,
+    }
+
+
+def sign_post_message(*, room: str, nonce: int, text: str, key: Any) -> str:
+    return b64u(key.sign(signed_post_preimage(room, nonce, text)))
+
+
 def post_room_url(room: str = CANONICAL_ROOM) -> str:
     if room != CANONICAL_ROOM:
         raise SafetyError("signed posts are restricted to d-flop-bench")
@@ -372,6 +392,90 @@ def classify_post_status(status: int) -> str:
     return "post_rejected"
 
 
+def classify_post_transport_failure(classification: str) -> tuple[str, str]:
+    if classification in {"dns_failure", "tls_failure", "connect_failure", "connect_timeout"}:
+        return "failed_pre_transmission", classification
+    if classification in {
+        "read_timeout",
+        "connection_reset",
+        "broken_pipe",
+        "timeout",
+        "timeout_unknown_phase",
+        "connectivity_failure",
+        "transport_failure",
+    }:
+        return "unknown_outcome", f"post_outcome_unknown_{classification}"
+    return "confirmed_rejected", classification
+
+
+def protocol_check_post(message_path: Path, *, state_dir: Path) -> dict[str, Any]:
+    text = read_message(message_path)
+    byte_count = len(text.encode("utf-8"))
+    char_count = len(text)
+    scout_character_limit = 4096
+    within_scout_limit = char_count <= scout_character_limit
+    within_bench_byte_limit = byte_count <= MAX_POST_BYTES
+    return {
+        "ok": within_scout_limit and within_bench_byte_limit,
+        "room": CANONICAL_ROOM,
+        "message_file": str(message_path),
+        "message_hash": message_hash(text),
+        "message_bytes": byte_count,
+        "message_characters": char_count,
+        "technocore_post_limit": {
+            "source": "FLOP Scout v0.2 normalize_text",
+            "max_characters": scout_character_limit,
+            "bench_max_bytes": MAX_POST_BYTES,
+            "message_valid": within_scout_limit and within_bench_byte_limit,
+        },
+        "endpoint": {
+            "method": "POST",
+            "url": post_room_url(),
+            "path_query": f"/r/{quote(CANONICAL_ROOM)}?format=json",
+            "url_encoding": "urllib.parse.quote(..., safe='')",
+        },
+        "headers": signed_post_headers(),
+        "json": {
+            "field_names": ["did", "sig", "nonce", "text"],
+            "ensure_ascii": False,
+            "separators": [",", ":"],
+            "encoding": "utf-8",
+            "content_length": "set by urllib.request from body bytes",
+        },
+        "signature": {
+            "encoding": "unpadded base64url Ed25519 signature",
+            "preimage": "room|nonce|text",
+        },
+        "nonce": {
+            "generation": "locally monotonic millisecond epoch, max(now_ms, previous + 1)",
+            "acquired": False,
+        },
+        "transport": {
+            "client": "urllib.request",
+            "timeout_seconds": 20.0,
+            "proxy_behavior": (
+                "urllib.request default environment proxy handling; proxy values not reported"
+            ),
+            "redirect_behavior": (
+                "Bench refuses redirects; Scout urlopen uses default redirect handling"
+            ),
+            "response_limit_bytes": MAX_RESPONSE_BYTES,
+        },
+        "scout_parity": {
+            "status": "protocol_bytes_match_except_user_agent",
+            "intentional_difference": "User-Agent",
+            "known_non_byte_difference": "redirect handling",
+        },
+        "will_prompt_for_private_key": False,
+        "will_load_private_key": False,
+        "will_sign": False,
+        "will_acquire_nonce": False,
+        "network_action": False,
+        "state_write": False,
+        "state_dir": str(state_dir.expanduser().resolve(strict=False)),
+    }
+
+
 def send_post(
     message_path: Path,
     *,
@@ -469,7 +573,7 @@ def send_post(
         raise SafetyError("Bench room ownership is not verified")
     nonce = next_post_nonce(resolved_state)
     try:
-        sig = b64u(key.sign(signed_post_preimage(CANONICAL_ROOM, nonce, text)))
+        sig = sign_post_message(room=CANONICAL_ROOM, nonce=nonce, text=text, key=key)
     except Exception as exc:
         update_post_audit(
             resolved_state,
@@ -481,16 +585,8 @@ def send_post(
             failure_classification="signing_failure",
         )
         raise SafetyError("Technocore signed post signing failed") from exc
-    body = json.dumps(
-        {"did": expected_bench_did, "sig": sig, "nonce": nonce, "text": text},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json; charset=utf-8",
-        "User-Agent": USER_AGENT,
-    }
+    body = signed_post_body(did=expected_bench_did, sig=sig, nonce=nonce, text=text)
+    headers = signed_post_headers()
     url = post_room_url()
     try:
         response = transport.request("POST", url, body=body, headers=headers)
@@ -514,26 +610,20 @@ def send_post(
             )
         parsed = json.loads(response.body.decode("utf-8"))
     except ActivationRequestError as exc:
-        ambiguous = exc.response is None and exc.failure_classification in {
-            "timeout",
-            "connectivity_failure",
-        }
+        post_status, failure_classification = classify_post_transport_failure(
+            exc.failure_classification
+        )
+        if exc.response is not None:
+            post_status = "confirmed_rejected"
+            failure_classification = exc.failure_classification
         update_post_audit(
             resolved_state,
             post_id=post_id,
-            post_status="unknown_outcome" if ambiguous else "confirmed_rejected",
+            post_status=post_status,
             response_status=exc.response.status if exc.response else None,
             nonce_used=nonce,
             seq=None,
-            failure_classification=(
-                "timeout_after_transmission"
-                if exc.failure_classification == "timeout" and ambiguous
-                else (
-                    "connectivity_failure_after_transmission"
-                    if exc.failure_classification == "connectivity_failure" and ambiguous
-                    else exc.failure_classification
-                )
-            ),
+            failure_classification=failure_classification,
         )
         raise
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:

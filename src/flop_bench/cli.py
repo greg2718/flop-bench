@@ -25,7 +25,7 @@ from .identity import (
     verify_identity,
 )
 from .ledger import verify_ledger
-from .posting import POST_CONFIRMATION, preview_post, reconcile_post, send_post
+from .posting import POST_CONFIRMATION, preview_post, protocol_check_post, reconcile_post, send_post
 from .posting import history as post_history
 from .schemas import validate_test_spec
 from .service import (
@@ -135,6 +135,9 @@ def build_parser() -> argparse.ArgumentParser:
     post_preview = post_sub.add_parser("preview")
     post_preview.add_argument("message", type=Path)
     post_preview.add_argument("--state-dir", required=True, type=Path)
+    post_protocol_check = post_sub.add_parser("protocol-check")
+    post_protocol_check.add_argument("message", type=Path)
+    post_protocol_check.add_argument("--state-dir", required=True, type=Path)
     post_send = post_sub.add_parser("send")
     post_send.add_argument("message", type=Path)
     post_send.add_argument("--state-dir", required=True, type=Path)
@@ -246,6 +249,8 @@ def run(argv: list[str] | None = None) -> int:
             _print_json(verify_identity(state_dir=args.state_dir, passphrase=passphrase))
         elif args.cmd == "post" and args.post_cmd == "preview":
             _print_json(preview_post(args.message, state_dir=args.state_dir))
+        elif args.cmd == "post" and args.post_cmd == "protocol-check":
+            _print_json(protocol_check_post(args.message, state_dir=args.state_dir))
         elif args.cmd == "post" and args.post_cmd == "send":
             passphrase = read_interactive_existing_passphrase()
             _print_json(
