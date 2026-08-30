@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
+import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import threading
+import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -25,6 +30,7 @@ from flop_bench.activation import (
     TECHNOCORE_ORIGIN,
     ActivationRequestError,
     TransportResponse,
+    classify_transport_exception,
     create_mailbox,
     create_room,
     request_text,
@@ -60,10 +66,14 @@ from flop_bench.posting import (
     post_room_url,
     preview_post,
     proposed_initial_announcement,
+    protocol_check_post,
     reconcile_post,
     scan_room_history_for_hash,
     send_post,
     service_manifest,
+    sign_post_message,
+    signed_post_body,
+    signed_post_headers,
     signed_post_preimage,
 )
 from flop_bench.posting import (
@@ -98,6 +108,7 @@ from flop_bench.state import activation_history, connect_state, migration_status
 from flop_bench.transport import DisabledTechnocoreTransport
 
 REPO = Path(__file__).resolve().parents[1]
+SCOUT_PATH = Path("/Users/greg/Dev/flop_scout_v02/flop_scout.py")
 
 
 def write_json(path: Path, value: object) -> Path:
@@ -131,6 +142,51 @@ def different_test_phrase() -> str:
 
 def weak_test_phrase() -> str:
     return "".join(["we", "ak"])
+
+
+def load_scout_module() -> object:
+    spec = importlib.util.spec_from_file_location("flop_scout_readonly", SCOUT_PATH)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def scout_signed_post_request_parts(
+    *,
+    did: str,
+    key: Ed25519PrivateKey,
+    room: str,
+    nonce: int,
+    text: str,
+) -> dict[str, object]:
+    scout = load_scout_module()
+    payload = f"{room}|{nonce}|{text}".encode()
+    sig = scout.b64u(key.sign(payload))  # type: ignore[attr-defined]
+    body = json.dumps(
+        {"did": did, "sig": sig, "nonce": nonce, "text": text},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    request = urllib.request.Request(  # noqa: S310 - fixed Technocore URL in parity test.
+        f"{scout.BASE_URL}/r/{urllib.parse.quote(room, safe='')}?format=json",  # type: ignore[attr-defined]
+        data=body,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": scout.USER_AGENT,  # type: ignore[attr-defined]
+        },
+    )
+    return {
+        "method": request.get_method(),
+        "url": request.full_url,
+        "body": request.data,
+        "headers": dict(request.header_items()),
+        "sig": sig,
+        "preimage": payload,
+    }
 
 
 class FakeActivationTransport:
@@ -1630,6 +1686,84 @@ def test_post_send_uses_scout_preimage_body_nonce_and_one_audit_row(tmp_path: Pa
     assert passphrase not in stored
 
 
+def test_signed_post_golden_scout_parity_except_user_agent() -> None:
+    key = Ed25519PrivateKey.generate()
+    did = public_did(key)
+    room = "d-flop-bench"
+    nonce = 1_788_096_000_001
+    text = "FLOP Bench golden parity text"
+    scout = scout_signed_post_request_parts(
+        did=did,
+        key=key,
+        room=room,
+        nonce=nonce,
+        text=text,
+    )
+    sig = sign_post_message(room=room, nonce=nonce, text=text, key=key)
+    bench = {
+        "sig": sig,
+        "preimage": signed_post_preimage(room, nonce, text),
+    }
+    bench_request = urllib.request.Request(  # noqa: S310 - fixed Technocore URL in parity test.
+        post_room_url(room),
+        data=signed_post_body(did=did, sig=sig, nonce=nonce, text=text),
+        method="POST",
+        headers=signed_post_headers(),
+    )
+    assert bench_request.get_method() == scout["method"]
+    assert bench_request.full_url == scout["url"]
+    assert bench_request.data == scout["body"]
+    assert bench["sig"] == scout["sig"]
+    assert bench["preimage"] == scout["preimage"]
+    bench_headers = dict(bench_request.header_items())
+    scout_headers = dict(scout["headers"])
+    assert bench_headers.pop("User-agent") != scout_headers.pop("User-agent")
+    assert bench_headers == scout_headers
+
+
+def test_protocol_check_is_offline_and_reports_post_limits(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    message = tmp_path / "message.txt"
+    text = "x" * 584
+    message.write_text(text, encoding="utf-8")
+    report = protocol_check_post(message, state_dir=state)
+    assert report["network_action"] is False
+    assert report["state_write"] is False
+    assert report["will_load_private_key"] is False
+    assert report["will_sign"] is False
+    assert report["will_acquire_nonce"] is False
+    assert not state.exists()
+    assert report["message_bytes"] == 584
+    assert report["technocore_post_limit"]["max_characters"] == 4096
+    assert report["technocore_post_limit"]["message_valid"] is True
+    assert report["scout_parity"]["status"] == "protocol_bytes_match_except_user_agent"
+
+
+def test_post_length_boundaries_match_scout_limit(tmp_path: Path) -> None:
+    ok = tmp_path / "ok.txt"
+    ok.write_text("x" * 4096, encoding="utf-8")
+    report = protocol_check_post(ok, state_dir=tmp_path / "state")
+    assert report["ok"] is True
+    too_long = tmp_path / "too-long.txt"
+    too_long.write_text("x" * 4097, encoding="utf-8")
+    with pytest.raises(SafetyError, match="4096 bytes"):
+        protocol_check_post(too_long, state_dir=tmp_path / "state")
+
+
+def test_transport_exception_classification_is_specific_and_safe() -> None:
+    cases: list[tuple[BaseException, str]] = [
+        (urllib.error.URLError(socket.gaierror("nodename nor servname provided")), "dns_failure"),
+        (urllib.error.URLError(ssl.SSLError("certificate verify failed")), "tls_failure"),
+        (urllib.error.URLError(TimeoutError("timed out")), "connect_timeout"),
+        (TimeoutError("read timed out"), "read_timeout"),
+        (ConnectionResetError("reset by peer"), "connection_reset"),
+        (BrokenPipeError("broken pipe"), "broken_pipe"),
+        (OSError("other network problem token=abc123"), "connectivity_failure"),
+    ]
+    for exc, expected in cases:
+        assert classify_transport_exception(exc) == expected
+
+
 def test_post_send_requires_verified_room_owner_and_audits_preflight_failures(
     tmp_path: Path,
 ) -> None:
@@ -1800,7 +1934,7 @@ def test_post_timeout_after_accept_reconcile_finds_exact_match(tmp_path: Path) -
     with connect_state(state) as conn:
         row = conn.execute("SELECT * FROM post_attempts").fetchone()
     assert row["post_status"] == "unknown_outcome"
-    assert row["failure_classification"] == "timeout_after_transmission"
+    assert row["failure_classification"] == "post_outcome_unknown_timeout"
     assert row["nonce_used"] == transport.post_bodies[0]["nonce"]
     result = reconcile_post(
         state_dir=state,
@@ -1952,7 +2086,7 @@ def test_reconcile_does_not_nonce_sign_post_or_expose_remote_text(tmp_path: Path
                 "unknown_outcome",
                 datetime.now(UTC).isoformat(),
                 1788016223914,
-                "timeout_after_transmission",
+                "post_outcome_unknown_timeout",
             ),
         ).lastrowid
         conn.commit()

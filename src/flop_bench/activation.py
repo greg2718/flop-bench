@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -110,11 +112,10 @@ class UrlLibActivationTransport:
             final_url = exc.geturl()
             status = int(exc.code)
             response_headers = dict(exc.headers.items())
-        except (TimeoutError, urllib.error.URLError) as exc:
-            reason = getattr(exc, "reason", None)
-            classification = "connectivity_failure" if reason is not None else "timeout"
+        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            classification = classify_transport_exception(exc)
             raise ActivationRequestError(
-                "Technocore request timed out or failed before verification",
+                f"Technocore request failed before verification: {classification}",
                 failure_classification=classification,
             ) from exc
         if final_url and final_url != url:
@@ -147,6 +148,37 @@ class UrlLibActivationTransport:
             headers=response_headers,
             final_url=final_url,
         )
+
+
+def classify_transport_exception(exc: BaseException) -> str:
+    reason = getattr(exc, "reason", None)
+    target = reason if isinstance(exc, urllib.error.URLError) and reason is not None else exc
+    if isinstance(target, ssl.SSLError):
+        return "tls_failure"
+    if isinstance(target, TimeoutError) and "read" in str(target).casefold():
+        return "read_timeout"
+    if isinstance(target, TimeoutError):
+        return "connect_timeout"
+    if isinstance(target, ConnectionResetError):
+        return "connection_reset"
+    if isinstance(target, BrokenPipeError):
+        return "broken_pipe"
+    if isinstance(target, socket.gaierror):
+        return "dns_failure"
+    if isinstance(target, ConnectionRefusedError):
+        return "connect_failure"
+    if isinstance(target, OSError):
+        text = str(target).casefold()
+        if "timed out" in text:
+            return "timeout_unknown_phase"
+        if "reset" in text:
+            return "connection_reset"
+        if "broken pipe" in text:
+            return "broken_pipe"
+        if "name or service not known" in text or "nodename nor servname" in text:
+            return "dns_failure"
+        return "connectivity_failure"
+    return "transport_failure"
 
 
 def validate_origin(url: str, *, origin: str = TECHNOCORE_ORIGIN) -> None:
