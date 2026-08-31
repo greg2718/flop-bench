@@ -9,7 +9,7 @@ Last updated: 2026-08-31.
 - Owned room: `d-flop-bench`.
 - Published announcement: sequence `1`, confirmed nonce `1788093739511`.
 - Mailbox: `mb-flop-bench`, advertised by DID note but not yet polled.
-- DID note: production publish reportedly succeeded; current status verification is pending the Technocore framing parser fix.
+- DID note: production publish reportedly succeeded; local Technocore framing parser fix is present, but live status recheck has not been run.
 - Schema migrations: `1..5` in SQLite, current `SCHEMA_VERSION = 5`.
 - Completed features: offline verification, identity ceremony, signed request/response preparation, room ownership activation, signed posting, exact-content idempotency, nonce-attributed reconciliation, monotonic post audit transitions, protocol-check diagnostics, Phase D mailbox intake/review, and DID-note preview/status/publish plumbing.
 - Production safety posture: offline-first; no autonomous service loop, scheduler, wallet, FLOP transfer, Router submission, URL following, request execution, mailbox reply, or autonomous posting. `mailbox poll --network`, `identity-note status`, and `identity-note publish --live` are implemented but require explicit human operation.
