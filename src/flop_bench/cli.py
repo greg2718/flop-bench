@@ -29,6 +29,7 @@ from .identity_note import (
     identity_note_status,
     preview_identity_note,
     publish_identity_note,
+    reconcile_identity_note,
 )
 from .ledger import verify_ledger
 from .mailbox import (
@@ -197,6 +198,9 @@ def build_parser() -> argparse.ArgumentParser:
     identity_note_preview.add_argument("--state-dir", required=True, type=Path)
     identity_note_status_cmd = identity_note_sub.add_parser("status")
     identity_note_status_cmd.add_argument("--state-dir", required=True, type=Path)
+    identity_note_reconcile = identity_note_sub.add_parser("reconcile")
+    identity_note_reconcile.add_argument("--state-dir", required=True, type=Path)
+    identity_note_reconcile.add_argument("--network", action="store_true")
     identity_note_publish = identity_note_sub.add_parser("publish")
     identity_note_publish.add_argument("--state-dir", required=True, type=Path)
     identity_note_publish.add_argument("--live", action="store_true")
@@ -365,6 +369,14 @@ def run(argv: list[str] | None = None) -> int:
             _print_json(
                 identity_note_status(
                     state_dir=args.state_dir,
+                    transport=UrlLibActivationTransport(),
+                )
+            )
+        elif args.cmd == "identity-note" and args.identity_note_cmd == "reconcile":
+            _print_json(
+                reconcile_identity_note(
+                    state_dir=args.state_dir,
+                    network=args.network,
                     transport=UrlLibActivationTransport(),
                 )
             )

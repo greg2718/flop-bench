@@ -6,11 +6,11 @@ import sqlite3
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .exceptions import SafetyError
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 STATE_DB = "state.sqlite"
 PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIR_MODE = 0o700
@@ -364,6 +364,27 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
             """
         )
         applied.append(5)
+    if current < 6:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS did_note_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace TEXT NOT NULL,
+                key TEXT NOT NULL,
+                expected_hash TEXT NOT NULL,
+                observed_hash TEXT,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                response_status INTEGER,
+                timestamp TEXT NOT NULL,
+                failure_classification TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_did_note_observations_path
+                ON did_note_observations(namespace, key, id);
+            INSERT OR IGNORE INTO schema_migrations(version) VALUES (6);
+            """
+        )
+        applied.append(6)
     conn.commit()
     return applied
 
@@ -778,3 +799,115 @@ def mailbox_message_detail(state_dir: Path, *, message_id: str) -> dict[str, Any
     if result["provenance_json"]:
         result["provenance"] = json.loads(result.pop("provenance_json"))
     return result
+
+
+STRONG_DID_NOTE_STATUS = "already-matching"
+WEAKER_DID_NOTE_STATUSES = {
+    "absent",
+    "conflict",
+    "remote_unavailable",
+    "reconciliation_incomplete",
+    "publish_unknown",
+}
+
+
+def _latest_did_note_row(
+    conn: sqlite3.Connection,
+    *,
+    namespace: str,
+    key: str,
+) -> sqlite3.Row | None:
+    return cast(
+        sqlite3.Row | None,
+        conn.execute(
+            """
+        SELECT id, namespace, key, expected_hash, observed_hash, action, status,
+               response_status, timestamp, failure_classification
+        FROM did_note_observations
+        WHERE namespace = ? AND key = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+            (namespace, key),
+        ).fetchone(),
+    )
+
+
+def record_did_note_observation(
+    conn: sqlite3.Connection,
+    *,
+    namespace: str,
+    key: str,
+    expected_hash: str,
+    observed_hash: str | None,
+    action: str,
+    status: str,
+    response_status: int | None,
+    failure_classification: str | None,
+) -> dict[str, Any]:
+    latest = _latest_did_note_row(conn, namespace=namespace, key=key)
+    if (
+        latest is not None
+        and latest["status"] == STRONG_DID_NOTE_STATUS
+        and latest["expected_hash"] == expected_hash
+        and status in WEAKER_DID_NOTE_STATUSES
+    ):
+        return {
+            "state_write": False,
+            "audit_transition": "preserved",
+            "latest": dict(latest),
+        }
+    timestamp = datetime.now(UTC).isoformat()
+    cursor = conn.execute(
+        """
+        INSERT INTO did_note_observations(
+            namespace, key, expected_hash, observed_hash, action, status,
+            response_status, timestamp, failure_classification
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            namespace,
+            key,
+            expected_hash,
+            observed_hash,
+            action,
+            status,
+            response_status,
+            timestamp,
+            failure_classification,
+        ),
+    )
+    conn.commit()
+    row = _latest_did_note_row(conn, namespace=namespace, key=key)
+    return {
+        "state_write": True,
+        "audit_transition": "updated",
+        "id": cursor.lastrowid,
+        "latest": dict(row) if row is not None else None,
+    }
+
+
+def latest_did_note_observation(
+    state_dir: Path,
+    *,
+    namespace: str,
+    key: str,
+) -> dict[str, Any] | None:
+    resolved = state_dir.expanduser().resolve(strict=False)
+    status = migration_status(resolved)
+    if not status["database_exists"]:
+        return None
+    uri = f"file:{(resolved / STATE_DB).as_posix()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        table_exists = conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'did_note_observations'
+            """
+        ).fetchone()
+        if table_exists is None:
+            return None
+        row = _latest_did_note_row(conn, namespace=namespace, key=key)
+    return dict(row) if row is not None else None

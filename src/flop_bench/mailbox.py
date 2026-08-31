@@ -23,12 +23,14 @@ from .canonical import sha256_bytes
 from .config import BENCH_DID, MAILBOX, BenchConfig, assert_isolated
 from .exceptions import SafetyError, ValidationError
 from .identity import is_valid_ed25519_did
+from .identity_note import did_profile_path, identity_note_value, note_hash
 from .posting import extract_room_messages, message_nonce, message_seq
 from .protocol import SUPPORTED_CAPABILITIES, parse_timestamp, validate_timestamp_window
 from .redaction import redact
 from .state import (
     STATE_DB,
     connect_state,
+    latest_did_note_observation,
     mailbox_cursor,
     mailbox_message_detail,
     mailbox_messages_history,
@@ -268,6 +270,28 @@ def mailbox_status(*, state_dir: Path) -> dict[str, Any]:
     cursor = 0
     pending = 0
     total = 0
+    namespace, key, _fingerprint = did_profile_path(BENCH_DID)
+    expected_note_hash = note_hash(identity_note_value(BENCH_DID))
+    latest_ad = latest_did_note_observation(state_dir, namespace=namespace, key=key)
+    if latest_ad is None:
+        advertised: bool | None = None
+        advertisement_status = "unknown_not_reconciled"
+    elif (
+        latest_ad["status"] == "already-matching"
+        and latest_ad["expected_hash"] == expected_note_hash
+        and latest_ad["observed_hash"] == expected_note_hash
+    ):
+        advertised = True
+        advertisement_status = "already-matching"
+    elif latest_ad["status"] == "absent":
+        advertised = False
+        advertisement_status = "absent"
+    elif latest_ad["status"] == "conflict":
+        advertised = False
+        advertisement_status = "conflict"
+    else:
+        advertised = None
+        advertisement_status = "unknown_not_reconciled"
     if status["database_exists"]:
         uri = f"file:{(resolved / STATE_DB).as_posix()}?mode=ro"
         with sqlite3.connect(uri, uri=True) as conn:
@@ -302,7 +326,9 @@ def mailbox_status(*, state_dir: Path) -> dict[str, Any]:
         "mailbox": MAILBOX,
         "protocol": "signed-write-only-room",
         "creation_required": False,
-        "advertised": False,
+        "advertised": advertised,
+        "advertisement_status": advertisement_status,
+        "advertisement_expected_hash": expected_note_hash,
         "cursor": cursor,
         "messages": total,
         "pending_human_review": pending,

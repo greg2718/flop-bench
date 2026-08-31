@@ -28,6 +28,7 @@ from .config import (
 from .exceptions import SafetyError, ValidationError
 from .identity import IDENTITY_JSON, is_valid_ed25519_did
 from .redaction import redact
+from .state import connect_state, record_did_note_observation
 
 DID_NOTE_CONFIRMATION = "PUBLISH-FLOP-BENCH-DID-NOTE"
 NOTE_RESPONSE_BANNER = (
@@ -57,6 +58,10 @@ def identity_note_value(did: str = BENCH_DID) -> str:
         "role: verification operator-group: local-flop-agent-family "
         "related-agent-evidence-independent: false"
     )
+
+
+def note_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def scout_compatible_mailbox_from_note(value: str) -> str | None:
@@ -193,15 +198,114 @@ def identity_note_status(
         **{key: preview[key] for key in ("did", "fingerprint", "namespace", "key")},
         "ok": status != "conflict",
         "status": status,
-        "current_hash": hashlib.sha256(current.encode("utf-8")).hexdigest()
-        if current is not None
-        else None,
-        "expected_hash": hashlib.sha256(expected.encode("utf-8")).hexdigest(),
+        "current_hash": note_hash(current) if current is not None else None,
+        "expected_hash": note_hash(expected),
         "response_status": response.status,
         "network_action": "bounded_read_only",
         "state_write": False,
         "will_sign": False,
         "will_load_private_key": False,
+    }
+
+
+def _record_observation(
+    state_dir: Path,
+    *,
+    namespace: str,
+    key: str,
+    expected_hash: str,
+    observed_hash: str | None,
+    action: str,
+    status: str,
+    response_status: int | None,
+    failure_classification: str | None,
+) -> dict[str, Any]:
+    with connect_state(state_dir) as conn:
+        return record_did_note_observation(
+            conn,
+            namespace=namespace,
+            key=key,
+            expected_hash=expected_hash,
+            observed_hash=observed_hash,
+            action=action,
+            status=status,
+            response_status=response_status,
+            failure_classification=failure_classification,
+        )
+
+
+def reconcile_identity_note(
+    *,
+    state_dir: Path,
+    network: bool,
+    transport: ActivationTransport,
+) -> dict[str, Any]:
+    if not network:
+        raise SafetyError("identity-note reconcile requires explicit --network")
+    preview = preview_identity_note(state_dir=state_dir)
+    expected = str(preview["value"])
+    expected_hash = note_hash(expected)
+    namespace = str(preview["namespace"])
+    key = str(preview["key"])
+    try:
+        current, response = _read_note(transport=transport, namespace=namespace, key=key)
+    except ActivationRequestError as exc:
+        return {
+            "ok": False,
+            "status": "reconciliation_incomplete",
+            "failure_classification": exc.failure_classification,
+            "response_status": exc.response.status if exc.response else None,
+            "network_action": "bounded_read_only",
+            "state_write": False,
+            "will_publish": False,
+            "will_sign": False,
+            "will_load_private_key": False,
+            "will_acquire_nonce": False,
+            "followed_urls": False,
+        }
+    except (SafetyError, ValidationError) as exc:
+        return {
+            "ok": False,
+            "status": "reconciliation_incomplete",
+            "failure_classification": str(exc),
+            "response_status": None,
+            "network_action": "bounded_read_only",
+            "state_write": False,
+            "will_publish": False,
+            "will_sign": False,
+            "will_load_private_key": False,
+            "will_acquire_nonce": False,
+            "followed_urls": False,
+        }
+    status = _note_comparison(current=current, expected=expected)
+    observed_hash = note_hash(current) if current is not None else None
+    audit = _record_observation(
+        state_dir,
+        namespace=namespace,
+        key=key,
+        expected_hash=expected_hash,
+        observed_hash=observed_hash,
+        action="reconcile",
+        status=status,
+        response_status=response.status,
+        failure_classification=None,
+    )
+    return {
+        "ok": status == "already-matching",
+        "status": status,
+        "namespace": namespace,
+        "key": key,
+        "expected_hash": expected_hash,
+        "observed_hash": observed_hash,
+        "response_status": response.status,
+        "network_action": "bounded_read_only",
+        "state_write": audit["state_write"],
+        "audit_transition": audit["audit_transition"],
+        "will_publish": False,
+        "will_sign": False,
+        "will_load_private_key": False,
+        "will_acquire_nonce": False,
+        "followed_urls": False,
     }
 
 
@@ -229,11 +333,26 @@ def publish_identity_note(
         key=str(preview["key"]),
     )
     expected = str(preview["value"])
+    expected_hash = note_hash(expected)
+    namespace = str(preview["namespace"])
+    key = str(preview["key"])
     if current == expected:
+        audit = _record_observation(
+            resolved,
+            namespace=namespace,
+            key=key,
+            expected_hash=expected_hash,
+            observed_hash=expected_hash,
+            action="publish",
+            status="already-matching",
+            response_status=read_response.status,
+            failure_classification=None,
+        )
         return {
             "ok": True,
             "status": "already-matching",
-            "state_write": False,
+            "state_write": audit["state_write"],
+            "audit_transition": audit["audit_transition"],
             "network_action": "bounded_read_only",
             "response_status": read_response.status,
             "will_sign": False,
@@ -241,21 +360,47 @@ def publish_identity_note(
         }
     if current is not None:
         raise SafetyError("DID note conflict; refusing to overwrite unexpected existing content")
+    _record_observation(
+        resolved,
+        namespace=namespace,
+        key=key,
+        expected_hash=expected_hash,
+        observed_hash=None,
+        action="publish",
+        status="publish_started",
+        response_status=read_response.status,
+        failure_classification=None,
+    )
     body = json.dumps(
         {"value": expected, "if_absent": True},
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    response = transport.request(
-        "POST",
-        str(preview["url"]),
-        body=body,
-        headers={
-            "Content-Type": "application/json; charset=utf-8",
-            "User-Agent": USER_AGENT,
-        },
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
+    try:
+        response = transport.request(
+            "POST",
+            str(preview["url"]),
+            body=body,
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "User-Agent": USER_AGENT,
+            },
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except ActivationRequestError as exc:
+        audit = _record_observation(
+            resolved,
+            namespace=namespace,
+            key=key,
+            expected_hash=expected_hash,
+            observed_hash=None,
+            action="publish",
+            status="publish_unknown",
+            response_status=exc.response.status if exc.response else None,
+            failure_classification=exc.failure_classification,
+        )
+        exc.args = (*exc.args, f"audit_state_write={audit['state_write']}")
+        raise
     if response.final_url and response.final_url != preview["url"]:
         raise ActivationRequestError(
             "Technocore redirect refused",
@@ -265,11 +410,23 @@ def publish_identity_note(
     if response.status == 409:
         current, framing = parse_note_response_value(response.body)
         if current == expected:
+            audit = _record_observation(
+                resolved,
+                namespace=namespace,
+                key=key,
+                expected_hash=expected_hash,
+                observed_hash=expected_hash,
+                action="publish",
+                status="already-matching",
+                response_status=response.status,
+                failure_classification=None,
+            )
             return {
                 "ok": True,
                 "status": "already-matching",
                 "response_status": response.status,
-                "state_write": False,
+                "state_write": audit["state_write"],
+                "audit_transition": audit["audit_transition"],
                 "network_action": "bounded_read_write",
                 "cas": "if_absent_conflict_existing_match",
                 "note_response_framing": framing,
@@ -277,11 +434,23 @@ def publish_identity_note(
                 "will_load_private_key": False,
                 "will_acquire_nonce": False,
             }
+        audit = _record_observation(
+            resolved,
+            namespace=namespace,
+            key=key,
+            expected_hash=expected_hash,
+            observed_hash=note_hash(current) if current is not None else None,
+            action="publish",
+            status="conflict",
+            response_status=response.status,
+            failure_classification=None,
+        )
         return {
             "ok": False,
             "status": "conflict",
             "response_status": response.status,
-            "state_write": False,
+            "state_write": audit["state_write"],
+            "audit_transition": audit["audit_transition"],
             "network_action": "bounded_read_write",
             "cas": "if_absent_conflict_existing_different",
             "note_response_framing": framing,
@@ -290,13 +459,36 @@ def publish_identity_note(
             "will_acquire_nonce": False,
         }
     if response.status not in {200, 201, 204}:
+        _record_observation(
+            resolved,
+            namespace=namespace,
+            key=key,
+            expected_hash=expected_hash,
+            observed_hash=None,
+            action="publish",
+            status="publish_unknown",
+            response_status=response.status,
+            failure_classification="http_status_error",
+        )
         body_text = response.body.decode("utf-8", errors="replace")
         raise SafetyError(f"DID note publication failed: {redact(body_text, 256)}")
+    audit = _record_observation(
+        resolved,
+        namespace=namespace,
+        key=key,
+        expected_hash=expected_hash,
+        observed_hash=None,
+        action="publish",
+        status="published",
+        response_status=response.status,
+        failure_classification=None,
+    )
     return {
         "ok": True,
         "status": "published",
         "response_status": response.status,
-        "state_write": False,
+        "state_write": audit["state_write"],
+        "audit_transition": audit["audit_transition"],
         "network_action": "bounded_read_write",
         "cas": "if_absent",
         "will_sign": False,
