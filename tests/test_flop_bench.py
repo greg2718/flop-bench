@@ -91,6 +91,7 @@ from flop_bench.posting import (
     POST_CONFIRMATION,
     message_hash,
     post_room_url,
+    posted_record_matches,
     preview_post,
     proposed_initial_announcement,
     protocol_check_post,
@@ -193,7 +194,7 @@ def scout_signed_post_request_parts(
     payload = f"{room}|{nonce}|{text}".encode()
     sig = scout.b64u(key.sign(payload))  # type: ignore[attr-defined]
     body = json.dumps(
-        {"did": did, "sig": sig, "nonce": nonce, "text": text},
+        {"did": did, "sig": sig, "nonce": str(nonce), "text": text},
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -295,12 +296,13 @@ class FakeActivationTransport:
                     status, b"post rejected token=abc123", headers, final_url=url
                 )
             next_seq = len(self.room_messages.get("d-flop-bench", [])) + 1
+            posted_nonce = int(payload["nonce"])
             self.room_messages.setdefault("d-flop-bench", []).append(
                 {
                     "seq": next_seq,
                     "from": payload["did"],
                     "text": payload["text"],
-                    "nonce": payload["nonce"],
+                    "nonce": posted_nonce,
                 }
             )
             if self.timeout_after_accept:
@@ -312,7 +314,7 @@ class FakeActivationTransport:
                 "posted": {
                     "from": payload["did"],
                     "text": payload["text"],
-                    "nonce": payload["nonce"],
+                    "nonce": posted_nonce,
                     "seq": 123,
                 }
             }
@@ -1769,7 +1771,9 @@ def test_post_send_uses_scout_preimage_body_nonce_and_one_audit_row(tmp_path: Pa
     body = transport.post_bodies[0]
     assert body["did"] == did
     assert body["text"] == text
-    assert isinstance(body["nonce"], int)
+    assert isinstance(body["nonce"], str)
+    assert str(body["nonce"]).isdigit()
+    assert len(str(body["nonce"])) <= 19
     assert signed_post_preimage("d-flop-bench", int(body["nonce"]), text) == (
         f"d-flop-bench|{body['nonce']}|{text}".encode()
     )
@@ -1784,12 +1788,92 @@ def test_post_send_uses_scout_preimage_body_nonce_and_one_audit_row(tmp_path: Pa
     assert len(rows) == 1
     row = rows[0]
     assert row["post_status"] == "posted"
-    assert row["nonce_used"] == body["nonce"]
+    assert row["nonce_used"] == int(body["nonce"])
     assert row["seq"] == 123
     stored = json.dumps([dict(row)], sort_keys=True)
     assert text not in stored
     assert str(body["sig"]) not in stored
     assert passphrase not in stored
+
+
+def test_post_success_requires_integer_response_nonce_equal_to_local_nonce(tmp_path: Path) -> None:
+    assert posted_record_matches(
+        {"from": "did:key:z6MkOwn", "text": "hello", "nonce": 123, "seq": 1},
+        did="did:key:z6MkOwn",
+        text="hello",
+        nonce=123,
+    )
+    base = {"from": "did:key:z6MkOwn", "text": "hello", "seq": 1}
+    for label, raw_nonce, expected_nonce in (
+        ("string", "123", 123),
+        ("bool", True, 1),
+        ("float", 123.0, 123),
+        ("missing", None, 123),
+        ("mismatched", 124, 123),
+    ):
+        posted = dict(base)
+        if label != "missing":
+            posted["nonce"] = raw_nonce
+        assert not posted_record_matches(
+            posted,
+            did="did:key:z6MkOwn",
+            text="hello",
+            nonce=expected_nonce,
+        )
+
+
+def test_send_post_fails_closed_on_string_response_nonce(tmp_path: Path) -> None:
+    state, passphrase, did = temp_production_identity(tmp_path)
+    message = tmp_path / "message.txt"
+    message.write_text("FLOP Bench response nonce type check", encoding="utf-8")
+
+    class StringResponseNonceTransport(FakeActivationTransport):
+        def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            body: bytes | None = None,
+            headers: dict[str, str] | None = None,
+            timeout: float = 20.0,
+        ) -> TransportResponse:
+            response = super().request(
+                method,
+                url,
+                body=body,
+                headers=headers,
+                timeout=timeout,
+            )
+            if method == "POST" and response.status == 200:
+                parsed = json.loads(response.body.decode("utf-8"))
+                parsed["posted"]["nonce"] = str(parsed["posted"]["nonce"])
+                return TransportResponse(
+                    response.status,
+                    json.dumps(parsed, separators=(",", ":")).encode(),
+                    response.headers,
+                    final_url=response.final_url,
+                )
+            return response
+
+    transport = StringResponseNonceTransport()
+    transport.notes[("room-owners", "d-flop-bench")] = did
+    with pytest.raises(SafetyError, match="returned posted record"):
+        send_post(
+            message,
+            state_dir=state,
+            live=True,
+            confirm=POST_CONFIRMATION,
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    assert isinstance(transport.post_bodies[0]["nonce"], str)
+    with connect_state(state) as conn:
+        row = conn.execute("SELECT * FROM post_attempts").fetchone()
+    assert row["post_status"] == "failed"
+    assert row["failure_classification"] == "unverifiable_post"
+    assert row["nonce_used"] == int(transport.post_bodies[0]["nonce"])
 
 
 def test_signed_post_golden_scout_parity_except_user_agent() -> None:
@@ -1823,6 +1907,8 @@ def test_signed_post_golden_scout_parity_except_user_agent() -> None:
     assert bench["preimage"] == scout["preimage"]
     bench_headers = dict(bench_request.header_items())
     scout_headers = dict(scout["headers"])
+    assert json.loads(bench_request.data.decode("utf-8"))["nonce"] == str(nonce)
+    assert json.loads(bytes(scout["body"]).decode("utf-8"))["nonce"] == str(nonce)
     assert bench_headers.pop("User-agent") != scout_headers.pop("User-agent")
     assert bench_headers == scout_headers
 
@@ -1842,6 +1928,9 @@ def test_protocol_check_is_offline_and_reports_post_limits(tmp_path: Path) -> No
     assert report["message_bytes"] == 584
     assert report["technocore_post_limit"]["max_characters"] == 4096
     assert report["technocore_post_limit"]["message_valid"] is True
+    assert report["nonce"]["local_type"] == "integer"
+    assert report["nonce"]["request_body"] == "JSON string matching ^[0-9]{1,19}$"
+    assert report["nonce"]["response_posted_record"].startswith("JSON integer")
     assert report["scout_parity"]["status"] == "protocol_bytes_match_except_user_agent"
 
 
@@ -2041,7 +2130,7 @@ def test_post_timeout_after_accept_reconcile_finds_exact_match(tmp_path: Path) -
         row = conn.execute("SELECT * FROM post_attempts").fetchone()
     assert row["post_status"] == "unknown_outcome"
     assert row["failure_classification"] == "post_outcome_unknown_timeout"
-    assert row["nonce_used"] == transport.post_bodies[0]["nonce"]
+    assert row["nonce_used"] == int(transport.post_bodies[0]["nonce"])
     result = reconcile_post(
         state_dir=state,
         attempt_id=int(row["id"]),
@@ -2303,7 +2392,7 @@ def test_reconcile_reports_missing_null_and_malformed_remote_nonce(tmp_path: Pat
             ),
         ).lastrowid
         conn.commit()
-    for raw_nonce in (None, "not-an-int", False):
+    for raw_nonce in (None, "not-an-int", "222", False, 222.0):
         transport = FakeActivationTransport()
         transport.room_messages["d-flop-bench"] = [
             {"seq": 3, "from": did, "text": text, "nonce": raw_nonce}
@@ -3310,6 +3399,8 @@ def test_mailbox_canonical_parsing_authentication_and_pending_review(tmp_path: P
     assert classify_authentication(transport.room_messages["mb-flop-bench"][0])[0] == (
         "server_verified_signed_lane"
     )
+    string_nonce = {"seq": 2, "from": sender, "nonce": "124", "text": text}
+    assert classify_authentication(string_nonce)[0] == "malformed_or_unverifiable"
     parsed = parse_mailbox_envelope(text, remote_sender=sender)
     assert parsed["request_id"] == "mb-req-1"
     result = poll_mailbox(
