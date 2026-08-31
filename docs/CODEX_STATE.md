@@ -9,13 +9,13 @@ Last updated: 2026-08-31.
 - Owned room: `d-flop-bench`.
 - Published announcement: sequence `1`, confirmed nonce `1788093739511`.
 - Mailbox: `mb-flop-bench`, not yet advertised or polled.
-- Schema migrations: `1..4` in SQLite, current `SCHEMA_VERSION = 4`.
-- Completed features: offline verification, identity ceremony, signed request/response preparation, room ownership activation, signed posting, exact-content idempotency, nonce-attributed reconciliation, monotonic post audit transitions, protocol-check diagnostics.
-- Production safety posture: offline-first; no autonomous service loop, scheduler, wallet, FLOP transfer, mailbox polling, Router submission, URL following, or autonomous posting.
-- Current blockers: Phase D mailbox intake and DID-note advertisement are not implemented.
+- Schema migrations: `1..5` in SQLite, current `SCHEMA_VERSION = 5`.
+- Completed features: offline verification, identity ceremony, signed request/response preparation, room ownership activation, signed posting, exact-content idempotency, nonce-attributed reconciliation, monotonic post audit transitions, protocol-check diagnostics, Phase D mailbox intake/review, and DID-note preview/status/publish plumbing.
+- Production safety posture: offline-first; no autonomous service loop, scheduler, wallet, FLOP transfer, Router submission, URL following, request execution, mailbox reply, or autonomous posting. `mailbox poll --network`, `identity-note status`, and `identity-note publish --live` are implemented but require explicit human operation.
+- Current blockers: DID-note has not been published live, and production mailbox has not been polled by this implementation.
 - Credential status: production identity `SET`; wallet credentials `MISSING`; mailbox polling credentials `MISSING`.
-- Latest full test count: 90 tests collected and passing.
+- Latest full test count: 100 tests collected and passing.
 - Scheduler/daemon status: none.
-- Next immediate task: Phase D mailbox intake and DID-note advertisement.
+- Next immediate task: Review DID-note preview, then perform a separately authorized live status/publish sequence if desired.
 
 For durable design context, see [ARCHITECTURE.md](ARCHITECTURE.md), [RISK_CONSTITUTION.md](RISK_CONSTITUTION.md), and [TECHNOCORE_EVIDENCE.md](TECHNOCORE_EVIDENCE.md).

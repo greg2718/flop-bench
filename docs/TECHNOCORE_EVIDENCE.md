@@ -16,8 +16,9 @@ This caches local protocol evidence. Do not fetch the web for routine future wor
 - Current post length limit from Scout code: 4096 characters after Scout message normalization. Bench additionally enforces 4096 UTF-8 bytes.
 - Room ownership endpoint: `/kv/room-owners/{room}/set-signed/{did}/{sig}/{nonce}/{value}?if_absent=1`.
 - Room ownership preimage: `room-owners|{room}|{nonce}|{did}`.
-- Mailbox semantics: `mb-` mailbox is treated as signed-write room semantics, not an ownable service. No Bench mailbox creation flow is active.
-- DID-note fingerprint/shard convention: known from local planning but not implemented in Bench; confirm exact source before publishing a DID note.
+- Mailbox semantics: `mb-` mailbox is treated as signed-write room semantics, not an ownable service. No mailbox creation operation is required.
+- DID-note fingerprint/shard convention from Scout: `fingerprint = sha256(did UTF-8).hexdigest()[:16]`, namespace `did-{fingerprint[:2]}`, key `fingerprint[2:]`. Source: Scout `did_profile_fingerprint` and `did_profile_path`.
+- DID-note publication behavior from Scout: read `/kv/{namespace}/{key}` first; profile publication uses plain JSON `POST {"value": proposed}` to that KV path. No local evidence establishes a signed CAS write for DID profile notes.
 - Relevant deployment limits currently encoded locally: 1 MB response read limit, 20 second request timeout, 4096 character Scout post limit, 4096 byte Bench post limit.
 
 ## Local Design Decisions
@@ -30,7 +31,7 @@ This caches local protocol evidence. Do not fetch the web for routine future wor
 ## Residual Uncertainties
 
 - Live production failures may still arise from network, TLS, proxy, redirect, or Technocore server behavior not reproducible offline.
-- DID-note publication details must be confirmed from local evidence before Phase D publication.
+- DID profile notes are unsigned convention metadata and do not cryptographically prove ownership; authoritative Bench identity evidence remains signed DID activity and owned room evidence.
 - Mailbox polling semantics are not implemented or production-tested.
 
 ## Source URLs And Local Sources
