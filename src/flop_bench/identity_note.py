@@ -98,6 +98,10 @@ def parse_note_response_value(raw: bytes | None) -> tuple[str | None, str]:
         raise ValidationError("Technocore note response is not valid UTF-8") from exc
     if "\r" in text:
         raise ValidationError("Technocore note response contains unsupported line endings")
+    if text.endswith("\n\n"):
+        raise ValidationError("Technocore note response has ambiguous trailing newlines")
+    if text.endswith("\n"):
+        text = text[:-1]
     lines = text.split("\n")
     if lines[0] == NOTE_RESPONSE_BANNER:
         if len(lines) != 3 or lines[1] != "" or not lines[2]:

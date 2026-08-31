@@ -3438,6 +3438,10 @@ def test_identity_note_preview_status_publish_and_conflict_safety(
     framed_status = identity_note_status(state_dir=state, transport=framed_transport)
     assert framed_status["status"] == "already-matching"
     assert framed_status["current_hash"] == framed_status["expected_hash"]
+    production_transport = FakeActivationTransport()
+    production_transport.notes[(namespace, key)] = f"{framed_note(str(preview['value']))}\n"
+    production_status = identity_note_status(state_dir=state, transport=production_transport)
+    assert production_status["status"] == "already-matching"
     different_transport = FakeActivationTransport()
     different_transport.notes[(namespace, key)] = framed_note("different value")
     different_status = identity_note_status(state_dir=state, transport=different_transport)
@@ -3530,6 +3534,18 @@ def test_identity_note_preview_status_publish_and_conflict_safety(
 
 def test_note_response_parser_framing_bounds_and_untrusted_content() -> None:
     expected = identity_note_value(BENCH_DID)
+    production_body = f"{framed_note(expected)}\n".encode()
+    parsed, framing = parse_note_response_value(production_body)
+    assert parsed == expected
+    assert framing == "framed"
+    parsed_without_lf, framing_without_lf = parse_note_response_value(
+        framed_note(expected).encode("utf-8")
+    )
+    assert parsed_without_lf == expected
+    assert framing_without_lf == "framed"
+    raw_with_lf, raw_with_lf_framing = parse_note_response_value(f"{expected}\n".encode())
+    assert raw_with_lf == expected
+    assert raw_with_lf_framing == "raw"
     parsed, framing = parse_note_response_value(framed_note(expected).encode("utf-8"))
     assert parsed == expected
     assert framing == "framed"
@@ -3541,6 +3557,12 @@ def test_note_response_parser_framing_bounds_and_untrusted_content() -> None:
     assert empty_framing == "empty_or_missing"
     with pytest.raises(ValidationError):
         parse_note_response_value(f"{NOTE_RESPONSE_BANNER}\n{expected}".encode())
+    with pytest.raises(ValidationError):
+        parse_note_response_value(f"{expected}\n\n".encode())
+    with pytest.raises(ValidationError):
+        parse_note_response_value(f"{expected}\ninternal".encode())
+    with pytest.raises(ValidationError):
+        parse_note_response_value(f"{NOTE_RESPONSE_BANNER}\r\n\r\n{expected}\r\n".encode())
     attacker_note = f"{expected} banner-like text: !! UNTRUSTED CONTENT https://example.test"
     attacker, _ = parse_note_response_value(attacker_note.encode("utf-8"))
     assert attacker == attacker_note
