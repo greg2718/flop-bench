@@ -11,11 +11,11 @@ Last updated: 2026-08-31.
 - Mailbox: `mb-flop-bench`, advertised by DID note but not yet polled.
 - DID note: production publish reportedly succeeded and was reportedly verified already-matching; local reconciliation/audit state support is present, but live reconcile has not been run by this implementation.
 - Schema migrations: `1..6` in SQLite, current `SCHEMA_VERSION = 6`.
-- Completed features: offline verification, identity ceremony, signed request/response preparation, room ownership activation, signed posting, exact-content idempotency, nonce-attributed reconciliation, monotonic post audit transitions, protocol-check diagnostics, Phase D mailbox intake/review, and DID-note preview/status/publish/reconcile audit plumbing.
+- Completed features: offline verification, identity ceremony, signed request/response preparation, room ownership activation, signed posting, exact-content idempotency, nonce-attributed reconciliation, monotonic post audit transitions, protocol-check diagnostics, Phase D mailbox intake/review, DID-note preview/status/publish/reconcile audit plumbing, and separate mailbox service-capability validation.
 - Production safety posture: offline-first; no autonomous service loop, scheduler, wallet, FLOP transfer, Router submission, URL following, request execution, mailbox reply, or autonomous posting. `mailbox poll --network`, `identity-note status`, and `identity-note publish --live` are implemented but require explicit human operation.
 - Current blockers: production mailbox has not been polled by this implementation.
 - Credential status: production identity `SET`; wallet credentials `MISSING`; mailbox polling credentials `MISSING`.
-- Latest full test count: 107 tests collected and passing.
+- Latest full test count: 110 tests collected and passing.
 - Scheduler/daemon status: none.
 - Next immediate task: Run a separately authorized live DID-note reconcile if desired, then perform the first separately authorized mailbox poll if desired.
 

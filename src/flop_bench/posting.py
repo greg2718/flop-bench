@@ -21,6 +21,7 @@ from .activation import (
 from .canonical import sha256_bytes
 from .config import (
     BENCH_DID,
+    BENCH_SERVICE_CAPABILITIES,
     CANONICAL_ROOM,
     DEFAULT_PRODUCTION_STATE,
     MAILBOX,
@@ -58,16 +59,7 @@ def service_manifest() -> dict[str, Any]:
             "status": "protocol-unconfirmed",
             "active": False,
         },
-        "capabilities": [
-            "software.testing",
-            "software.api",
-            "software.debugging",
-            "technocore.api",
-            "technocore.signed_post",
-            "technocore.protocol",
-            "reproducibility",
-            "verification",
-        ],
+        "capabilities": list(BENCH_SERVICE_CAPABILITIES),
         "operator_group": {
             "common_control_disclosure": True,
             "operator_group_id": "local-flop-agent-family",

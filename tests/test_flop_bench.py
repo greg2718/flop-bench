@@ -41,6 +41,7 @@ from flop_bench.activation import (
 from flop_bench.adapters import run_local_command_step
 from flop_bench.config import (
     BENCH_DID,
+    BENCH_SERVICE_CAPABILITIES,
     SCOUT_DID,
     SCOUT_MAILBOX,
     SCOUT_ROOM,
@@ -108,6 +109,7 @@ from flop_bench.posting import (
 from flop_bench.protocol import (
     REQUEST_SCHEMA_VERSION,
     RESPONSE_SCHEMA_VERSION,
+    SUPPORTED_CAPABILITIES,
     b64u_decode,
     protocol_error_from_response,
     public_key_from_did,
@@ -1116,6 +1118,21 @@ def test_invalid_signature_wrong_target_and_unsupported_capability(tmp_path: Pat
         verify_request(
             write_json(tmp_path / "unsupported.json", unsupported),
             state_dir=tmp_path / "s3",
+        )
+
+
+def test_signed_request_capabilities_remain_execution_allowlist(tmp_path: Path) -> None:
+    sender_key = Ed25519PrivateKey.generate()
+    assert SUPPORTED_CAPABILITIES == frozenset({"approved-local-command", "file-check"})
+    assert "software.testing" not in SUPPORTED_CAPABILITIES
+    request = signed_request(
+        sender_key=sender_key,
+        requested_capability="software.testing",
+    )
+    with pytest.raises(SafetyError):
+        verify_request(
+            write_json(tmp_path / "service-capability.json", request),
+            state_dir=tmp_path / "state",
         )
 
 
@@ -3118,7 +3135,7 @@ def mailbox_request_text(
     sender_did: str,
     request_id: str = "mb-req-1",
     target_did: str = BENCH_DID,
-    capability: str = "file-check",
+    capability: str = "software.testing",
     created_at: str | None = None,
     expires_at: str | None = None,
     extra: dict[str, object] | None = None,
@@ -3156,6 +3173,87 @@ def write_bench_identity_json(state: Path) -> None:
             "mailbox": "mb-flop-bench",
         },
     )
+
+
+def test_mailbox_capability_validation_uses_advertised_service_capabilities() -> None:
+    sender = public_did(Ed25519PrivateKey.generate())
+    assert BENCH_SERVICE_CAPABILITIES == (
+        "software.testing",
+        "software.api",
+        "software.debugging",
+        "technocore.api",
+        "technocore.signed_post",
+        "technocore.protocol",
+        "reproducibility",
+        "verification",
+    )
+    assert tuple(service_manifest()["capabilities"]) == BENCH_SERVICE_CAPABILITIES
+    assert SUPPORTED_CAPABILITIES == frozenset({"file-check", "approved-local-command"})
+    assert "software.testing" in BENCH_SERVICE_CAPABILITIES
+    assert "file-check" not in BENCH_SERVICE_CAPABILITIES
+    assert "approved-local-command" not in BENCH_SERVICE_CAPABILITIES
+    for capability in BENCH_SERVICE_CAPABILITIES:
+        parsed = parse_mailbox_envelope(
+            mailbox_request_text(sender_did=sender, capability=capability),
+            remote_sender=sender,
+        )
+        assert parsed["requested_capability"] == capability
+    for capability in ("approved-local-command", "file-check", "unknown.capability"):
+        with pytest.raises(SafetyError):
+            parse_mailbox_envelope(
+                mailbox_request_text(sender_did=sender, capability=capability),
+                remote_sender=sender,
+            )
+
+
+def test_mailbox_service_capability_does_not_authorize_actions(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    sender = public_did(Ed25519PrivateKey.generate())
+    marker = tmp_path / "must-not-exist"
+    transport = FakeActivationTransport()
+    transport.room_messages["mb-flop-bench"] = [
+        {
+            "seq": 1,
+            "from": sender,
+            "nonce": 1,
+            "text": mailbox_request_text(
+                sender_did=sender,
+                capability="software.testing",
+                extra={
+                    "test_spec": spec(
+                        tmp_path,
+                        [
+                            {
+                                "adapter": "local_command",
+                                "argv": [
+                                    sys.executable,
+                                    "-c",
+                                    f"open({str(marker)!r}, 'w').write('bad')",
+                                ],
+                                "cwd": str(tmp_path),
+                                "timeout_seconds": 5,
+                            }
+                        ],
+                        mode="approved-local",
+                    )
+                },
+            ),
+        }
+    ]
+    result = poll_mailbox(
+        state_dir=state,
+        network=True,
+        transport=transport,
+        sleep_on_429=False,
+    )
+    queued = request_queue(state_dir=state)
+    assert result["network_action"] == "bounded_read_only"
+    assert result["will_sign"] is False
+    assert result["will_post"] is False
+    assert result["will_acquire_nonce"] is False
+    assert queued["requests"][0]["review_status"] == "pending_human_review"
+    assert not marker.exists()
+    assert all(method == "GET" for method, _url in transport.requests)
 
 
 def framed_note(value: str) -> str:
