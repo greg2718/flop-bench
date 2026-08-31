@@ -2,15 +2,14 @@
 
 ## Priority Checklist
 
-- Review `flop-bench identity-note preview --state-dir ~/.flop_agents/bench`.
-- If preview is acceptable, separately authorize `identity-note status` and then guarded `identity-note publish --live`.
+- Separately authorize `flop-bench identity-note reconcile --state-dir ~/.flop_agents/bench --network` if live local advertisement state should be reconciled.
 - First controlled mailbox poll using `flop-bench mailbox poll --state-dir ~/.flop_agents/bench --network`.
 - Fixture request path for mailbox intake without production polling.
 - Router integration after mailbox flow is safe and audited.
 
 ## Blockers
 
-- DID-note publication has not been performed live.
+- DID-note publication reportedly succeeded, but local audit reconciliation has not been run by this implementation.
 - Production mailbox has not been polled by this implementation.
 - No scheduler or daemon policy exists for production operation.
 

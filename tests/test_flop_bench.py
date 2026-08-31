@@ -64,9 +64,11 @@ from flop_bench.identity_note import (
     did_profile_path,
     identity_note_status,
     identity_note_value,
+    note_hash,
     parse_note_response_value,
     preview_identity_note,
     publish_identity_note,
+    reconcile_identity_note,
     scout_compatible_mailbox_from_note,
 )
 from flop_bench.ledger import append_record, verify_ledger
@@ -2742,7 +2744,7 @@ def test_service_doctor_read_only_does_not_create_or_migrate_state(tmp_path: Pat
     assert report["database_exists"] is False
     assert report["permission_issues"] == []
     assert report["schema_migrations"] == []
-    assert report["pending_migrations"] == [1, 2, 3, 4, 5]
+    assert report["pending_migrations"] == [1, 2, 3, 4, 5, 6]
     assert not state.exists()
 
 
@@ -2751,8 +2753,8 @@ def test_service_doctor_reports_migrations_applied_and_plan_is_read_only(tmp_pat
     report = service_doctor(state_dir=state)
     assert report["read_only"] is False
     assert report["state_write"] is True
-    assert report["migrations_applied"] == [1, 2, 3, 4, 5]
-    assert report["schema_migrations"] == [1, 2, 3, 4, 5]
+    assert report["migrations_applied"] == [1, 2, 3, 4, 5, 6]
+    assert report["schema_migrations"] == [1, 2, 3, 4, 5, 6]
     status = migration_status(state)
     assert status["pending_migrations"] == []
     plan = plan_init(state_dir=state)
@@ -2769,13 +2771,13 @@ def test_service_doctor_read_only_reports_outdated_state_without_migrating(tmp_p
     read_only = service_doctor(state_dir=state, read_only=True)
     assert read_only["state_write"] is False
     assert read_only["schema_migrations"] == [1]
-    assert read_only["pending_migrations"] == [2, 3, 4, 5]
+    assert read_only["pending_migrations"] == [2, 3, 4, 5, 6]
     after_read_only = migration_status(state)
     assert after_read_only["schema_migrations"] == [1]
     normal = service_doctor(state_dir=state)
     assert normal["state_write"] is True
-    assert normal["migrations_applied"] == [2, 3, 4, 5]
-    assert normal["schema_migrations"] == [1, 2, 3, 4, 5]
+    assert normal["migrations_applied"] == [2, 3, 4, 5, 6]
+    assert normal["schema_migrations"] == [1, 2, 3, 4, 5, 6]
 
 
 def test_private_state_database_and_sidecar_permissions(tmp_path: Path) -> None:
@@ -3166,7 +3168,8 @@ def test_mailbox_status_and_local_poll_are_local_only(tmp_path: Path) -> None:
     poll = poll_mailbox(state_dir=state, network=False, transport=FakeActivationTransport())
     assert status["protocol"] == "signed-write-only-room"
     assert status["creation_required"] is False
-    assert status["advertised"] is False
+    assert status["advertised"] is None
+    assert status["advertisement_status"] == "unknown_not_reconciled"
     assert status["network_action"] is False
     assert poll["poll_status"] == "local_only"
     assert poll["will_sign"] is False
@@ -3570,6 +3573,180 @@ def test_note_response_parser_framing_bounds_and_untrusted_content() -> None:
         parse_note_response_value(f"{expected}\n{NOTE_RESPONSE_BANNER}".encode())
     with pytest.raises(SafetyError):
         parse_note_response_value(b"x" * 8193)
+
+
+def test_did_note_reconcile_drives_local_mailbox_advertisement_state(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    write_bench_identity_json(state)
+    namespace, key, _fingerprint = did_profile_path(BENCH_DID)
+    expected = identity_note_value(BENCH_DID)
+    before = mailbox_status(state_dir=state)
+    assert before["advertised"] is None
+    assert before["advertisement_status"] == "unknown_not_reconciled"
+    matching = FakeActivationTransport()
+    matching.notes[(namespace, key)] = framed_note(expected)
+    reconciled = reconcile_identity_note(state_dir=state, network=True, transport=matching)
+    assert reconciled["status"] == "already-matching"
+    assert reconciled["state_write"] is True
+    assert reconciled["network_action"] == "bounded_read_only"
+    assert matching.note_bodies == []
+    assert all(method == "GET" for method, _url in matching.requests)
+    after = mailbox_status(state_dir=state)
+    assert after["advertised"] is True
+    assert after["advertisement_status"] == "already-matching"
+    assert after["advertisement_expected_hash"] == note_hash(expected)
+
+
+def test_did_note_reconcile_absent_and_conflict_are_explicit_false(tmp_path: Path) -> None:
+    for label, notes, expected_status in [
+        ("absent", {}, "absent"),
+        ("conflict", {"value": "different value"}, "conflict"),
+    ]:
+        state = tmp_path / label
+        write_bench_identity_json(state)
+        namespace, key, _fingerprint = did_profile_path(BENCH_DID)
+        transport = FakeActivationTransport()
+        if notes:
+            transport.notes[(namespace, key)] = framed_note(str(notes["value"]))
+        result = reconcile_identity_note(state_dir=state, network=True, transport=transport)
+        status = mailbox_status(state_dir=state)
+        assert result["status"] == expected_status
+        assert result["state_write"] is True
+        assert status["advertised"] is False
+        assert status["advertisement_status"] == expected_status
+
+
+def test_did_note_reconcile_503_preserves_prior_matching_evidence(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    write_bench_identity_json(state)
+    namespace, key, _fingerprint = did_profile_path(BENCH_DID)
+    matching = FakeActivationTransport()
+    matching.notes[(namespace, key)] = framed_note(identity_note_value(BENCH_DID))
+    reconcile_identity_note(state_dir=state, network=True, transport=matching)
+    before = mailbox_status(state_dir=state)
+    unavailable = FakeActivationTransport()
+    unavailable.note_statuses[(namespace, key)] = 503
+    result = reconcile_identity_note(state_dir=state, network=True, transport=unavailable)
+    after = mailbox_status(state_dir=state)
+    assert result["status"] == "reconciliation_incomplete"
+    assert result["state_write"] is False
+    assert after == before
+
+
+def test_did_note_reconcile_absent_or_conflict_preserves_prior_matching_evidence(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    write_bench_identity_json(state)
+    namespace, key, _fingerprint = did_profile_path(BENCH_DID)
+    matching = FakeActivationTransport()
+    matching.notes[(namespace, key)] = framed_note(identity_note_value(BENCH_DID))
+    reconcile_identity_note(state_dir=state, network=True, transport=matching)
+    before = mailbox_status(state_dir=state)
+    absent = reconcile_identity_note(
+        state_dir=state,
+        network=True,
+        transport=FakeActivationTransport(),
+    )
+    conflict_transport = FakeActivationTransport()
+    conflict_transport.notes[(namespace, key)] = framed_note("different value")
+    conflict = reconcile_identity_note(
+        state_dir=state,
+        network=True,
+        transport=conflict_transport,
+    )
+    after = mailbox_status(state_dir=state)
+    assert absent["status"] == "absent"
+    assert absent["state_write"] is False
+    assert absent["audit_transition"] == "preserved"
+    assert conflict["status"] == "conflict"
+    assert conflict["state_write"] is False
+    assert conflict["audit_transition"] == "preserved"
+    assert after == before
+
+
+def test_did_note_reconcile_requires_network_and_never_publishes(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    write_bench_identity_json(state)
+    with pytest.raises(SafetyError):
+        reconcile_identity_note(
+            state_dir=state,
+            network=False,
+            transport=FakeActivationTransport(),
+        )
+    transport = FakeActivationTransport()
+    namespace, key, _fingerprint = did_profile_path(BENCH_DID)
+    transport.notes[(namespace, key)] = framed_note(identity_note_value(BENCH_DID))
+    reconcile_identity_note(state_dir=state, network=True, transport=transport)
+    assert transport.note_bodies == []
+    assert all(method == "GET" for method, _url in transport.requests)
+
+
+def test_identity_note_publish_audits_safe_lifecycle_and_ambiguous_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "state"
+    write_bench_identity_json(state)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    transport = FakeActivationTransport()
+    published = publish_identity_note(
+        state_dir=state,
+        live=True,
+        confirm=DID_NOTE_CONFIRMATION,
+        transport=transport,
+        expected_state_dir=state,
+    )
+    assert published["status"] == "published"
+    with connect_state(state) as conn:
+        rows = conn.execute(
+            """
+            SELECT namespace, key, expected_hash, observed_hash, action, status,
+                   response_status, failure_classification
+            FROM did_note_observations
+            ORDER BY id
+            """
+        ).fetchall()
+    assert [row["status"] for row in rows] == ["publish_started", "published"]
+    stored = json.dumps([dict(row) for row in rows], sort_keys=True)
+    assert identity_note_value(BENCH_DID) not in stored
+    assert "signature" not in stored
+    assert "cookie" not in stored.lower()
+    assert "password" not in stored.lower()
+
+    class AmbiguousPublishTransport(FakeActivationTransport):
+        def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            body: bytes | None = None,
+            headers: dict[str, str] | None = None,
+            timeout: float = 20.0,
+        ) -> TransportResponse:
+            if method == "POST":
+                raise ActivationRequestError(
+                    "write timed out password=supersecret",
+                    failure_classification="timeout_unknown_phase",
+                )
+            return super().request(method, url, body=body, headers=headers, timeout=timeout)
+
+    ambiguous_state = tmp_path / "ambiguous"
+    write_bench_identity_json(ambiguous_state)
+    with pytest.raises(ActivationRequestError):
+        publish_identity_note(
+            state_dir=ambiguous_state,
+            live=True,
+            confirm=DID_NOTE_CONFIRMATION,
+            transport=AmbiguousPublishTransport(),
+            expected_state_dir=ambiguous_state,
+        )
+    with connect_state(ambiguous_state) as conn:
+        statuses = [
+            row["status"]
+            for row in conn.execute("SELECT status FROM did_note_observations ORDER BY id")
+        ]
+    assert statuses == ["publish_started", "publish_unknown"]
 
 
 def test_cli_phase_d_local_commands_smoke(tmp_path: Path) -> None:
