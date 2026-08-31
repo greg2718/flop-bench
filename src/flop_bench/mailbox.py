@@ -20,12 +20,12 @@ from .activation import (
     quote,
 )
 from .canonical import sha256_bytes
-from .config import BENCH_DID, MAILBOX, BenchConfig, assert_isolated
+from .config import BENCH_DID, BENCH_SERVICE_CAPABILITIES, MAILBOX, BenchConfig, assert_isolated
 from .exceptions import SafetyError, ValidationError
 from .identity import is_valid_ed25519_did
 from .identity_note import did_profile_path, identity_note_value, note_hash
 from .posting import extract_room_messages, message_nonce, message_seq
-from .protocol import SUPPORTED_CAPABILITIES, parse_timestamp, validate_timestamp_window
+from .protocol import parse_timestamp, validate_timestamp_window
 from .redaction import redact
 from .state import (
     STATE_DB,
@@ -150,7 +150,7 @@ def parse_mailbox_envelope(
         raise SafetyError("mailbox request target_did is not the Bench DID")
     if envelope["sender_did"] != remote_sender:
         raise SafetyError("mailbox request sender_did does not match Technocore from")
-    if envelope["requested_capability"] not in SUPPORTED_CAPABILITIES:
+    if envelope["requested_capability"] not in BENCH_SERVICE_CAPABILITIES:
         raise SafetyError("unsupported requested capability")
     if not isinstance(envelope["test_spec"], dict):
         raise ValidationError("test_spec must be an object")
