@@ -60,9 +60,11 @@ from flop_bench.identity import (
 )
 from flop_bench.identity_note import (
     DID_NOTE_CONFIRMATION,
+    NOTE_RESPONSE_BANNER,
     did_profile_path,
     identity_note_status,
     identity_note_value,
+    parse_note_response_value,
     preview_identity_note,
     publish_identity_note,
     scout_compatible_mailbox_from_note,
@@ -3154,6 +3156,10 @@ def write_bench_identity_json(state: Path) -> None:
     )
 
 
+def framed_note(value: str) -> str:
+    return f"{NOTE_RESPONSE_BANNER}\n\n{value}"
+
+
 def test_mailbox_status_and_local_poll_are_local_only(tmp_path: Path) -> None:
     state = tmp_path / "state"
     status = mailbox_status(state_dir=state)
@@ -3427,6 +3433,15 @@ def test_identity_note_preview_status_publish_and_conflict_safety(
     transport = FakeActivationTransport()
     status = identity_note_status(state_dir=state, transport=transport)
     assert status["status"] == "absent"
+    framed_transport = FakeActivationTransport()
+    framed_transport.notes[(namespace, key)] = framed_note(str(preview["value"]))
+    framed_status = identity_note_status(state_dir=state, transport=framed_transport)
+    assert framed_status["status"] == "already-matching"
+    assert framed_status["current_hash"] == framed_status["expected_hash"]
+    different_transport = FakeActivationTransport()
+    different_transport.notes[(namespace, key)] = framed_note("different value")
+    different_status = identity_note_status(state_dir=state, transport=different_transport)
+    assert different_status["status"] == "conflict"
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     published = publish_identity_note(
         state_dir=state,
@@ -3471,7 +3486,7 @@ def test_identity_note_preview_status_publish_and_conflict_safety(
         if args[0] == "POST":
             return TransportResponse(
                 409,
-                json.dumps({"value": preview["value"]}, separators=(",", ":")).encode(),
+                framed_note(str(preview["value"])).encode("utf-8"),
                 {},
                 final_url=str(args[1]),
             )
@@ -3492,7 +3507,12 @@ def test_identity_note_preview_status_publish_and_conflict_safety(
 
     def cas_409_different(*args: object, **kwargs: object) -> TransportResponse:
         if args[0] == "POST":
-            return TransportResponse(409, b"unexpected existing value", {}, final_url=str(args[1]))
+            return TransportResponse(
+                409,
+                framed_note("unexpected existing value").encode("utf-8"),
+                {},
+                final_url=str(args[1]),
+            )
         return original_different_request(*args, **kwargs)
 
     cas_different.request = cas_409_different  # type: ignore[method-assign]
@@ -3506,6 +3526,28 @@ def test_identity_note_preview_status_publish_and_conflict_safety(
     assert cas_conflict["status"] == "conflict"
     assert cas_conflict["ok"] is False
     assert all("set-signed" not in url for _method, url in transport.requests)
+
+
+def test_note_response_parser_framing_bounds_and_untrusted_content() -> None:
+    expected = identity_note_value(BENCH_DID)
+    parsed, framing = parse_note_response_value(framed_note(expected).encode("utf-8"))
+    assert parsed == expected
+    assert framing == "framed"
+    raw, raw_framing = parse_note_response_value(expected.encode("utf-8"))
+    assert raw == expected
+    assert raw_framing == "raw"
+    empty, empty_framing = parse_note_response_value(b"")
+    assert empty is None
+    assert empty_framing == "empty_or_missing"
+    with pytest.raises(ValidationError):
+        parse_note_response_value(f"{NOTE_RESPONSE_BANNER}\n{expected}".encode())
+    attacker_note = f"{expected} banner-like text: !! UNTRUSTED CONTENT https://example.test"
+    attacker, _ = parse_note_response_value(attacker_note.encode("utf-8"))
+    assert attacker == attacker_note
+    with pytest.raises(ValidationError):
+        parse_note_response_value(f"{expected}\n{NOTE_RESPONSE_BANNER}".encode())
+    with pytest.raises(SafetyError):
+        parse_note_response_value(b"x" * 8193)
 
 
 def test_cli_phase_d_local_commands_smoke(tmp_path: Path) -> None:
