@@ -163,13 +163,9 @@ def message_seq(raw: dict[str, Any]) -> int | None:
 
 def message_nonce(raw: dict[str, Any]) -> int | None:
     value = raw.get("nonce")
-    if isinstance(value, bool) or value is None:
+    if type(value) is not int:
         return None
-    try:
-        nonce = int(value)
-    except (TypeError, ValueError):
-        return None
-    return nonce if nonce > 0 else None
+    return value if value > 0 else None
 
 
 def canonical_room_message(raw: dict[str, Any]) -> dict[str, Any]:
@@ -201,10 +197,23 @@ def signed_post_preimage(room: str, nonce: int, text: str) -> bytes:
 
 def signed_post_body(*, did: str, sig: str, nonce: int, text: str) -> bytes:
     return json.dumps(
-        {"did": did, "sig": sig, "nonce": nonce, "text": text},
+        {"did": did, "sig": sig, "nonce": str(nonce), "text": text},
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def posted_record_matches(posted: dict[str, Any], *, did: str, text: str, nonce: int) -> bool:
+    posted_nonce = posted.get("nonce")
+    seq = posted.get("seq")
+    return (
+        posted.get("from") == did
+        and posted.get("text") == text
+        and type(posted_nonce) is int
+        and posted_nonce == nonce
+        and isinstance(seq, int)
+        and seq > 0
+    )
 
 
 def signed_post_headers(*, user_agent: str = USER_AGENT) -> dict[str, str]:
@@ -550,6 +559,11 @@ def protocol_check_post(message_path: Path, *, state_dir: Path) -> dict[str, Any
         },
         "nonce": {
             "generation": "locally monotonic millisecond epoch, max(now_ms, previous + 1)",
+            "local_type": "integer",
+            "request_body": "JSON string matching ^[0-9]{1,19}$",
+            "response_posted_record": (
+                "JSON integer; bool, string, float, missing, or mismatch fail closed"
+            ),
             "acquired": False,
         },
         "transport": {
@@ -763,13 +777,7 @@ def send_post(
         raise SafetyError("Technocore did not return a posted record")
     posted = parsed["posted"]
     seq = posted.get("seq")
-    expected = (
-        posted.get("from") == expected_bench_did
-        and posted.get("text") == text
-        and str(posted.get("nonce")) == str(nonce)
-        and isinstance(seq, int)
-        and seq > 0
-    )
+    expected = posted_record_matches(posted, did=expected_bench_did, text=text, nonce=nonce)
     if not expected:
         update_post_audit(
             resolved_state,

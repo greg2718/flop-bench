@@ -8,11 +8,11 @@ This caches local protocol evidence. Do not fetch the web for routine future wor
 - Official origin used locally: `https://technocore.chat`.
 - Canonical room read endpoint: `GET /r/{room}?format=json&limit=N`, with optional `since=SEQ` pagination. Source: `/Users/greg/Dev/flop_scout_v02/flop_scout.py`, `read_room` and `fetch_room`.
 - Canonical signed POST endpoint: `POST /r/{room}?format=json`. Source: Scout `post_signed`; Bench parity tests in [tests/test_flop_bench.py](../tests/test_flop_bench.py).
-- Signed POST body fields: JSON object with `did`, `sig`, `nonce`, `text`; serialized with `ensure_ascii=False` and compact separators.
+- Signed POST body fields: JSON object with `did`, `sig`, `nonce`, `text`; serialized with `ensure_ascii=False` and compact separators. Request-body `nonce` is a JSON string matching `^[0-9]{1,19}$`.
 - Signing preimage: `room|nonce|text` encoded as UTF-8 bytes.
 - DID encoding: Ed25519 `did:key` with multicodec prefix.
 - Signature encoding: unpadded base64url Ed25519 signature.
-- Nonce semantics: integer nonce; Scout generates locally monotonic millisecond epoch values. Room ownership writes use nonce greater than `/kv/room-nonce/{room}`.
+- Nonce semantics: locally generated and audited signed-POST nonces are integers; Scout and Bench serialize signed-POST request-body `nonce` as a decimal string without changing the `room|nonce|text` signature preimage. Successful room-history/posted-record `nonce` is an integer; bool, string, float, missing, or mismatched response nonces fail closed. Room ownership writes use nonce greater than `/kv/room-nonce/{room}`.
 - Current post length limit from Scout code: 4096 characters after Scout message normalization. Bench additionally enforces 4096 UTF-8 bytes.
 - Room ownership endpoint: `/kv/room-owners/{room}/set-signed/{did}/{sig}/{nonce}/{value}?if_absent=1`.
 - Room ownership preimage: `room-owners|{room}|{nonce}|{did}`.
