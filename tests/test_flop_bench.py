@@ -58,7 +58,29 @@ from flop_bench.identity import (
     read_interactive_new_passphrase,
     verify_identity,
 )
+from flop_bench.identity_note import (
+    DID_NOTE_CONFIRMATION,
+    did_profile_path,
+    identity_note_status,
+    identity_note_value,
+    preview_identity_note,
+    publish_identity_note,
+    scout_compatible_mailbox_from_note,
+)
 from flop_bench.ledger import append_record, verify_ledger
+from flop_bench.mailbox import (
+    MAILBOX_REQUEST_SCHEMA_VERSION,
+    classify_authentication,
+    mailbox_inspect,
+    mailbox_messages,
+    mailbox_status,
+    parse_mailbox_envelope,
+    poll_mailbox,
+    request_approve,
+    request_queue,
+    request_reject,
+    request_show,
+)
 from flop_bench.posting import (
     MAX_POST_BYTES,
     POST_CONFIRMATION,
@@ -200,6 +222,7 @@ class FakeActivationTransport:
         self.room_history_statuses: list[int] = []
         self.requests: list[tuple[str, str]] = []
         self.post_bodies: list[dict[str, object]] = []
+        self.note_bodies: list[dict[str, object]] = []
         self.room_messages: dict[str, list[dict[str, object]]] = {}
         self.timeout_after_accept = False
         self.reject_without_accept = False
@@ -226,7 +249,8 @@ class FakeActivationTransport:
             return TransportResponse(200, b"x" * (MAX_RESPONSE_BYTES + 1), {}, final_url=url)
         parsed = urllib.parse.urlparse(url)
         parts = parsed.path.strip("/").split("/")
-        if method == "GET" and parts == ["r", "d-flop-bench"]:
+        if method == "GET" and len(parts) == 2 and parts[0] == "r":
+            room = urllib.parse.unquote(parts[1])
             if self.room_history_statuses:
                 return TransportResponse(
                     self.room_history_statuses.pop(0),
@@ -238,9 +262,7 @@ class FakeActivationTransport:
             limit = int(query.get("limit", ["200"])[0])
             since = int(query.get("since", ["0"])[0])
             messages = [
-                msg
-                for msg in self.room_messages.get("d-flop-bench", [])
-                if int(msg.get("seq", 0)) > since
+                msg for msg in self.room_messages.get(room, []) if int(msg.get("seq", 0)) > since
             ][:limit]
             response = {"messages": messages}
             return TransportResponse(
@@ -297,7 +319,7 @@ class FakeActivationTransport:
         if len(parts) >= 3 and parts[0] == "kv":
             namespace = urllib.parse.unquote(parts[1])
             key = urllib.parse.unquote(parts[2])
-            if len(parts) == 3:
+            if method == "GET" and len(parts) == 3:
                 status = self.note_statuses.get((namespace, key))
                 if status is not None:
                     return TransportResponse(
@@ -322,6 +344,24 @@ class FakeActivationTransport:
                 if value is None:
                     return TransportResponse(404, b"", {}, final_url=url)
                 return TransportResponse(200, value.encode(), {}, final_url=url)
+            if method == "POST" and len(parts) == 3:
+                payload = json.loads((body or b"{}").decode("utf-8"))
+                self.note_bodies.append(payload)
+                status = self.write_statuses.pop(0) if self.write_statuses else 200
+                if payload.get("if_absent") is True and (namespace, key) in self.notes:
+                    return TransportResponse(
+                        409,
+                        json.dumps(
+                            {"value": self.notes[(namespace, key)]},
+                            separators=(",", ":"),
+                        ).encode(),
+                        {},
+                        final_url=url,
+                    )
+                if status in {200, 201, 204}:
+                    self.notes[(namespace, key)] = str(payload.get("value", ""))
+                headers = {"Retry-After": "2"} if status == 429 else {}
+                return TransportResponse(status, b"ok token=abc123", headers, final_url=url)
             if len(parts) >= 8 and parts[3] == "set-signed":
                 status = self.write_statuses.pop(0) if self.write_statuses else 200
                 if status in {200, 201, 204}:
@@ -1500,7 +1540,7 @@ def test_mailbox_creation_fails_closed_before_transport_signing_or_state(tmp_pat
             expected_bench_did=public_did(Ed25519PrivateKey.generate()),
             sleep_on_429=False,
         )
-    assert "PROTOCOL_UNCONFIRMED" in str(exc.value)
+    assert "MAILBOX_CREATION_NOT_REQUIRED" in str(exc.value)
     assert not state.exists()
 
 
@@ -2679,12 +2719,15 @@ def test_status_and_dry_run_do_not_invoke_network(tmp_path: Path) -> None:
         action for action in parsed_plan["planned_actions"] if action["action"] == "create-mailbox"
     ][0]
     assert mailbox_action["will_execute"] is False
-    assert mailbox_action["protocol_status"] == "unconfirmed"
+    assert mailbox_action["creation_required"] is False
+    assert mailbox_action["protocol"] == "signed-write-only-room"
+    assert mailbox_action["advertised"] is False
     transport = FakeActivationTransport()
     status = technocore_status(state_dir=state, transport=transport)
     assert status["room"]["status"] == "unclaimed"
-    assert status["mailbox"]["status"] == "unknown"
-    assert status["mailbox"]["protocol_status"] == "unconfirmed"
+    assert status["mailbox"]["status"] == "signed-write-only-room"
+    assert status["mailbox"]["creation_required"] is False
+    assert status["mailbox"]["advertised"] is False
     assert all("mailbox-owners" not in url for _method, url in transport.requests)
 
 
@@ -2697,7 +2740,7 @@ def test_service_doctor_read_only_does_not_create_or_migrate_state(tmp_path: Pat
     assert report["database_exists"] is False
     assert report["permission_issues"] == []
     assert report["schema_migrations"] == []
-    assert report["pending_migrations"] == [1, 2, 3, 4]
+    assert report["pending_migrations"] == [1, 2, 3, 4, 5]
     assert not state.exists()
 
 
@@ -2706,8 +2749,8 @@ def test_service_doctor_reports_migrations_applied_and_plan_is_read_only(tmp_pat
     report = service_doctor(state_dir=state)
     assert report["read_only"] is False
     assert report["state_write"] is True
-    assert report["migrations_applied"] == [1, 2, 3, 4]
-    assert report["schema_migrations"] == [1, 2, 3, 4]
+    assert report["migrations_applied"] == [1, 2, 3, 4, 5]
+    assert report["schema_migrations"] == [1, 2, 3, 4, 5]
     status = migration_status(state)
     assert status["pending_migrations"] == []
     plan = plan_init(state_dir=state)
@@ -2724,13 +2767,13 @@ def test_service_doctor_read_only_reports_outdated_state_without_migrating(tmp_p
     read_only = service_doctor(state_dir=state, read_only=True)
     assert read_only["state_write"] is False
     assert read_only["schema_migrations"] == [1]
-    assert read_only["pending_migrations"] == [2, 3, 4]
+    assert read_only["pending_migrations"] == [2, 3, 4, 5]
     after_read_only = migration_status(state)
     assert after_read_only["schema_migrations"] == [1]
     normal = service_doctor(state_dir=state)
     assert normal["state_write"] is True
-    assert normal["migrations_applied"] == [2, 3, 4]
-    assert normal["schema_migrations"] == [1, 2, 3, 4]
+    assert normal["migrations_applied"] == [2, 3, 4, 5]
+    assert normal["schema_migrations"] == [1, 2, 3, 4, 5]
 
 
 def test_private_state_database_and_sidecar_permissions(tmp_path: Path) -> None:
@@ -3047,7 +3090,7 @@ def test_cli_smoke_tests_use_temp_state_only(tmp_path: Path) -> None:
         check=False,
     )
     assert mailbox_refusal.returncode == 4
-    assert "PROTOCOL_UNCONFIRMED" in mailbox_refusal.stderr
+    assert "MAILBOX_CREATION_NOT_REQUIRED" in mailbox_refusal.stderr
     assert not (tmp_path / "read-only-missing").exists()
     assert not (tmp_path / "preview-missing").exists()
     assert not (tmp_path / "post-history-missing").exists()
@@ -3064,3 +3107,452 @@ def test_local_command_spec_cannot_enable_permission(tmp_path: Path) -> None:
     spec_path = write_json(tmp_path / "spec.json", spec(tmp_path, [step], mode="approved-local"))
     with pytest.raises(ValidationError):
         verify_spec(spec_path, state_dir=tmp_path / "state", allow_local_exec=False)
+
+
+def mailbox_request_text(
+    *,
+    sender_did: str,
+    request_id: str = "mb-req-1",
+    target_did: str = BENCH_DID,
+    capability: str = "file-check",
+    created_at: str | None = None,
+    expires_at: str | None = None,
+    extra: dict[str, object] | None = None,
+) -> str:
+    now = datetime.now(UTC)
+    payload: dict[str, object] = {
+        "schema_version": MAILBOX_REQUEST_SCHEMA_VERSION,
+        "request_id": request_id,
+        "sender_did": sender_did,
+        "target_did": target_did,
+        "requested_capability": capability,
+        "hypothesis": "mailbox request stays inert",
+        "test_spec": spec(
+            Path("mailbox-fixture"),
+            [{"adapter": "file_exists", "path": "README.md"}],
+        ),
+        "created_at": created_at or now.isoformat(),
+        "expires_at": expires_at or (now + timedelta(minutes=10)).isoformat(),
+        "provenance": {"source": "pytest", "url": "https://example.test/inert"},
+    }
+    if extra:
+        payload.update(extra)
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def write_bench_identity_json(state: Path) -> None:
+    state.mkdir(parents=True, exist_ok=True)
+    write_json(
+        state / "identity.json",
+        {
+            "schema_version": "flop-bench.identity.v0.1",
+            "did": BENCH_DID,
+            "purpose": "flop-bench-production",
+            "canonical_room": "d-flop-bench",
+            "mailbox": "mb-flop-bench",
+        },
+    )
+
+
+def test_mailbox_status_and_local_poll_are_local_only(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    status = mailbox_status(state_dir=state)
+    poll = poll_mailbox(state_dir=state, network=False, transport=FakeActivationTransport())
+    assert status["protocol"] == "signed-write-only-room"
+    assert status["creation_required"] is False
+    assert status["advertised"] is False
+    assert status["network_action"] is False
+    assert poll["poll_status"] == "local_only"
+    assert poll["will_sign"] is False
+    assert poll["will_post"] is False
+    assert poll["will_acquire_nonce"] is False
+    assert not state.exists()
+
+
+def test_mailbox_unused_404_and_empty_mailbox_advance_safely(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    not_found = FakeActivationTransport()
+    not_found.room_history_statuses = [404]
+    missing = poll_mailbox(
+        state_dir=state,
+        network=True,
+        transport=not_found,
+        sleep_on_429=False,
+    )
+    assert missing["ok"] is True
+    assert missing["cursor_after"] == 0
+    assert missing["inserted"] == 0
+    empty = poll_mailbox(
+        state_dir=state,
+        network=True,
+        transport=FakeActivationTransport(),
+        sleep_on_429=False,
+    )
+    assert empty["history_scan_complete"] is True
+    assert empty["cursor_after"] == 0
+
+
+def test_mailbox_canonical_parsing_authentication_and_pending_review(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    sender = public_did(Ed25519PrivateKey.generate())
+    text = mailbox_request_text(sender_did=sender)
+    transport = FakeActivationTransport()
+    transport.room_messages["mb-flop-bench"] = [
+        {"seq": 1, "from": sender, "nonce": 123, "text": text, "ts": "2026-08-31T10:00:00Z"}
+    ]
+    assert classify_authentication(transport.room_messages["mb-flop-bench"][0])[0] == (
+        "server_verified_signed_lane"
+    )
+    parsed = parse_mailbox_envelope(text, remote_sender=sender)
+    assert parsed["request_id"] == "mb-req-1"
+    result = poll_mailbox(
+        state_dir=state,
+        network=True,
+        transport=transport,
+        sleep_on_429=False,
+    )
+    assert result["ok"] is True
+    assert result["cursor_after"] == 1
+    assert result["inserted"] == 1
+    queue = request_queue(state_dir=state)
+    assert queue["requests"][0]["review_status"] == "pending_human_review"
+    inspected = mailbox_inspect(state_dir=state, message_id="mb-flop-bench:1")
+    assert inspected["sender_did"] == sender
+    assert inspected["nonce"] == 123
+    assert inspected["remote_text_is_untrusted"] is True
+    assert inspected["urls_followed"] is False
+
+
+def test_mailbox_poll_pagination_duplicates_and_request_id_replay(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    sender = public_did(Ed25519PrivateKey.generate())
+    transport = FakeActivationTransport()
+    transport.room_messages["mb-flop-bench"] = [
+        {
+            "seq": 1,
+            "from": sender,
+            "nonce": 1,
+            "text": mailbox_request_text(sender_did=sender, request_id="req-a"),
+        },
+        {
+            "seq": 2,
+            "from": sender,
+            "nonce": 2,
+            "text": mailbox_request_text(sender_did=sender, request_id="req-b"),
+        },
+        {
+            "seq": 3,
+            "from": sender,
+            "nonce": 3,
+            "text": mailbox_request_text(sender_did=sender, request_id="req-b"),
+        },
+    ]
+    first = poll_mailbox(
+        state_dir=state,
+        network=True,
+        transport=transport,
+        page_limit=2,
+        sleep_on_429=False,
+    )
+    second = poll_mailbox(
+        state_dir=state,
+        network=True,
+        transport=transport,
+        page_limit=2,
+        sleep_on_429=False,
+    )
+    assert first["pages_scanned"] == 2
+    assert first["cursor_after"] == 3
+    assert first["inserted"] == 3
+    assert first["duplicate_request_ids"] == 1
+    assert second["inserted"] == 0
+    assert second["cursor_before"] == 3
+    messages = mailbox_messages(state_dir=state, limit=10)["messages"]
+    assert len(messages) == 3
+
+
+def test_mailbox_failures_preserve_cursor_and_do_not_store_partial(tmp_path: Path) -> None:
+    sender = public_did(Ed25519PrivateKey.generate())
+    for status in (429, 503):
+        state = tmp_path / f"state-{status}"
+        transport = FakeActivationTransport()
+        transport.room_history_statuses = [status, status]
+        result = poll_mailbox(
+            state_dir=state,
+            network=True,
+            transport=transport,
+            sleep_on_429=False,
+        )
+        assert result["ok"] is False
+        assert result["cursor_after"] == 0
+        assert mailbox_messages(state_dir=state, limit=10)["messages"] == []
+    malformed = FakeActivationTransport()
+    malformed.room_messages["mb-flop-bench"] = [{"seq": 1, "from": sender, "nonce": 1}]
+    bad = poll_mailbox(
+        state_dir=tmp_path / "malformed",
+        network=True,
+        transport=malformed,
+        sleep_on_429=False,
+    )
+    assert bad["ok"] is False
+    assert bad["cursor_after"] == 0
+    gap = FakeActivationTransport()
+    gap.room_messages["mb-flop-bench"] = [
+        {"seq": 2, "from": sender, "nonce": 2, "text": mailbox_request_text(sender_did=sender)}
+    ]
+    gap_result = poll_mailbox(
+        state_dir=tmp_path / "gap",
+        network=True,
+        transport=gap,
+        sleep_on_429=False,
+    )
+    assert gap_result["failure_classification"] == "sequence_gap"
+    assert gap_result["cursor_after"] == 0
+
+
+def test_mailbox_envelope_rejections_and_inert_urls_code(tmp_path: Path) -> None:
+    sender = public_did(Ed25519PrivateKey.generate())
+    now = datetime.now(UTC)
+    cases = [
+        mailbox_request_text(sender_did=sender, target_did=SCOUT_DID),
+        mailbox_request_text(sender_did=sender, capability="wallet-transfer"),
+        mailbox_request_text(
+            sender_did=sender,
+            created_at=(now + timedelta(minutes=6)).isoformat(),
+        ),
+        mailbox_request_text(
+            sender_did=sender,
+            expires_at=(now - timedelta(seconds=1)).isoformat(),
+        ),
+        mailbox_request_text(sender_did=sender, extra={"unexpected": True}),
+        "{not-json",
+        mailbox_request_text(sender_did=sender).replace(
+            sender,
+            public_did(Ed25519PrivateKey.generate()),
+        ),
+    ]
+    transport = FakeActivationTransport()
+    transport.room_messages["mb-flop-bench"] = [
+        {"seq": idx + 1, "from": sender, "nonce": idx + 1, "text": text}
+        for idx, text in enumerate(cases)
+    ]
+    result = poll_mailbox(
+        state_dir=tmp_path / "state",
+        network=True,
+        transport=transport,
+        sleep_on_429=False,
+    )
+    assert result["ok"] is True
+    stored = mailbox_messages(state_dir=tmp_path / "state", limit=20)["messages"]
+    assert all(item["review_status"] == "rejected" for item in stored)
+    assert all(item["classification"] != "valid_request" for item in stored)
+    visible = json.dumps(stored, sort_keys=True)
+    assert "https://example.test/inert" not in visible
+
+
+def test_mailbox_unverified_from_is_not_treated_as_signed_lane(tmp_path: Path) -> None:
+    transport = FakeActivationTransport()
+    transport.room_messages["mb-flop-bench"] = [
+        {"seq": 1, "from": "nickname", "nonce": 1, "text": "{}"},
+        {"seq": 2, "did": BENCH_DID, "nonce": 2, "text": "{}"},
+    ]
+    result = poll_mailbox(
+        state_dir=tmp_path / "state",
+        network=True,
+        transport=transport,
+        sleep_on_429=False,
+    )
+    assert result["ok"] is True
+    messages = mailbox_messages(state_dir=tmp_path / "state", limit=10)["messages"]
+    assert {item["authentication_level"] for item in messages} == {"malformed_or_unverifiable"}
+
+
+def test_request_approval_and_rejection_are_local_status_only(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    sender = public_did(Ed25519PrivateKey.generate())
+    transport = FakeActivationTransport()
+    transport.room_messages["mb-flop-bench"] = [
+        {
+            "seq": 1,
+            "from": sender,
+            "nonce": 1,
+            "text": mailbox_request_text(sender_did=sender, request_id="approve-me"),
+        },
+        {
+            "seq": 2,
+            "from": sender,
+            "nonce": 2,
+            "text": mailbox_request_text(sender_did=sender, request_id="reject-me"),
+        },
+    ]
+    poll_mailbox(state_dir=state, network=True, transport=transport, sleep_on_429=False)
+    shown = request_show(state_dir=state, request_id="approve-me")
+    approved = request_approve(
+        state_dir=state,
+        request_id="approve-me",
+        confirm="APPROVE-BENCH-REQUEST",
+    )
+    rejected = request_reject(state_dir=state, request_id="reject-me", reason="not needed")
+    assert shown["will_execute"] is False
+    assert approved["review_status"] == "approved_for_manual_execution"
+    assert approved["will_execute"] is False
+    assert approved["will_post"] is False
+    assert approved["will_update_router"] is False
+    assert rejected["review_status"] == "rejected"
+
+
+def test_identity_note_preview_status_publish_and_conflict_safety(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "state"
+    write_bench_identity_json(state)
+    preview = preview_identity_note(state_dir=state)
+    namespace, key, fingerprint = did_profile_path(BENCH_DID)
+    assert preview["namespace"] == namespace
+    assert preview["key"] == key
+    assert preview["fingerprint"] == fingerprint
+    assert preview["value"] == identity_note_value(BENCH_DID)
+    assert preview["value"] == (
+        "did:key:z6MkqqqEMxujBTEAvoanSx6pVBMMZzLP7gMUcmNVdYHS3BVk "
+        "mailbox: mb-flop-bench service-room: d-flop-bench role: verification "
+        "operator-group: local-flop-agent-family related-agent-evidence-independent: false"
+    )
+    assert scout_compatible_mailbox_from_note(str(preview["value"])) == "mb-flop-bench"
+    assert len(str(preview["value"]).splitlines()) == 1
+    assert len(str(preview["value"]).encode("utf-8")) < 4096
+    assert preview["network_action"] is False
+    assert preview["will_load_private_key"] is False
+    assert "unsigned DID note is conventional metadata" in preview["proof_warning"]
+    transport = FakeActivationTransport()
+    status = identity_note_status(state_dir=state, transport=transport)
+    assert status["status"] == "absent"
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    published = publish_identity_note(
+        state_dir=state,
+        live=True,
+        confirm=DID_NOTE_CONFIRMATION,
+        transport=transport,
+        expected_state_dir=state,
+    )
+    assert published["status"] == "published"
+    assert published["cas"] == "if_absent"
+    assert transport.notes[(namespace, key)] == preview["value"]
+    post_urls = [url for method, url in transport.requests if method == "POST"]
+    assert post_urls == [f"{TECHNOCORE_ORIGIN}/kv/did-76/0e4e861a71aa43"]
+    assert transport.note_bodies == [{"value": preview["value"], "if_absent": True}]
+    conflict = FakeActivationTransport()
+    conflict.notes[(namespace, key)] = "unexpected existing value"
+    with pytest.raises(SafetyError):
+        publish_identity_note(
+            state_dir=state,
+            live=True,
+            confirm=DID_NOTE_CONFIRMATION,
+            transport=conflict,
+            expected_state_dir=state,
+        )
+    matching = FakeActivationTransport()
+    matching.notes[(namespace, key)] = str(preview["value"])
+    already = publish_identity_note(
+        state_dir=state,
+        live=True,
+        confirm=DID_NOTE_CONFIRMATION,
+        transport=matching,
+        expected_state_dir=state,
+    )
+    assert already["status"] == "already-matching"
+    assert all(method != "POST" for method, _url in matching.requests)
+    cas_match = FakeActivationTransport()
+    cas_match.notes[(namespace, key)] = str(preview["value"])
+    del cas_match.notes[(namespace, key)]
+    original_request = cas_match.request
+
+    def cas_409_match(*args: object, **kwargs: object) -> TransportResponse:
+        if args[0] == "POST":
+            return TransportResponse(
+                409,
+                json.dumps({"value": preview["value"]}, separators=(",", ":")).encode(),
+                {},
+                final_url=str(args[1]),
+            )
+        return original_request(*args, **kwargs)
+
+    cas_match.request = cas_409_match  # type: ignore[method-assign]
+    cas_matched = publish_identity_note(
+        state_dir=state,
+        live=True,
+        confirm=DID_NOTE_CONFIRMATION,
+        transport=cas_match,
+        expected_state_dir=state,
+    )
+    assert cas_matched["status"] == "already-matching"
+    assert cas_matched["cas"] == "if_absent_conflict_existing_match"
+    cas_different = FakeActivationTransport()
+    original_different_request = cas_different.request
+
+    def cas_409_different(*args: object, **kwargs: object) -> TransportResponse:
+        if args[0] == "POST":
+            return TransportResponse(409, b"unexpected existing value", {}, final_url=str(args[1]))
+        return original_different_request(*args, **kwargs)
+
+    cas_different.request = cas_409_different  # type: ignore[method-assign]
+    cas_conflict = publish_identity_note(
+        state_dir=state,
+        live=True,
+        confirm=DID_NOTE_CONFIRMATION,
+        transport=cas_different,
+        expected_state_dir=state,
+    )
+    assert cas_conflict["status"] == "conflict"
+    assert cas_conflict["ok"] is False
+    assert all("set-signed" not in url for _method, url in transport.requests)
+
+
+def test_cli_phase_d_local_commands_smoke(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    write_bench_identity_json(state)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(REPO / "src")
+    commands = [
+        [sys.executable, "-m", "flop_bench.cli", "mailbox", "status", "--state-dir", str(state)],
+        [sys.executable, "-m", "flop_bench.cli", "mailbox", "poll", "--state-dir", str(state)],
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "mailbox",
+            "messages",
+            "--state-dir",
+            str(state),
+            "--limit",
+            "5",
+        ],
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "request",
+            "queue",
+            "--state-dir",
+            str(state),
+        ],
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "identity-note",
+            "preview",
+            "--state-dir",
+            str(state),
+        ],
+    ]
+    for command in commands:
+        completed = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
+            command,
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr

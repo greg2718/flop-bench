@@ -829,7 +829,10 @@ def create_mailbox(
     sleep_on_429: bool = True,
 ) -> dict[str, Any]:
     del live, confirm, state_dir, transport, expected_state_dir, expected_bench_did, sleep_on_429
-    raise SafetyError("PROTOCOL_UNCONFIRMED: live mailbox creation protocol has not been verified")
+    raise SafetyError(
+        "MAILBOX_CREATION_NOT_REQUIRED: mb-flop-bench is a signed-write-only "
+        "Technocore append room with no ownership or creation operation"
+    )
 
 
 def technocore_status(
@@ -851,8 +854,9 @@ def technocore_status(
         "mailbox": {
             "name": MAILBOX,
             "owner": None,
-            "status": "unknown",
-            "protocol_status": "unconfirmed",
+            "status": "signed-write-only-room",
+            "creation_required": False,
+            "advertised": False,
             "response_status": None,
         },
     }

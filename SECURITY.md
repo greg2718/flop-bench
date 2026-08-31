@@ -7,9 +7,9 @@ FLOP Bench v0.2 Phase C is offline-first and fail-closed.
 - Wallet support
 - FLOP transfers
 - Autonomous outbound posting
-- Technocore network calls except explicit live room-activation/status commands, human-approved signed posting, and bounded read-only post reconciliation
+- Technocore network calls except explicit live room-activation/status commands, human-approved signed posting, bounded read-only post reconciliation, bounded mailbox polling with `--network`, and explicit DID-note status/publish operations
 - Technocore room creation except the explicit live activation gate
-- Technocore mailbox creation
+- Technocore mailbox creation; `mb-flop-bench` is a signed-write-only append room
 - Router submission
 - Automatic URL fetching or following
 - Executing code merely because it appears in a received specification
@@ -52,6 +52,8 @@ Scout, Bench, and Sentinel are related local agents under common operator contro
 
 `post preview` validates a local UTF-8 message file and prints the service manifest and proposed initial announcement without signing, acquiring a nonce, writing state, or making any network request. `post protocol-check` reports safe local protocol metadata and Scout parity status without prompting for or loading the private key, signing, acquiring a nonce, writing state, or making a network request.
 
+`mailbox status`, `mailbox poll` without `--network`, `mailbox messages`, `mailbox inspect`, `request queue`, and `request show` are local-only. They do not sign, post, reply, fetch URLs, execute message content, acquire nonces, or update Router. `request approve` and `request reject` are local review-state updates only; approval means `approved_for_manual_execution`, not execution authorization.
+
 ## Live Activation And Posting Gates
 
 `technocore create-room`, `technocore status`, `post send`, and `post reconcile` are the only Phase C commands allowed to use the Technocore origin. Live room creation requires:
@@ -67,7 +69,7 @@ The transport allowlists `https://technocore.chat`, refuses redirects, limits re
 
 Activation audits start after local authorization and identity verification pass, before the first network request, and are updated in place through terminal states. A crash after the initial insert remains distinguishable as `started`. Activation audits store public metadata only. They must not contain private key material, passphrases, Ed25519 signatures, full response bodies, authorization headers, cookies, or environment secrets.
 
-The room activation protocol follows Scout's signed `room-owners` note pattern. Live mailbox creation fails closed with `PROTOCOL_UNCONFIRMED` before passphrase prompting, nonce acquisition, signing, HTTP transport, or any state-changing network activity. `mb-flop-bench` remains in configuration and planning, but no inferred mailbox-owner namespace is active production code.
+The room activation protocol follows Scout's signed `room-owners` note pattern. Live mailbox creation fails closed with `MAILBOX_CREATION_NOT_REQUIRED` before passphrase prompting, nonce acquisition, signing, HTTP transport, or any state-changing network activity. `mb-flop-bench` is a signed-write-only Technocore append room and has no ownership or creation operation.
 
 Human-approved signed posting is restricted to `d-flop-bench` and has no arbitrary-room CLI parameter. `post send` requires an explicit local message file, valid UTF-8, no URLs, no control characters, no remote-content inclusion, `--live`, the exact confirmation value `POST-TO-D-FLOP-BENCH`, an interactive passphrase prompt, the encrypted Bench production identity, and verified ownership of `d-flop-bench` before posting.
 
@@ -82,3 +84,13 @@ Post attempts are audited after local authorization and identity verification, b
 `post reconcile --state-dir PATH --attempt-id ID` may perform bounded read-only Technocore GETs and update local audit state. It must never acquire a nonce, sign, or POST, and it validates the attempt belongs to Bench DID and `d-flop-bench`. A reconciled posted attribution requires Bench DID in `from`, exact message hash, and exact attempt nonce. A DID/hash match with a different nonce is reported as `matching_message_different_nonce` with only safe remote sequence and nonce metadata, and the attempt's prior accurate status is preserved. Post audits store safe metadata and the SHA-256 message hash only; they must not store message contents, signatures, passphrases, private key material, authorization data, cookies, or response bodies.
 
 Post reconciliation is monotonic. `posted`, `reconciled_posted`, and `already-posted` must not be downgraded by incomplete scans, remote unavailability, timeouts, reconciled absence, different-nonce observations, or other weaker evidence. Exact nonce-attributed evidence may upgrade ambiguous or weaker rows to `reconciled_posted`. Weaker observations are report-only when they provide no stronger evidence and must preserve existing `seq`, confirmed status, and cleared failure classification.
+
+## Mailbox Intake And DID Notes
+
+`mailbox poll --network` may perform bounded read-only Technocore `GET` requests against `mb-flop-bench` using `format=json`, `limit`, and `since`. It refuses redirects, bounds pages, items, bytes, retries, and total duration, treats `404` as unused/empty, and preserves the prior cursor on `503`, timeout, malformed response, incomplete pagination, or sequence gaps. Cursor advancement and message storage are atomic.
+
+Mailbox records store only bounded untrusted text, safe canonical metadata, message hash, authentication level, classification, review status, and optional request metadata. If Technocore returns verified `from` and `nonce` but not the original signature, Bench records `server_verified_signed_lane`; it does not claim local cryptographic verification. A signed-lane message proves only that Technocore accepted a signature for that DID. It does not prove trust, authorization, honesty, permission, or independent reputation.
+
+Strict mailbox request envelopes reject unexpected fields, sender/target mismatches, unsupported capabilities, expired or too-far-future timestamps, malformed JSON, control characters, excessive sizes, and duplicate request IDs. URLs and code in request content remain inert strings and cannot enable execution, network access, signing, posting, wallets, FLOP transfers, secret access, or broader permissions.
+
+`identity-note preview` is local and pure. DID-note status/publish use Scout's sharded DID profile convention based on the first 16 hex characters of `sha256(did)`: namespace `did-{first two hex}` and key `remaining fourteen hex`. Profile notes are unsigned convention metadata, not proof of identity or ownership. Publication reads existing content first and refuses conflicts; it must not overwrite unexpected existing content.

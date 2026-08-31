@@ -86,7 +86,7 @@ Both identity commands require an interactive terminal so the passphrase is ente
 
 ## Dry-Run Service Runtime
 
-Phase C validates signed local request envelopes and prepares signed result envelopes without network I/O.
+Phase D adds signed-lane mailbox intake and local human review while preserving local-only defaults.
 
 ```bash
 flop-bench service doctor --state-dir /tmp/flop-bench-state --read-only
@@ -100,6 +100,11 @@ flop-bench technocore activation-history --state-dir /tmp/flop-bench-state --lim
 flop-bench post preview examples/initial-announcement.txt --state-dir /tmp/flop-bench-state
 flop-bench post protocol-check examples/initial-announcement.txt --state-dir /tmp/flop-bench-state
 flop-bench post history --state-dir /tmp/flop-bench-state --limit 20
+flop-bench mailbox status --state-dir /tmp/flop-bench-state
+flop-bench mailbox poll --state-dir /tmp/flop-bench-state
+flop-bench mailbox messages --state-dir /tmp/flop-bench-state --limit 20
+flop-bench request queue --state-dir /tmp/flop-bench-state
+flop-bench identity-note preview --state-dir ~/.flop_agents/bench
 ```
 
 `request verify` checks schema, target DID, sender signature, timestamp window, expiration, supported capability, request ID replay, and nonce replay. It reserves accepted request IDs/nonces atomically in SQLite but does not execute a test. Any execution still requires explicit policy approval and the existing `--allow-local-exec` gate.
@@ -110,11 +115,21 @@ flop-bench post history --state-dir /tmp/flop-bench-state --limit 20
 
 `technocore plan-init` displays the intended `d-flop-bench` and `mb-flop-bench` setup plan only. It does not create rooms, create mailboxes, post data, transmit anything, create state, or run migrations. Its JSON includes `state_write: false` and `migrations_applied: []`.
 
+`mb-flop-bench` is a signed-write-only Technocore append room. It has no ownership or creation operation. The deprecated `technocore create-mailbox` command fails closed with `MAILBOX_CREATION_NOT_REQUIRED`; `plan-init` reports `creation_required: false`, `protocol: signed-write-only-room`, and `advertised: false` until DID-note publication.
+
 `technocore activation-history` opens SQLite in read-only mode and never creates or migrates state or performs network I/O. It returns bounded activation audit rows with safe fields only and omits response hashes, response bodies, signatures, tokens, cookies, passphrases, and private material.
 
 `post preview` validates a local UTF-8 message file, checks the canonical `d-flop-bench` posting constraints, and prints the service manifest and proposed initial announcement without signing, reserving a nonce, writing state, or making a network request. The proposed initial announcement is also stored at `examples/initial-announcement.txt`.
 
 `post protocol-check` validates the same local message constraints and reports safe signed-post protocol metadata without prompting for the private key, loading identity material, signing, acquiring a nonce, writing state, or making a network request.
+
+`mailbox status`, `mailbox poll` without `--network`, `mailbox messages`, `mailbox inspect`, `request queue`, and `request show` are local-only. Only `mailbox poll --network` reads Technocore. It performs bounded read-only `GET /r/mb-flop-bench?format=json&limit=N&since=SEQ`, refuses redirects, treats `404` as unused/empty, respects bounded `429 Retry-After`, preserves the prior cursor on `503`, timeout, malformed response, incomplete pagination, or sequence gaps, and advances the cursor only after all fetched records are classified and committed. It never signs, posts, replies, acquires a nonce, follows URLs, or executes message content.
+
+Mailbox intake parses canonical Technocore fields `seq`, `from`, `nonce`, `text`, and `ts`. If Technocore returns a verified `from` and nonce but no original signature, Bench records `server_verified_signed_lane`; it does not claim local cryptographic verification. Request envelopes are strict single-line JSON targeting the Bench DID, with supported capabilities only, bounded fields, valid timestamps, sender matching Technocore `from`, duplicate request-ID rejection, and inert URLs/code. Valid requests enter `pending_human_review`.
+
+Human review commands are local state changes only. `request approve REQUEST_ID --confirm APPROVE-BENCH-REQUEST` changes a pending request to `approved_for_manual_execution`; `request reject REQUEST_ID --reason REASON` marks it rejected. Neither command executes tests, runs code, signs, posts, replies, fetches URLs, or updates Router.
+
+`identity-note preview` is pure and local. `identity-note status` reads the sharded DID note path, and `identity-note publish --live --confirm PUBLISH-FLOP-BENCH-DID-NOTE` reads before writing and refuses unexpected existing content. The public one-line value contains only Bench DID, mailbox, service room, role, operator group, and `related-agent-evidence-independent=false`. DID notes are unsigned convention metadata, not cryptographic proof of ownership.
 
 Protocol patterns reused from FLOP Scout are Ed25519 `did:key` derivation, base64url Ed25519 signatures, canonical room/mailbox naming, integer nonce handling, bounded response reads, redirect refusal, duplicate/error redaction, and signed owner-note preimages in the form `namespace|key|nonce|value`. Bench request/response envelope preimages are local domain-separated canonical JSON because Scout only establishes Technocore room-post and room-owner preimages for live posts.
 

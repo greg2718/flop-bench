@@ -24,7 +24,23 @@ from .identity import (
     read_interactive_new_passphrase,
     verify_identity,
 )
+from .identity_note import (
+    DID_NOTE_CONFIRMATION,
+    identity_note_status,
+    preview_identity_note,
+    publish_identity_note,
+)
 from .ledger import verify_ledger
+from .mailbox import (
+    mailbox_inspect,
+    mailbox_messages,
+    mailbox_status,
+    poll_mailbox,
+    request_approve,
+    request_queue,
+    request_reject,
+    request_show,
+)
 from .posting import POST_CONFIRMATION, preview_post, protocol_check_post, reconcile_post, send_post
 from .posting import history as post_history
 from .schemas import validate_test_spec
@@ -90,6 +106,19 @@ def build_parser() -> argparse.ArgumentParser:
     request_inspect = request_sub.add_parser("inspect")
     request_inspect.add_argument("request", type=Path)
     request_inspect.add_argument("--state-dir", required=True, type=Path)
+    request_queue_cmd = request_sub.add_parser("queue")
+    request_queue_cmd.add_argument("--state-dir", required=True, type=Path)
+    request_show_cmd = request_sub.add_parser("show")
+    request_show_cmd.add_argument("request_id")
+    request_show_cmd.add_argument("--state-dir", required=True, type=Path)
+    request_approve_cmd = request_sub.add_parser("approve")
+    request_approve_cmd.add_argument("request_id")
+    request_approve_cmd.add_argument("--state-dir", required=True, type=Path)
+    request_approve_cmd.add_argument("--confirm", required=True)
+    request_reject_cmd = request_sub.add_parser("reject")
+    request_reject_cmd.add_argument("request_id")
+    request_reject_cmd.add_argument("--state-dir", required=True, type=Path)
+    request_reject_cmd.add_argument("--reason", required=True)
     response = sub.add_parser("response")
     response_sub = response.add_subparsers(dest="response_cmd", required=True)
     response_prepare = response_sub.add_parser("prepare")
@@ -149,6 +178,29 @@ def build_parser() -> argparse.ArgumentParser:
     post_reconcile = post_sub.add_parser("reconcile")
     post_reconcile.add_argument("--state-dir", required=True, type=Path)
     post_reconcile.add_argument("--attempt-id", required=True, type=int)
+    mailbox = sub.add_parser("mailbox")
+    mailbox_sub = mailbox.add_subparsers(dest="mailbox_cmd", required=True)
+    mailbox_status_cmd = mailbox_sub.add_parser("status")
+    mailbox_status_cmd.add_argument("--state-dir", required=True, type=Path)
+    mailbox_poll_cmd = mailbox_sub.add_parser("poll")
+    mailbox_poll_cmd.add_argument("--state-dir", required=True, type=Path)
+    mailbox_poll_cmd.add_argument("--network", action="store_true")
+    mailbox_messages_cmd = mailbox_sub.add_parser("messages")
+    mailbox_messages_cmd.add_argument("--state-dir", required=True, type=Path)
+    mailbox_messages_cmd.add_argument("--limit", required=True, type=int)
+    mailbox_inspect_cmd = mailbox_sub.add_parser("inspect")
+    mailbox_inspect_cmd.add_argument("--state-dir", required=True, type=Path)
+    mailbox_inspect_cmd.add_argument("--message-id", required=True)
+    identity_note = sub.add_parser("identity-note")
+    identity_note_sub = identity_note.add_subparsers(dest="identity_note_cmd", required=True)
+    identity_note_preview = identity_note_sub.add_parser("preview")
+    identity_note_preview.add_argument("--state-dir", required=True, type=Path)
+    identity_note_status_cmd = identity_note_sub.add_parser("status")
+    identity_note_status_cmd.add_argument("--state-dir", required=True, type=Path)
+    identity_note_publish = identity_note_sub.add_parser("publish")
+    identity_note_publish.add_argument("--state-dir", required=True, type=Path)
+    identity_note_publish.add_argument("--live", action="store_true")
+    identity_note_publish.add_argument("--confirm", required=True, choices=[DID_NOTE_CONFIRMATION])
     return parser
 
 
@@ -181,6 +233,26 @@ def run(argv: list[str] | None = None) -> int:
             _print_json(verify_request(args.request, state_dir=args.state_dir))
         elif args.cmd == "request" and args.request_cmd == "inspect":
             _print_json(inspect_request(args.request, state_dir=args.state_dir))
+        elif args.cmd == "request" and args.request_cmd == "queue":
+            _print_json(request_queue(state_dir=args.state_dir))
+        elif args.cmd == "request" and args.request_cmd == "show":
+            _print_json(request_show(state_dir=args.state_dir, request_id=args.request_id))
+        elif args.cmd == "request" and args.request_cmd == "approve":
+            _print_json(
+                request_approve(
+                    state_dir=args.state_dir,
+                    request_id=args.request_id,
+                    confirm=args.confirm,
+                )
+            )
+        elif args.cmd == "request" and args.request_cmd == "reject":
+            _print_json(
+                request_reject(
+                    state_dir=args.state_dir,
+                    request_id=args.request_id,
+                    reason=args.reason,
+                )
+            )
         elif args.cmd == "response" and args.response_cmd == "prepare":
             passphrase = read_interactive_existing_passphrase()
             _print_json(
@@ -270,6 +342,38 @@ def run(argv: list[str] | None = None) -> int:
                 reconcile_post(
                     state_dir=args.state_dir,
                     attempt_id=args.attempt_id,
+                    transport=UrlLibActivationTransport(),
+                )
+            )
+        elif args.cmd == "mailbox" and args.mailbox_cmd == "status":
+            _print_json(mailbox_status(state_dir=args.state_dir))
+        elif args.cmd == "mailbox" and args.mailbox_cmd == "poll":
+            _print_json(
+                poll_mailbox(
+                    state_dir=args.state_dir,
+                    network=args.network,
+                    transport=UrlLibActivationTransport(),
+                )
+            )
+        elif args.cmd == "mailbox" and args.mailbox_cmd == "messages":
+            _print_json(mailbox_messages(state_dir=args.state_dir, limit=args.limit))
+        elif args.cmd == "mailbox" and args.mailbox_cmd == "inspect":
+            _print_json(mailbox_inspect(state_dir=args.state_dir, message_id=args.message_id))
+        elif args.cmd == "identity-note" and args.identity_note_cmd == "preview":
+            _print_json(preview_identity_note(state_dir=args.state_dir))
+        elif args.cmd == "identity-note" and args.identity_note_cmd == "status":
+            _print_json(
+                identity_note_status(
+                    state_dir=args.state_dir,
+                    transport=UrlLibActivationTransport(),
+                )
+            )
+        elif args.cmd == "identity-note" and args.identity_note_cmd == "publish":
+            _print_json(
+                publish_identity_note(
+                    state_dir=args.state_dir,
+                    live=args.live,
+                    confirm=args.confirm,
                     transport=UrlLibActivationTransport(),
                 )
             )
