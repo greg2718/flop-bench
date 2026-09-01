@@ -51,6 +51,13 @@ from flop_bench.config import (
 )
 from flop_bench.engine import router_export, verify_spec
 from flop_bench.exceptions import IsolationError, LedgerError, SafetyError, ValidationError
+from flop_bench.execution import (
+    EXECUTE_PASSIVE_CONFIRMATION,
+    execute_passive,
+    execution_history,
+    execution_preview,
+    result_preview,
+)
 from flop_bench.identity import (
     IDENTITY_CONFIRMATION,
     b64u,
@@ -135,6 +142,7 @@ from flop_bench.provenance import (
 from flop_bench.schemas import (
     EVIDENCE_BUNDLE_SCHEMA,
     MAILBOX_REQUEST_SCHEMA,
+    MAILBOX_RESULT_SCHEMA,
     ROUTER_EXPORT_SCHEMA,
     TEST_SPEC_SCHEMA,
     validate_test_spec,
@@ -533,6 +541,7 @@ def test_external_schema_files_match_python_schema_constants() -> None:
         "schemas/test-spec-v0.1.json": TEST_SPEC_SCHEMA,
         "schemas/evidence-bundle-v0.1.json": EVIDENCE_BUNDLE_SCHEMA,
         "schemas/router-validation-export-v0.1.json": ROUTER_EXPORT_SCHEMA,
+        "schemas/mailbox-result-v0.1.json": MAILBOX_RESULT_SCHEMA,
     }
     for relative_path, schema in expected.items():
         assert json.loads((REPO / relative_path).read_text(encoding="utf-8")) == schema
@@ -2920,7 +2929,7 @@ def test_service_doctor_read_only_does_not_create_or_migrate_state(tmp_path: Pat
     assert report["database_exists"] is False
     assert report["permission_issues"] == []
     assert report["schema_migrations"] == []
-    assert report["pending_migrations"] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert report["pending_migrations"] == list(range(1, SCHEMA_VERSION + 1))
     assert not state.exists()
 
 
@@ -2929,8 +2938,8 @@ def test_service_doctor_reports_migrations_applied_and_plan_is_read_only(tmp_pat
     report = service_doctor(state_dir=state)
     assert report["read_only"] is False
     assert report["state_write"] is True
-    assert report["migrations_applied"] == [1, 2, 3, 4, 5, 6, 7, 8]
-    assert report["schema_migrations"] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert report["migrations_applied"] == list(range(1, SCHEMA_VERSION + 1))
+    assert report["schema_migrations"] == list(range(1, SCHEMA_VERSION + 1))
     status = migration_status(state)
     assert status["pending_migrations"] == []
     plan = plan_init(state_dir=state)
@@ -2947,13 +2956,13 @@ def test_service_doctor_read_only_reports_outdated_state_without_migrating(tmp_p
     read_only = service_doctor(state_dir=state, read_only=True)
     assert read_only["state_write"] is False
     assert read_only["schema_migrations"] == [1]
-    assert read_only["pending_migrations"] == [2, 3, 4, 5, 6, 7, 8]
+    assert read_only["pending_migrations"] == list(range(2, SCHEMA_VERSION + 1))
     after_read_only = migration_status(state)
     assert after_read_only["schema_migrations"] == [1]
     normal = service_doctor(state_dir=state)
     assert normal["state_write"] is True
-    assert normal["migrations_applied"] == [2, 3, 4, 5, 6, 7, 8]
-    assert normal["schema_migrations"] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert normal["migrations_applied"] == list(range(2, SCHEMA_VERSION + 1))
+    assert normal["schema_migrations"] == list(range(1, SCHEMA_VERSION + 1))
 
 
 def test_private_state_database_and_sidecar_permissions(tmp_path: Path) -> None:
@@ -3320,6 +3329,56 @@ def mailbox_request_text(
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
+def literal_equality_spec(actual: object, expected: object) -> dict[str, object]:
+    return {"type": "literal_equality", "actual": actual, "expected": expected}
+
+
+def approved_literal_request(
+    tmp_path: Path,
+    *,
+    request_id: str = "literal-pass",
+    actual: object = "ok",
+    expected: object = "ok",
+    sender: str | None = None,
+    expires_at: str | None = None,
+    extra: dict[str, object] | None = None,
+) -> tuple[Path, str]:
+    state = tmp_path / request_id
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
+    sender_did = sender or public_did(Ed25519PrivateKey.generate())
+    payload_extra: dict[str, object] = {
+        "test_spec": literal_equality_spec(actual, expected),
+        "provenance": {"source": "pytest-e1"},
+    }
+    if extra:
+        payload_extra.update(extra)
+    transport = FakeActivationTransport()
+    transport.room_messages["mb-flop-bench"] = [
+        {
+            "seq": 1,
+            "from": sender_did,
+            "nonce": 1,
+            "text": mailbox_request_text(
+                sender_did=sender_did,
+                request_id=request_id,
+                expires_at=expires_at,
+                extra=payload_extra,
+            ),
+            "ts": "2026-08-31T10:00:00Z",
+        }
+    ]
+    poll_mailbox(state_dir=state, network=True, transport=transport, sleep_on_429=False)
+    request_approve(
+        state_dir=state,
+        request_id=request_id,
+        confirm="APPROVE-BENCH-REQUEST",
+    )
+    return state, sender_did
+
+
 def write_bench_identity_json(state: Path) -> None:
     state.mkdir(parents=True, exist_ok=True)
     write_json(
@@ -3416,7 +3475,7 @@ def test_mailbox_activation_preview_pending_activation_migration(tmp_path: Path)
     db_path = state / STATE_DB
     with sqlite3.connect(db_path) as conn:
         conn.execute("DROP TABLE mailbox_intake_activation")
-        conn.execute("DELETE FROM schema_migrations WHERE version = 8")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 8")
         conn.commit()
     before = db_path.read_bytes()
     before_mtime = db_path.stat().st_mtime_ns
@@ -3424,7 +3483,7 @@ def test_mailbox_activation_preview_pending_activation_migration(tmp_path: Path)
     assert preview["can_activate"] is False
     assert preview["database_exists"] is True
     assert preview["schema_migrations"] == list(range(1, 8))
-    assert preview["pending_migrations"] == [8]
+    assert preview["pending_migrations"] == [8, 9]
     assert preview["migration_required"] is True
     assert preview["activation_blockers"] == ["state_schema_migration_required"]
     assert preview["advertised"] is True
@@ -4273,6 +4332,419 @@ def test_request_approval_and_rejection_are_local_status_only(tmp_path: Path) ->
     assert approved["will_post"] is False
     assert approved["will_update_router"] is False
     assert rejected["review_status"] == "rejected"
+
+
+def test_execution_preview_is_pure_and_reports_missing_state(tmp_path: Path) -> None:
+    state = tmp_path / "missing-state"
+    preview = execution_preview(state_dir=state, request_id="missing")
+    assert preview["eligible"] is False
+    assert preview["blockers"] == ["state_database_missing"]
+    assert preview["state_write"] is False
+    assert preview["network_action"] is False
+    assert preview["will_load_private_key"] is False
+    assert preview["will_sign"] is False
+    assert preview["will_post"] is False
+    assert not state.exists()
+
+
+def test_execution_preview_reports_metadata_without_raw_serialized_payloads(
+    tmp_path: Path,
+) -> None:
+    state, _sender = approved_literal_request(tmp_path, request_id="preview-metadata-e1")
+    preview = execution_preview(state_dir=state, request_id="preview-metadata-e1")
+    assert preview["eligible"] is True
+    assert "request" not in preview
+    assert "request_envelope" not in preview
+    metadata = preview["request_metadata"]
+    assert metadata["request_id"] == "preview-metadata-e1"
+    assert metadata["requested_capability"] == "software.testing"
+    assert metadata["has_canonical_request_payload"] is True
+    assert metadata["has_provenance"] is True
+    assert "request_json" not in metadata
+    assert "provenance_json" not in metadata
+    assert metadata["canonical_request"]["request_id"] == "preview-metadata-e1"
+    assert metadata["canonical_request"]["test_spec_sha256"] == message_hash(
+        json.dumps(literal_equality_spec("ok", "ok"), separators=(",", ":"), sort_keys=True)
+    )
+    assert preview["state_write"] is False
+    assert preview["network_action"] is False
+
+
+def test_execution_preview_reports_pending_migration_expiration_and_legacy_payload(
+    tmp_path: Path,
+) -> None:
+    expires_at = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    state, _sender = approved_literal_request(tmp_path, request_id="legacy-expired-e1")
+    db_path = state / STATE_DB
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE mailbox_messages SET expires_at = ?, request_json = NULL WHERE request_id = ?",
+            (expires_at, "legacy-expired-e1"),
+        )
+        conn.execute("DELETE FROM schema_migrations WHERE version = 9")
+        conn.commit()
+    before = db_path.read_bytes()
+    before_mtime = db_path.stat().st_mtime_ns
+
+    preview = execution_preview(state_dir=state, request_id="legacy-expired-e1")
+
+    assert preview["eligible"] is False
+    assert preview["database_exists"] is True
+    assert preview["pending_migrations"] == [9]
+    assert preview["migration_required"] is True
+    assert "state_schema_migration_required" in preview["blockers"]
+    assert "request_expired" in preview["blockers"]
+    assert "canonical_request_payload_unavailable" in preview["blockers"]
+    assert preview["request_metadata"]["has_canonical_request_payload"] is False
+    assert "canonical_request" not in preview["request_metadata"]
+    assert preview["will_execute"] is False
+    assert db_path.read_bytes() == before
+    assert db_path.stat().st_mtime_ns == before_mtime
+    with pytest.raises(SafetyError):
+        execute_passive(
+            state_dir=state,
+            request_id="legacy-expired-e1",
+            confirm=EXECUTE_PASSIVE_CONFIRMATION,
+        )
+
+
+def test_execute_passive_requires_active_intake_approval_and_unexpired_request(
+    tmp_path: Path,
+) -> None:
+    state, _sender = approved_literal_request(tmp_path, request_id="deactivate-before-exec")
+    mailbox_deactivate(state_dir=state, confirm=MAILBOX_DEACTIVATE_CONFIRMATION)
+    preview = execution_preview(state_dir=state, request_id="deactivate-before-exec")
+    assert "mailbox_intake_inactive" in preview["blockers"]
+    with pytest.raises(SafetyError):
+        execute_passive(
+            state_dir=state,
+            request_id="deactivate-before-exec",
+            confirm=EXECUTE_PASSIVE_CONFIRMATION,
+        )
+
+    pending_state = tmp_path / "pending"
+    with connect_state(pending_state):
+        pass
+    write_reconciled_did_note_observation(pending_state)
+    mailbox_activate(state_dir=pending_state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
+    sender = public_did(Ed25519PrivateKey.generate())
+    transport = FakeActivationTransport()
+    transport.room_messages["mb-flop-bench"] = [
+        {
+            "seq": 1,
+            "from": sender,
+            "nonce": 1,
+            "text": mailbox_request_text(
+                sender_did=sender,
+                request_id="pending-e1",
+                extra={"test_spec": literal_equality_spec(1, 1)},
+            ),
+        }
+    ]
+    poll_mailbox(state_dir=pending_state, network=True, transport=transport, sleep_on_429=False)
+    assert (
+        "request_not_approved_for_manual_execution"
+        in execution_preview(
+            state_dir=pending_state,
+            request_id="pending-e1",
+        )["blockers"]
+    )
+
+    expired_at = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    expired_state = tmp_path / "expired"
+    with connect_state(expired_state):
+        pass
+    write_reconciled_did_note_observation(expired_state)
+    mailbox_activate(state_dir=expired_state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
+    expired_sender = public_did(Ed25519PrivateKey.generate())
+    with connect_state(expired_state) as conn:
+        conn.execute(
+            """
+            INSERT INTO mailbox_messages(
+                message_id, room, seq, sender_did, nonce, nonce_text, message_hash,
+                untrusted_text, remote_ts, authentication_level, request_id,
+                requested_capability, classification, review_status, received_at,
+                expires_at, provenance_json, evidence_id, result_link, request_json
+            )
+            VALUES (?, 'mb-flop-bench', 1, ?, 1, '1', ?, '{}', NULL,
+                    'server_verified_signed_lane', 'BENCH-FIXTURE-20260831T155341Z',
+                    'software.testing', 'valid_request',
+                    'approved_for_manual_execution', ?, ?, '{}', NULL, NULL, ?)
+            """,
+            (
+                "mb-flop-bench:1",
+                expired_sender,
+                message_hash("{}"),
+                datetime.now(UTC).isoformat(),
+                expired_at,
+                json.dumps(
+                    {
+                        "schema_version": MAILBOX_REQUEST_SCHEMA_VERSION,
+                        "request_id": "BENCH-FIXTURE-20260831T155341Z",
+                        "sender_did": expired_sender,
+                        "target_did": BENCH_DID,
+                        "requested_capability": "software.testing",
+                        "hypothesis": "expired fixture must not execute",
+                        "test_spec": literal_equality_spec(True, True),
+                        "created_at": "2026-08-31T15:53:41+00:00",
+                        "expires_at": expired_at,
+                        "provenance": {"source": "expired-fixture"},
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            ),
+        )
+        conn.commit()
+    expired_preview = execution_preview(
+        state_dir=expired_state,
+        request_id="BENCH-FIXTURE-20260831T155341Z",
+    )
+    assert "request_expired" in expired_preview["blockers"]
+    with pytest.raises(SafetyError):
+        execute_passive(
+            state_dir=expired_state,
+            request_id="BENCH-FIXTURE-20260831T155341Z",
+            confirm=EXECUTE_PASSIVE_CONFIRMATION,
+        )
+    assert execution_history(state_dir=expired_state, limit=10)["executions"] == []
+
+
+def test_literal_equality_pass_fail_strict_type_and_inert_strings(tmp_path: Path) -> None:
+    pass_state, _sender = approved_literal_request(
+        tmp_path,
+        request_id="literal-pass-e1",
+        actual="https://example.test/ignored; rm -rf /",
+        expected="https://example.test/ignored; rm -rf /",
+    )
+    with pytest.raises(SafetyError):
+        execute_passive(state_dir=pass_state, request_id="literal-pass-e1", confirm="WRONG")
+    passed = execute_passive(
+        state_dir=pass_state,
+        request_id="literal-pass-e1",
+        confirm=EXECUTE_PASSIVE_CONFIRMATION,
+    )
+    assert passed["evidence"]["verdict"] == "PASS"
+    evidence = json.loads(Path(passed["execution"]["evidence_path"]).read_text(encoding="utf-8"))
+    assert evidence["safety_report"]["code_executed"] is False
+    assert evidence["safety_report"]["urls_followed"] is False
+    assert evidence["safety_report"]["network_action"] is False
+    assert evidence["safety_report"]["confirmation_phrase_stored"] is False
+    assert evidence["provenance"]["common_control_disclosure"] is True
+    assert evidence["provenance"]["independent_evidence"] is False
+    Draft202012Validator(EVIDENCE_BUNDLE_SCHEMA).validate(evidence)
+
+    fail_state, _sender = approved_literal_request(
+        tmp_path,
+        request_id="literal-fail-e1",
+        actual=1,
+        expected=True,
+    )
+    failed = execute_passive(
+        state_dir=fail_state,
+        request_id="literal-fail-e1",
+        confirm=EXECUTE_PASSIVE_CONFIRMATION,
+    )
+    assert failed["evidence"]["verdict"] == "FAIL"
+    fail_evidence = json.loads(
+        Path(failed["execution"]["evidence_path"]).read_text(encoding="utf-8")
+    )
+    assert fail_evidence["observations"][0]["actual_type"] == "integer"
+    assert fail_evidence["observations"][0]["expected_type"] == "boolean"
+    assert fail_evidence["observations"][0]["pass"] is False
+
+
+def test_execution_rejects_malformed_unsupported_multiple_and_unbounded_specs(
+    tmp_path: Path,
+) -> None:
+    cases = [
+        ("malformed", {"actual": 1, "expected": 1}, "literal_equality"),
+        ("unsupported", {"type": "file_check", "actual": 1, "expected": 1}, "unsupported"),
+        (
+            "multiple",
+            {
+                "procedure": [
+                    literal_equality_spec(1, 1),
+                    literal_equality_spec(2, 2),
+                ]
+            },
+            "multiple remote procedures",
+        ),
+        ("unbounded", literal_equality_spec("x" * 600, "x" * 600), "exceeds"),
+    ]
+    for request_id, test_spec, expected_error in cases:
+        state, _sender = approved_literal_request(
+            tmp_path,
+            request_id=f"{request_id}-e1",
+            extra={"test_spec": test_spec},
+        )
+        preview = execution_preview(state_dir=state, request_id=f"{request_id}-e1")
+        assert preview["eligible"] is False
+        assert any(expected_error in blocker for blocker in preview["blockers"])
+        with pytest.raises(SafetyError):
+            execute_passive(
+                state_dir=state,
+                request_id=f"{request_id}-e1",
+                confirm=EXECUTE_PASSIVE_CONFIRMATION,
+            )
+
+
+def test_execute_passive_atomic_idempotent_and_interrupted_reservation_visible(
+    tmp_path: Path,
+) -> None:
+    state, _sender = approved_literal_request(tmp_path, request_id="race-e1")
+    barrier = threading.Barrier(4)
+    results: list[dict[str, object]] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        barrier.wait()
+        try:
+            result = execute_passive(
+                state_dir=state,
+                request_id="race-e1",
+                confirm=EXECUTE_PASSIVE_CONFIRMATION,
+            )
+            value = {
+                "ok": True,
+                "execution_status": result["execution"]["execution_status"],
+                "execution_performed": result["execution_performed"],
+                "evidence_id": result.get("evidence", {}).get("evidence_id"),
+            }
+        except SafetyError as exc:
+            value = {"ok": False, "error": str(exc)}
+        with lock:
+            results.append(value)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    performed = [item for item in results if item.get("execution_performed") is True]
+    assert len(performed) == 1
+    assert performed[0]["execution_status"] == "completed"
+    assert all(
+        item.get("execution_performed") is False
+        or item.get("execution_status") == "completed"
+        or "execution_reserved_or_running" in str(item.get("error", ""))
+        or "reserved/running" in str(item.get("error", ""))
+        for item in results
+    )
+    second = execute_passive(
+        state_dir=state,
+        request_id="race-e1",
+        confirm=EXECUTE_PASSIVE_CONFIRMATION,
+    )
+    assert second["idempotent"] is True
+    assert second["execution_performed"] is False
+    assert second["execution"]["execution_status"] == "completed"
+    history = execution_history(state_dir=state, limit=10)["executions"]
+    assert len(history) == 1
+    assert history[0]["execution_status"] == "completed"
+    evidence_files = sorted((state / "evidence").glob("*.json"))
+    assert len(evidence_files) == 1
+    ledger_lines = (state / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(ledger_lines) == 1
+
+    interrupted_state, _sender = approved_literal_request(tmp_path, request_id="interrupted-e1")
+    with connect_state(interrupted_state) as conn:
+        conn.execute(
+            """
+            INSERT INTO mailbox_request_executions(
+                request_id, execution_status, reserved_at, updated_at,
+                confirmation_recorded
+            )
+            VALUES ('interrupted-e1', 'reserved', ?, ?, 1)
+            """,
+            (datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat()),
+        )
+        conn.commit()
+    interrupted = execution_preview(state_dir=interrupted_state, request_id="interrupted-e1")
+    assert "execution_reserved_or_running" in interrupted["blockers"]
+    with pytest.raises(SafetyError):
+        execute_passive(
+            state_dir=interrupted_state,
+            request_id="interrupted-e1",
+            confirm=EXECUTE_PASSIVE_CONFIRMATION,
+        )
+
+
+def test_result_preview_schema_purity_and_requires_completed_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, sender = approved_literal_request(
+        tmp_path,
+        request_id="result-preview-e1",
+        extra={"reply_room": "mb-fictional-replies"},
+    )
+    with pytest.raises(SafetyError):
+        result_preview(state_dir=state, request_id="result-preview-e1")
+
+    def fail_identity_load(*args: object, **kwargs: object) -> object:
+        raise AssertionError("result preview must not load identity")
+
+    def fail_transport(*args: object, **kwargs: object) -> object:
+        raise AssertionError("result preview must not use network libraries")
+
+    monkeypatch.setattr("flop_bench.identity.load_production_identity_key", fail_identity_load)
+    monkeypatch.setattr("urllib.request.urlopen", fail_transport)
+    executed = execute_passive(
+        state_dir=state,
+        request_id="result-preview-e1",
+        confirm=EXECUTE_PASSIVE_CONFIRMATION,
+    )
+    before_history = execution_history(state_dir=state, limit=10)
+    before_ledger = (state / "ledger.jsonl").read_text(encoding="utf-8")
+    preview = result_preview(state_dir=state, request_id="result-preview-e1")
+    after_history = execution_history(state_dir=state, limit=10)
+    after_ledger = (state / "ledger.jsonl").read_text(encoding="utf-8")
+    assert preview["schema_version"] == "flop-bench.mailbox-result.v0.1"
+    assert preview["request_id"] == "result-preview-e1"
+    assert preview["evidence_id"] == executed["evidence"]["evidence_id"]
+    assert preview["verdict"] == "PASS"
+    assert preview["bench_did"] == BENCH_DID
+    assert preview["original_sender_did"] == sender
+    assert preview["reply_room"] == "mb-fictional-replies"
+    assert preview["result_delivery_status"] == "not_sent"
+    assert preview["state_write"] is False
+    assert preview["network_action"] is False
+    assert preview["will_sign"] is False
+    assert preview["will_reply"] is False
+    assert preview["will_update_router"] is False
+    assert after_history == before_history
+    assert after_ledger == before_ledger
+    Draft202012Validator(MAILBOX_RESULT_SCHEMA).validate(preview)
+
+
+def test_execution_does_not_shell_import_eval_network_file_or_url_from_remote_spec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "must-not-exist"
+    state, _sender = approved_literal_request(
+        tmp_path,
+        request_id="inert-remote-strings-e1",
+        actual=f"import os; eval('1'); open({str(marker)!r}, 'w'); https://example.test",
+        expected=f"import os; eval('1'); open({str(marker)!r}, 'w'); https://example.test",
+    )
+
+    def fail_subprocess(*args: object, **kwargs: object) -> object:
+        raise AssertionError("remote passive execution must not spawn subprocesses")
+
+    def fail_urlopen(*args: object, **kwargs: object) -> object:
+        raise AssertionError("remote passive execution must not open URLs")
+
+    monkeypatch.setattr(subprocess, "run", fail_subprocess)
+    monkeypatch.setattr(urllib.request, "urlopen", fail_urlopen)
+    result = execute_passive(
+        state_dir=state,
+        request_id="inert-remote-strings-e1",
+        confirm=EXECUTE_PASSIVE_CONFIRMATION,
+    )
+    assert result["evidence"]["verdict"] == "PASS"
+    assert not marker.exists()
 
 
 def test_identity_note_preview_status_publish_and_conflict_safety(

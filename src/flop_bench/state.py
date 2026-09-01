@@ -10,7 +10,7 @@ from typing import Any, cast
 
 from .exceptions import SafetyError
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 STATE_DB = "state.sqlite"
 SQLITE_SIGNED_64_MAX = 9_223_372_036_854_775_807
 PRIVATE_FILE_MODE = 0o600
@@ -25,6 +25,7 @@ PRIVATE_STATE_FILENAMES = (
 )
 MAILBOX_CURSOR_KEY = "mailbox:mb-flop-bench:cursor"
 MAILBOX_INTAKE_ACTIVATION_TABLE = "mailbox_intake_activation"
+MAILBOX_EXECUTION_TABLE = "mailbox_request_executions"
 
 
 def private_state_paths(state_dir: Path) -> list[Path]:
@@ -437,6 +438,44 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
             """
         )
         applied.append(8)
+    if current < 9:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mailbox_messages'"
+        ).fetchone()
+        if table is not None and "request_json" not in _table_columns(conn, "mailbox_messages"):
+            try:
+                conn.execute("ALTER TABLE mailbox_messages ADD COLUMN request_json TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).casefold():
+                    raise
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS mailbox_request_executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                execution_status TEXT NOT NULL,
+                reserved_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                updated_at TEXT NOT NULL,
+                evidence_id TEXT,
+                evidence_path TEXT,
+                evidence_hash TEXT,
+                result TEXT,
+                failure_classification TEXT,
+                confirmation_recorded INTEGER NOT NULL,
+                CHECK (
+                    execution_status IN (
+                        'reserved', 'running', 'completed', 'failed_internal'
+                    )
+                )
+            );
+            CREATE INDEX IF NOT EXISTS idx_mailbox_request_executions_status
+                ON mailbox_request_executions(execution_status, id);
+            INSERT OR IGNORE INTO schema_migrations(version) VALUES (9);
+            """
+        )
+        applied.append(9)
     conn.commit()
     return applied
 
@@ -885,9 +924,10 @@ def store_mailbox_poll(
                         message_id, room, seq, sender_did, nonce, nonce_text, message_hash,
                         untrusted_text, remote_ts, authentication_level, request_id,
                         requested_capability, classification, review_status,
-                        received_at, expires_at, provenance_json, evidence_id, result_link
+                        received_at, expires_at, provenance_json, evidence_id, result_link,
+                        request_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
                     """,
                     (
                         item["message_id"],
@@ -907,6 +947,7 @@ def store_mailbox_poll(
                         now,
                         item.get("expires_at"),
                         item.get("provenance_json"),
+                        item.get("request_json"),
                     ),
                 )
             except sqlite3.IntegrityError as exc:
@@ -924,9 +965,10 @@ def store_mailbox_poll(
                             message_id, room, seq, sender_did, nonce, nonce_text, message_hash,
                             untrusted_text, remote_ts, authentication_level, request_id,
                             requested_capability, classification, review_status,
-                            received_at, expires_at, provenance_json, evidence_id, result_link
+                            received_at, expires_at, provenance_json, evidence_id, result_link,
+                            request_json
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
                         """,
                         (
                             fallback["message_id"],
@@ -945,6 +987,7 @@ def store_mailbox_poll(
                             now,
                             fallback.get("expires_at"),
                             fallback.get("provenance_json"),
+                            fallback.get("request_json"),
                         ),
                     )
                 else:
@@ -981,6 +1024,239 @@ def _mailbox_row_dict(row: sqlite3.Row) -> dict[str, Any]:
     elif result.get("nonce") is not None:
         result["nonce_decimal"] = str(result["nonce"])
     return result
+
+
+def _execution_row_dict(row: sqlite3.Row) -> dict[str, Any]:
+    result = dict(row)
+    if "confirmation_recorded" in result:
+        result["confirmation_recorded"] = bool(result["confirmation_recorded"])
+    return result
+
+
+def readonly_state_connection(state_dir: Path) -> sqlite3.Connection:
+    resolved = state_dir.expanduser().resolve(strict=False)
+    db_path = resolved / STATE_DB
+    if not db_path.exists():
+        raise SafetyError("state database does not exist")
+    uri = f"file:{db_path.as_posix()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def mailbox_request_for_execution(state_dir: Path, *, request_id: str) -> dict[str, Any] | None:
+    with readonly_state_connection(state_dir) as conn:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mailbox_messages'"
+        ).fetchone()
+        if has_table is None:
+            return None
+        columns = _table_columns(conn, "mailbox_messages")
+        if "request_json" in columns:
+            row = conn.execute(
+                """
+                SELECT message_id, room, seq, sender_did, nonce_text, message_hash,
+                       remote_ts, authentication_level, request_id, requested_capability,
+                       classification, review_status, received_at, expires_at,
+                       provenance_json, evidence_id, result_link, request_json
+                FROM mailbox_messages
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT message_id, room, seq, sender_did, nonce_text, message_hash,
+                       remote_ts, authentication_level, request_id, requested_capability,
+                       classification, review_status, received_at, expires_at,
+                       provenance_json, evidence_id, result_link, NULL AS request_json
+                FROM mailbox_messages
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        execution_table = conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'mailbox_request_executions'
+            """
+        ).fetchone()
+        execution = None
+        if execution_table is not None:
+            execution_row = conn.execute(
+                """
+                SELECT id, request_id, execution_status, reserved_at, started_at,
+                       completed_at, updated_at, evidence_id, evidence_path,
+                       evidence_hash, result, failure_classification,
+                       confirmation_recorded
+                FROM mailbox_request_executions
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+            execution = None if execution_row is None else _execution_row_dict(execution_row)
+    return {**_mailbox_row_dict(row), "execution": execution}
+
+
+def mailbox_execution_history(state_dir: Path, *, limit: int) -> dict[str, Any]:
+    if limit < 1 or limit > 100:
+        raise SafetyError("execution history limit must be between 1 and 100")
+    resolved = state_dir.expanduser().resolve(strict=False)
+    status = migration_status(resolved)
+    if not status["database_exists"]:
+        return {
+            "ok": True,
+            "state_dir": str(resolved),
+            "limit": limit,
+            "executions": [],
+            "state_write": False,
+            "network_action": False,
+        }
+    with readonly_state_connection(resolved) as conn:
+        has_table = conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'mailbox_request_executions'
+            """
+        ).fetchone()
+        if has_table is None:
+            rows: list[sqlite3.Row] = []
+        else:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT id, request_id, execution_status, reserved_at, started_at,
+                           completed_at, updated_at, evidence_id, evidence_path,
+                           evidence_hash, result, failure_classification,
+                           confirmation_recorded
+                    FROM mailbox_request_executions
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+            )
+    return {
+        "ok": True,
+        "state_dir": str(resolved),
+        "limit": limit,
+        "executions": [_execution_row_dict(row) for row in rows],
+        "state_write": False,
+        "network_action": False,
+    }
+
+
+def reserve_mailbox_execution(conn: sqlite3.Connection, *, request_id: str) -> dict[str, Any]:
+    now = datetime.now(UTC).isoformat()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            """
+            SELECT id, request_id, execution_status, reserved_at, started_at,
+                   completed_at, updated_at, evidence_id, evidence_path,
+                   evidence_hash, result, failure_classification,
+                   confirmation_recorded
+            FROM mailbox_request_executions
+            WHERE request_id = ?
+            """,
+            (request_id,),
+        ).fetchone()
+        if row is not None:
+            conn.commit()
+            return {"created": False, **_execution_row_dict(row)}
+        cur = conn.execute(
+            """
+            INSERT INTO mailbox_request_executions(
+                request_id, execution_status, reserved_at, updated_at,
+                confirmation_recorded
+            )
+            VALUES (?, 'reserved', ?, ?, 1)
+            """,
+            (request_id, now, now),
+        )
+        row = conn.execute(
+            """
+            SELECT id, request_id, execution_status, reserved_at, started_at,
+                   completed_at, updated_at, evidence_id, evidence_path,
+                   evidence_hash, result, failure_classification,
+                   confirmation_recorded
+            FROM mailbox_request_executions
+            WHERE id = ?
+            """,
+            (cur.lastrowid,),
+        ).fetchone()
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    return {"created": True, **_execution_row_dict(row)}
+
+
+def mark_mailbox_execution_running(conn: sqlite3.Connection, *, request_id: str) -> None:
+    now = datetime.now(UTC).isoformat()
+    conn.execute(
+        """
+        UPDATE mailbox_request_executions
+        SET execution_status = 'running', started_at = COALESCE(started_at, ?), updated_at = ?
+        WHERE request_id = ? AND execution_status = 'reserved'
+        """,
+        (now, now, request_id),
+    )
+    conn.commit()
+
+
+def complete_mailbox_execution(
+    conn: sqlite3.Connection,
+    *,
+    request_id: str,
+    evidence_id: str,
+    evidence_path: Path,
+    evidence_hash: str,
+    result: str,
+) -> dict[str, Any]:
+    now = datetime.now(UTC).isoformat()
+    cur = conn.execute(
+        """
+        UPDATE mailbox_request_executions
+        SET execution_status = 'completed',
+            completed_at = COALESCE(completed_at, ?),
+            updated_at = ?,
+            evidence_id = COALESCE(evidence_id, ?),
+            evidence_path = COALESCE(evidence_path, ?),
+            evidence_hash = COALESCE(evidence_hash, ?),
+            result = COALESCE(result, ?),
+            failure_classification = NULL
+        WHERE request_id = ? AND execution_status = 'running'
+        """,
+        (now, now, evidence_id, str(evidence_path), evidence_hash, result, request_id),
+    )
+    if cur.rowcount != 1:
+        conn.rollback()
+        raise SafetyError("execution completion refused because reservation state changed")
+    conn.execute(
+        """
+        UPDATE mailbox_messages
+        SET evidence_id = COALESCE(evidence_id, ?),
+            result_link = COALESCE(result_link, ?)
+        WHERE request_id = ?
+        """,
+        (evidence_id, evidence_hash, request_id),
+    )
+    row = conn.execute(
+        """
+        SELECT id, request_id, execution_status, reserved_at, started_at,
+               completed_at, updated_at, evidence_id, evidence_path,
+               evidence_hash, result, failure_classification, confirmation_recorded
+        FROM mailbox_request_executions
+        WHERE request_id = ?
+        """,
+        (request_id,),
+    ).fetchone()
+    conn.commit()
+    return _execution_row_dict(row)
 
 
 def mailbox_messages_history(state_dir: Path, *, limit: int) -> dict[str, Any]:

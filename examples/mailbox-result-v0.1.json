@@ -1,0 +1,23 @@
+{
+  "bench_did": "did:key:z6MkqqqEMxujBTEAvoanSx6pVBMMZzLP7gMUcmNVdYHS3BVk",
+  "common_control_disclosure": true,
+  "evidence_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "evidence_id": "ev-mb-example0000000000000000000000",
+  "independent_evidence": false,
+  "network_action": false,
+  "original_sender_did": "did:key:z6MkEExampleSender111111111111111111111111111111",
+  "phase": "Phase E1 manual-only result preparation; delivery disabled",
+  "reply_room": "mb-fictional-replies",
+  "request_id": "EXAMPLE-LITERAL-EQUALITY-20000101T000000Z",
+  "result_delivery_status": "not_sent",
+  "schema_version": "flop-bench.mailbox-result.v0.1",
+  "state_write": false,
+  "urls_followed": false,
+  "verdict": "PASS",
+  "will_acquire_nonce": false,
+  "will_load_private_key": false,
+  "will_post": false,
+  "will_reply": false,
+  "will_sign": false,
+  "will_update_router": false
+}

@@ -22,6 +22,7 @@
     "schema_version": {"const": "flop-bench.evidence-bundle.v0.1"},
     "evidence_id": {"type": "string"},
     "claim_id": {"type": "string"},
+    "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
     "hypothesis": {"type": "string"},
     "capabilities": {"type": "array", "items": {"type": "string"}},
     "procedure": {"type": "array", "items": {"type": "object"}},

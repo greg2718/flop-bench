@@ -167,11 +167,13 @@ def parse_mailbox_envelope(
         raise ValidationError("operator_group must be an object or null")
     validate_timestamp_window(envelope["created_at"], envelope["expires_at"], now=now)
     expires = parse_timestamp(envelope["expires_at"], "expires_at").isoformat()
+    request_json = json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return {
         "request_id": envelope["request_id"],
         "requested_capability": envelope["requested_capability"],
         "expires_at": expires,
         "provenance": envelope["provenance"],
+        "request_json": request_json,
     }
 
 
@@ -205,6 +207,7 @@ def classify_mailbox_message(raw: dict[str, Any], *, now: datetime | None = None
     requested_capability = None
     expires_at = None
     provenance_json = None
+    request_json = None
     if auth == "server_verified_signed_lane" and sender is not None:
         try:
             envelope = parse_mailbox_envelope(text, remote_sender=sender, now=now)
@@ -225,6 +228,7 @@ def classify_mailbox_message(raw: dict[str, Any], *, now: datetime | None = None
                 sort_keys=True,
                 separators=(",", ":"),
             )
+            request_json = envelope["request_json"]
     return {
         "message_id": f"{MAILBOX}:{seq}",
         "seq": seq,
@@ -240,6 +244,7 @@ def classify_mailbox_message(raw: dict[str, Any], *, now: datetime | None = None
         "review_status": review_status,
         "expires_at": expires_at,
         "provenance_json": provenance_json,
+        "request_json": request_json,
     }
 
 
