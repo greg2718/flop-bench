@@ -1,6 +1,6 @@
 # Request Protocol
 
-FLOP Bench Phase E1 accepts signed Technocore mailbox requests only after local intake activation and can manually execute one safe passive procedure after separate approval and confirmation.
+FLOP Bench accepts signed Technocore mailbox requests only after local intake activation, can manually execute one safe passive procedure after separate approval and confirmation, and can manually deliver a signed result only after pure preview and explicit confirmation.
 
 ## Endpoint
 
@@ -91,6 +91,18 @@ Result delivery accepts only the exact request `reply_room` when it is canonical
 The delivered result envelope is canonical single-line JSON containing only schema/version, request ID, original sender DID as `target_did`, Bench DID, verdict, evidence ID/hash, common-control disclosure, `independent_evidence: false`, and URL/code/network safety disclosures. It does not include evidence paths, private state, raw procedures, response bodies, signatures, passphrases, or secrets.
 
 `result send` requires `--live`, exact confirmation, exact destination match, verified Bench identity/passphrase, a fresh locally monotonic nonce serialized as a decimal string in the signed POST body, and an audit row before the first network request. Delivery scans bounded destination history before posting; exact Bench DID plus message hash prevents duplicates. Timeout is audited as `unknown_outcome`; reconciliation attributes delivery by exact DID/hash/nonce and never downgrades a confirmed delivery.
+
+## Production Validation
+
+Phase E1 and E2 are operationally validated for same-operator transport and execution plumbing, not independent reputation.
+
+Live validation request `BENCH-E2-20260901T203609Z` was received in request mailbox `mb-flop-bench` at sequence `6` from sender DID `did:key:z6MkfJnczowbivU9SEDcZ77MEpKUfQTVbcD3i1gcwsfo4yL1` to Bench DID `did:key:z6MkqqqEMxujBTEAvoanSx6pVBMMZzLP7gMUcmNVdYHS3BVk`, with reply destination `mb-flop-scout`. Common operator control was disclosed, and `independent_evidence` was false.
+
+Manual human approval was required. Bench performed passive `literal_equality` execution exactly once, returned verdict `PASS`, did not execute code, and did not follow URLs. The resulting safe metadata was evidence ID `ev-mb-60b88b92c7c62603020da29223f17067` with evidence hash `a5f483f6e3a5e8a442836e84be9099897abb609faace250b3d79d59b6a26e44b`.
+
+Delivery ID `1` was posted to `mb-flop-scout` with HTTP status `200`, result sequence `3`, and result message hash `47332c70a0dbc56ecfa63d1755326e5adac943c2c907590c9b2784ded6cee948`. Scout read and observed the exact structured result. No reconciliation or duplicate delivery was required.
+
+During validation, Technocore experienced intermittent `530`, `remote_unavailable`, and `read_timeout` failures. Bench preserved cursors and state on incomplete reads, did not immediately retry ambiguous writes, failed closed on expired requests, and produced no duplicate request, execution, or result.
 
 ## Example
 
