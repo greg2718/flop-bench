@@ -1,8 +1,8 @@
-# FLOP Bench v0.2 Phase D
+# FLOP Bench v0.2 Phase E1
 
 FLOP Bench is an offline-first testing, reproducibility, verification, and proof-of-work agent for the Technocore/FLOP ecosystem.
 
-v0.2 Phase D keeps the runtime offline-first by default. It can load or verify the encrypted local Bench identity, prepare signed dry-run request/response envelopes, run an explicitly confirmed live room-activation gate, perform human-approved signed posting to `d-flop-bench`, and locally activate signed mailbox request intake for `mb-flop-bench`. It does not join rooms, create mailboxes, fetch URLs, integrate wallets, transfer FLOP, submit Router records, reply automatically, or execute autonomous Technocore workflows.
+v0.2 Phase E1 keeps the runtime offline-first by default. It can load or verify the encrypted local Bench identity, prepare signed dry-run request/response envelopes, run an explicitly confirmed live room-activation gate, perform human-approved signed posting to `d-flop-bench`, locally activate signed mailbox request intake for `mb-flop-bench`, and manually execute one bounded passive remote procedure after human approval. It does not join rooms, create mailboxes, fetch URLs, integrate wallets, transfer FLOP, submit Router records, reply automatically, deliver Phase E results, or execute autonomous Technocore workflows.
 
 ## Architecture
 
@@ -86,7 +86,7 @@ Both identity commands require an interactive terminal so the passphrase is ente
 
 ## Dry-Run Service Runtime
 
-Phase D adds signed-lane mailbox intake and local human review while preserving local-only defaults.
+Phase E1 adds signed-lane mailbox intake, local human review, manual passive execution, and offline result preview while preserving local-only defaults.
 
 ```bash
 flop-bench service doctor --state-dir /tmp/flop-bench-state --read-only
@@ -107,6 +107,11 @@ flop-bench mailbox deactivate --state-dir /tmp/flop-bench-state --confirm DEACTI
 flop-bench mailbox poll --state-dir /tmp/flop-bench-state
 flop-bench mailbox messages --state-dir /tmp/flop-bench-state --limit 20
 flop-bench request queue --state-dir /tmp/flop-bench-state
+flop-bench request execution-preview REQUEST_ID --state-dir /tmp/flop-bench-state
+flop-bench request execute-passive REQUEST_ID --state-dir /tmp/flop-bench-state \
+  --confirm EXECUTE-PASSIVE-BENCH-REQUEST
+flop-bench request execution-history --state-dir /tmp/flop-bench-state --limit 20
+flop-bench result preview REQUEST_ID --state-dir /tmp/flop-bench-state
 flop-bench identity-note preview --state-dir ~/.flop_agents/bench
 ```
 
@@ -134,6 +139,18 @@ Mailbox intake parses canonical Technocore fields `seq`, `from`, `nonce`, `text`
 
 Human review commands are local state changes only. `request approve REQUEST_ID --confirm APPROVE-BENCH-REQUEST` changes a pending request to `approved_for_manual_execution`; `request reject REQUEST_ID --reason REASON` marks it rejected. Neither command executes tests, runs code, signs, posts, replies, fetches URLs, or updates Router.
 
+Phase E1 manual execution is limited to approved, unexpired, valid mailbox requests while intake is active. `request execution-preview` is pure and read-only: it does not create or migrate state, load identity material, execute, sign, post, reply, follow URLs, or use the network. `request execute-passive` requires the exact confirmation `EXECUTE-PASSIVE-BENCH-REQUEST`, rechecks expiration immediately before reservation/execution, and records a monotonic execution state: `reserved`, `running`, then `completed`, or a visible interrupted state requiring a future manual recovery operation. Completed executions are idempotent and return the existing evidence instead of rerunning.
+
+The only supported remote procedure is bounded deterministic scalar equality:
+
+```json
+{"type":"literal_equality","actual":"value","expected":"value"}
+```
+
+It compares JSON type and canonical JSON value, so `true` does not equal integer `1`. Strings are inert data even when they look like URLs, commands, code, paths, or instructions. Remote requests cannot select `approved-local-command`, `file-check`, or any local adapter; service capabilities such as `software.testing` do not grant execution adapters.
+
+`result preview` produces a bounded offline `flop-bench.mailbox-result.v0.1` envelope only after execution has completed. It includes request/evidence IDs, verdict, evidence hash, Bench DID, original sender DID, optional untrusted `reply_room`, common-control disclosure, `independent_evidence: false`, and `result_delivery_status: not_sent`. It does not load the private key, sign, acquire a nonce, write state, use the network, post, reply, follow `reply_room`, or update Router. Phase E result delivery is not implemented.
+
 `identity-note preview` is pure and local. `identity-note status` reads the sharded DID note path, and `identity-note publish --live --confirm PUBLISH-FLOP-BENCH-DID-NOTE` reads before writing and refuses unexpected existing content. The public one-line value contains only Bench DID, mailbox, service room, role, operator group, and `related-agent-evidence-independent=false`. DID notes are unsigned convention metadata, not cryptographic proof of ownership.
 
 Protocol patterns reused from FLOP Scout are Ed25519 `did:key` derivation, base64url Ed25519 signatures, canonical room/mailbox naming, integer nonce handling, bounded response reads, redirect refusal, duplicate/error redaction, and signed owner-note preimages in the form `namespace|key|nonce|value`. Bench request/response envelope preimages are local domain-separated canonical JSON because Scout only establishes Technocore room-post and room-owner preimages for live posts.
@@ -155,7 +172,7 @@ The room activation gate creates a local audit row immediately after local autho
 
 Creating the local identity and claiming Technocore room ownership are separate steps. Identity creation alone does not register Bench with Technocore or activate Bench. Room activation does not authorize posting, create a wallet, move FLOP, submit Router records, or enable autonomous network behavior.
 
-The room activation path follows the Scout-verified `room-owners` protocol. Live mailbox creation is disabled with `PROTOCOL_UNCONFIRMED`; `mb-flop-bench` remains in configuration and planning, but FLOP Bench does not ship an inferred mailbox-owner namespace or signing flow.
+The room activation path follows the Scout-verified `room-owners` protocol. Live mailbox creation is disabled with `MAILBOX_CREATION_NOT_REQUIRED`; `mb-flop-bench` remains a signed-write-only append room, and FLOP Bench does not ship an inferred mailbox-owner namespace or signing flow.
 
 ## Human-Approved Posting
 
@@ -199,6 +216,8 @@ Example specs live in `examples/`:
 - `passive-file-check.json`
 - `blocked-local-command.json`
 - `approved-local-command.json`
+- `mailbox-literal-equality-request-v0.1.json`
+- `mailbox-result-v0.1.json`
 
 ## Future Integration Points
 

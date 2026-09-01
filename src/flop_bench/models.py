@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from .schemas import (
     EVIDENCE_BUNDLE_SCHEMA,
+    MAILBOX_RESULT_SCHEMA,
     ROUTER_EXPORT_SCHEMA,
     TEST_SPEC_SCHEMA,
     validate_with_schema,
@@ -103,4 +104,38 @@ class RouterValidationExport:
             limitations=list(value["limitations"]),
             provenance=dict(value["provenance"]),
             operator_group=dict(value["operator_group"]),
+        )
+
+
+@dataclass(frozen=True)
+class MailboxResultPreview:
+    schema_version: str
+    request_id: str
+    evidence_id: str
+    verdict: Result
+    evidence_hash: str
+    bench_did: str
+    original_sender_did: str | None
+    reply_room: str | None
+    common_control_disclosure: bool
+    independent_evidence: bool
+    result_delivery_status: str
+    phase: str
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> MailboxResultPreview:
+        validate_with_schema(value, MAILBOX_RESULT_SCHEMA)
+        return cls(
+            schema_version=value["schema_version"],
+            request_id=value["request_id"],
+            evidence_id=value["evidence_id"],
+            verdict=value["verdict"],
+            evidence_hash=value["evidence_hash"],
+            bench_did=value["bench_did"],
+            original_sender_did=value["original_sender_did"],
+            reply_room=value.get("reply_room"),
+            common_control_disclosure=value["common_control_disclosure"],
+            independent_evidence=value["independent_evidence"],
+            result_delivery_status=value["result_delivery_status"],
+            phase=value["phase"],
         )

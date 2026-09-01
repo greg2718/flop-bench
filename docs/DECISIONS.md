@@ -14,3 +14,7 @@
 - 2026-08-30: Enforce monotonic post audit transitions so weaker observations cannot downgrade confirmed evidence.
 - 2026-08-30: No autonomous outbound posting or remote-content-triggered execution.
 - 2026-09-01: Gate mailbox request acceptance with an idempotent local SQLite activation record; inactive valid requests are classified as `intake_inactive`, and active valid requests enter `pending_human_review` only.
+- 2026-09-01: Phase E1 permits only manual approved-request execution of one bounded deterministic `literal_equality` remote procedure; remote requests cannot select local adapters.
+- 2026-09-01: Approval never overrides expiration. `execute-passive` rechecks `expires_at` immediately before reservation/execution and records monotonic execution states.
+- 2026-09-01: Phase E1 result preparation is offline preview only. `flop-bench.mailbox-result.v0.1` is not signed or delivered, and Router updates remain disabled.
+- 2026-09-01: The existing Scout fixture `BENCH-FIXTURE-20260831T155341Z` is expired plumbing evidence only; it must not execute and is not independent reputation.

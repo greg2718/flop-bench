@@ -1,8 +1,8 @@
 # Security Policy
 
-FLOP Bench v0.2 Phase C is offline-first and fail-closed.
+FLOP Bench v0.2 Phase E1 is offline-first and fail-closed.
 
-## Prohibited in Phase C
+## Prohibited in Phase E1
 
 - Wallet support
 - FLOP transfers
@@ -11,6 +11,7 @@ FLOP Bench v0.2 Phase C is offline-first and fail-closed.
 - Technocore room creation except the explicit live activation gate
 - Technocore mailbox creation; `mb-flop-bench` is a signed-write-only append room
 - Router submission
+- Phase E result delivery, mailbox replies, or Router updates from result previews
 - Automatic URL fetching or following
 - Executing code merely because it appears in a received specification
 - `shell=True`, `eval`, `exec`, or dynamic import requested by a spec
@@ -54,9 +55,17 @@ Scout, Bench, and Sentinel are related local agents under common operator contro
 
 `mailbox status`, `mailbox activation-preview`, `mailbox poll` without `--network`, `mailbox messages`, `mailbox inspect`, `request queue`, and `request show` are local-only. They do not sign, post, reply, fetch URLs, execute message content, acquire nonces, or update Router. `mailbox activation-preview` is pure and does not create state or migrate. `mailbox activate` and `mailbox deactivate` are local SQLite state changes only; activation requires exact confirmation, existing Bench state, and a prior local DID-note reconciliation showing the expected mailbox advertisement. `request approve` and `request reject` are local review-state updates only; approval means `approved_for_manual_execution`, not execution authorization.
 
+`request execution-preview` is pure and read-only. It does not create or migrate state, load identity material, execute, sign, post, reply, fetch URLs, acquire nonces, or update Router. `request execute-passive` is manual-only and requires active intake, `valid_request`, `approved_for_manual_execution`, unexpired `expires_at` rechecked at execution time, supported capability, the supported passive procedure, and exact confirmation `EXECUTE-PASSIVE-BENCH-REQUEST`. Approval alone never executes.
+
+The only remote execution adapter in Phase E1 is `literal_equality` over bounded JSON scalars. It performs deterministic JSON type and canonical-value comparison only; `true` is not integer `1`. Strings that look like URLs, commands, imports, paths, or instructions remain inert data. Remote requests cannot select `approved-local-command`, `file-check`, local command execution, file reads, filesystem writes other than Bench evidence/state, subprocesses, imports, eval, environment access, URL access, or network access.
+
+Manual execution uses monotonic local states: `reserved`, `running`, then `completed`, or a visible interrupted state requiring a future explicit recovery operation. Completed evidence is not overwritten by weaker failures or retries; repeated execution of a completed request is idempotent and returns the existing evidence. Evidence and result previews disclose common operator control and mark related-agent evidence as non-independent.
+
+`result preview` is an offline preparation step only. It requires completed execution and emits bounded `flop-bench.mailbox-result.v0.1` data with `result_delivery_status: not_sent`. It does not load private keys, sign, acquire nonces, write state, post, reply, follow `reply_room`, use the network, or update Router.
+
 ## Live Activation And Posting Gates
 
-`technocore create-room`, `technocore status`, `post send`, and `post reconcile` are the only Phase C commands allowed to use the Technocore origin. Live room creation requires:
+`technocore create-room`, `technocore status`, `post send`, `post reconcile`, explicit DID-note status/publish/reconcile, and `mailbox poll --network` are the only Phase E1 commands allowed to use the Technocore origin. Live room creation requires:
 
 - `--state-dir ~/.flop_agents/bench`
 - `--live`

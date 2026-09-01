@@ -17,6 +17,13 @@ from .activation import (
 from .config import BenchConfig, assert_isolated, isolation_boundaries
 from .engine import router_export, verify_spec
 from .exceptions import FlopBenchError, IsolationError, LedgerError, SafetyError, ValidationError
+from .execution import (
+    EXECUTE_PASSIVE_CONFIRMATION,
+    execute_passive,
+    execution_history,
+    execution_preview,
+    result_preview,
+)
 from .identity import (
     IDENTITY_CONFIRMATION,
     create_production_identity,
@@ -129,6 +136,23 @@ def build_parser() -> argparse.ArgumentParser:
     request_reject_cmd.add_argument("request_id")
     request_reject_cmd.add_argument("--state-dir", required=True, type=Path)
     request_reject_cmd.add_argument("--reason", required=True)
+    request_execution_preview = request_sub.add_parser("execution-preview")
+    request_execution_preview.add_argument("request_id")
+    request_execution_preview.add_argument("--state-dir", required=True, type=Path)
+    request_execute_passive = request_sub.add_parser("execute-passive")
+    request_execute_passive.add_argument("request_id")
+    request_execute_passive.add_argument("--state-dir", required=True, type=Path)
+    request_execute_passive.add_argument(
+        "--confirm", required=True, choices=[EXECUTE_PASSIVE_CONFIRMATION]
+    )
+    request_execution_history = request_sub.add_parser("execution-history")
+    request_execution_history.add_argument("--state-dir", required=True, type=Path)
+    request_execution_history.add_argument("--limit", required=True, type=int)
+    result = sub.add_parser("result")
+    result_sub = result.add_subparsers(dest="result_cmd", required=True)
+    result_preview_cmd = result_sub.add_parser("preview")
+    result_preview_cmd.add_argument("request_id")
+    result_preview_cmd.add_argument("--state-dir", required=True, type=Path)
     response = sub.add_parser("response")
     response_sub = response.add_subparsers(dest="response_cmd", required=True)
     response_prepare = response_sub.add_parser("prepare")
@@ -285,6 +309,20 @@ def run(argv: list[str] | None = None) -> int:
                     reason=args.reason,
                 )
             )
+        elif args.cmd == "request" and args.request_cmd == "execution-preview":
+            _print_json(execution_preview(state_dir=args.state_dir, request_id=args.request_id))
+        elif args.cmd == "request" and args.request_cmd == "execute-passive":
+            _print_json(
+                execute_passive(
+                    state_dir=args.state_dir,
+                    request_id=args.request_id,
+                    confirm=args.confirm,
+                )
+            )
+        elif args.cmd == "request" and args.request_cmd == "execution-history":
+            _print_json(execution_history(state_dir=args.state_dir, limit=args.limit))
+        elif args.cmd == "result" and args.result_cmd == "preview":
+            _print_json(result_preview(state_dir=args.state_dir, request_id=args.request_id))
         elif args.cmd == "response" and args.response_cmd == "prepare":
             passphrase = read_interactive_existing_passphrase()
             _print_json(
