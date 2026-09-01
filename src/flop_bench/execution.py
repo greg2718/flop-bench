@@ -6,11 +6,37 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .activation import (
+    MAX_RESPONSE_BYTES,
+    ActivationRequestError,
+    ActivationTransport,
+    validate_live_gate,
+)
 from .canonical import atomic_write_text, canonical_json_bytes, sha256_bytes, sha256_json
-from .config import BENCH_DID, BENCH_SERVICE_CAPABILITIES, MAILBOX, BenchConfig, assert_isolated
+from .config import (
+    BENCH_DID,
+    BENCH_SERVICE_CAPABILITIES,
+    DEFAULT_PRODUCTION_STATE,
+    MAILBOX,
+    BenchConfig,
+    assert_isolated,
+)
 from .exceptions import SafetyError, ValidationError
+from .identity import b64u, load_production_identity_key
 from .ledger import append_record
 from .models import EvidenceBundle, MailboxResultPreview
+from .posting import (
+    classify_post_status,
+    classify_post_transport_failure,
+    message_hash,
+    post_room_url,
+    posted_record_matches,
+    scan_room_history_for_hash,
+    signed_post_body,
+    signed_post_headers,
+    signed_post_preimage,
+    validate_signed_write_room,
+)
 from .protocol import parse_timestamp
 from .schemas import (
     EVIDENCE_BUNDLE_SCHEMA,
@@ -26,15 +52,22 @@ from .state import (
     mailbox_request_for_execution,
     mark_mailbox_execution_running,
     migration_status,
+    record_result_delivery_attempt,
     reserve_mailbox_execution,
+    result_delivery_attempt,
+    result_delivery_history,
+    update_result_delivery_attempt,
 )
+from .state import next_post_nonce as reserve_post_nonce
 
 EXECUTE_PASSIVE_CONFIRMATION = "EXECUTE-PASSIVE-BENCH-REQUEST"
+RESULT_SEND_CONFIRMATION = "SEND-FLOP-BENCH-RESULT"
 MAILBOX_RESULT_SCHEMA_VERSION = "flop-bench.mailbox-result.v0.1"
 SUPPORTED_REMOTE_PROCEDURE = "literal_equality"
 MAX_PROCEDURE_BYTES = 2048
 MAX_SCALAR_STRING_BYTES = 512
 MAX_SCALAR_NUMBER_ABS = 1_000_000_000_000
+STRONG_RESULT_DELIVERY_STATUSES = frozenset({"posted", "reconciled_posted", "already-posted"})
 
 
 def _utc_now() -> datetime:
@@ -526,3 +559,541 @@ def result_preview(*, state_dir: Path, request_id: str) -> dict[str, Any]:
     validate_with_schema(preview, MAILBOX_RESULT_SCHEMA)
     MailboxResultPreview.from_mapping(preview)
     return preview
+
+
+def _completed_result_envelope(row: dict[str, Any]) -> dict[str, Any]:
+    execution = row.get("execution")
+    if not isinstance(execution, dict) or execution.get("execution_status") != "completed":
+        raise SafetyError("result delivery requires completed execution")
+    target_did = row.get("sender_did")
+    if not isinstance(target_did, str) or not target_did:
+        raise SafetyError("result delivery target DID is unavailable")
+    return {
+        "schema_version": MAILBOX_RESULT_SCHEMA_VERSION,
+        "request_id": row["request_id"],
+        "target_did": target_did,
+        "bench_did": BENCH_DID,
+        "verdict": execution["result"],
+        "evidence_id": execution["evidence_id"],
+        "evidence_hash": execution["evidence_hash"],
+        "common_control_disclosure": True,
+        "independent_evidence": False,
+        "urls_followed": False,
+        "code_executed": False,
+        "network_action": False,
+    }
+
+
+def _canonical_result_text(envelope: dict[str, Any]) -> str:
+    return canonical_json_bytes(envelope).decode("utf-8")
+
+
+def _delivery_destination_blockers(
+    *,
+    reply_room: Any,
+    destination: str | None,
+) -> tuple[str | None, list[str]]:
+    blockers: list[str] = []
+    resolved = reply_room if isinstance(reply_room, str) else None
+    if resolved is None:
+        blockers.append("missing_result_destination")
+    else:
+        try:
+            validate_signed_write_room(resolved)
+        except SafetyError:
+            blockers.append("unsupported_result_destination")
+        if not resolved.startswith("mb-"):
+            blockers.append("unsupported_result_destination")
+    if destination is not None:
+        try:
+            validate_signed_write_room(destination)
+        except SafetyError:
+            blockers.append("unsupported_cli_destination")
+        if not destination.startswith("mb-"):
+            blockers.append("unsupported_cli_destination")
+        if resolved is not None and destination != resolved:
+            blockers.append("destination_mismatch")
+    return resolved, list(dict.fromkeys(blockers))
+
+
+def result_delivery_preview(*, state_dir: Path, request_id: str) -> dict[str, Any]:
+    assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
+    resolved = state_dir.expanduser().resolve(strict=False)
+    blockers: list[str] = []
+    status = migration_status(resolved)
+    if not status["database_exists"]:
+        blockers.append("state_database_missing")
+        row = None
+        envelope = None
+        reply_room = None
+    else:
+        pending_migrations = list(status["pending_migrations"])
+        if pending_migrations:
+            blockers.append("state_schema_migration_required")
+        row = mailbox_request_for_execution(resolved, request_id=request_id)
+        if row is None:
+            blockers.append("request_not_found")
+            envelope = None
+            reply_room = None
+        else:
+            try:
+                request_envelope = _load_envelope(row)
+                reply_room = request_envelope.get("reply_room")
+            except (SafetyError, ValidationError) as exc:
+                blockers.append(str(exc))
+                reply_room = None
+            try:
+                envelope = _completed_result_envelope(row)
+            except SafetyError as exc:
+                blockers.append(str(exc))
+                envelope = None
+    destination, destination_blockers = _delivery_destination_blockers(
+        reply_room=reply_room,
+        destination=None,
+    )
+    blockers.extend(destination_blockers)
+    result_text = _canonical_result_text(envelope) if envelope is not None else None
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "can_send": not blockers,
+        "blockers": list(dict.fromkeys(blockers)),
+        "destination": destination,
+        "message_hash": message_hash(result_text) if result_text is not None else None,
+        "message_bytes": len(result_text.encode("utf-8")) if result_text is not None else None,
+        "result_envelope": envelope,
+        "result_text": result_text,
+        "state_dir": str(resolved),
+        "state_write": False,
+        "network_action": False,
+        "will_load_private_key": False,
+        "will_sign": False,
+        "will_acquire_nonce": False,
+        "will_post": False,
+        "will_reply": False,
+        "will_update_router": False,
+        "urls_followed": False,
+    }
+
+
+def _start_result_delivery_audit(
+    state_dir: Path,
+    *,
+    request_id: str,
+    destination: str,
+    target_did: str,
+    message_hash_value: str,
+    bench_did: str,
+) -> int:
+    with connect_state(state_dir) as conn:
+        return record_result_delivery_attempt(
+            conn,
+            request_id=request_id,
+            destination=destination,
+            bench_did=bench_did,
+            target_did=target_did,
+            message_hash=message_hash_value,
+            delivery_status="started",
+            response_status=None,
+            nonce_used=None,
+            seq=None,
+            failure_classification=None,
+        )
+
+
+def _update_result_delivery_audit(
+    state_dir: Path,
+    *,
+    delivery_id: int,
+    delivery_status: str,
+    response_status: int | None,
+    nonce_used: int | None,
+    seq: int | None,
+    failure_classification: str | None,
+) -> None:
+    with connect_state(state_dir) as conn:
+        update_result_delivery_attempt(
+            conn,
+            delivery_id=delivery_id,
+            delivery_status=delivery_status,
+            response_status=response_status,
+            nonce_used=nonce_used,
+            seq=seq,
+            failure_classification=failure_classification,
+        )
+
+
+def _next_delivery_nonce(state_dir: Path) -> int:
+    with connect_state(state_dir) as conn:
+        return reserve_post_nonce(conn)
+
+
+def _result_delivery_transition(
+    current: dict[str, Any],
+    *,
+    observed_status: str,
+    observed_seq: int | None,
+    observed_failure_classification: str | None,
+) -> dict[str, Any]:
+    current_status = str(current["delivery_status"])
+    current_seq = current["seq"] if isinstance(current["seq"], int) else None
+    current_failure = current["failure_classification"]
+    if observed_status == "reconciled_posted":
+        return {
+            "state_write": (
+                current_status != "reconciled_posted"
+                or current_seq != observed_seq
+                or current_failure is not None
+            ),
+            "delivery_status": "reconciled_posted",
+            "seq": observed_seq if observed_seq is not None else current_seq,
+            "failure_classification": None,
+        }
+    if current_status in STRONG_RESULT_DELIVERY_STATUSES:
+        return {
+            "state_write": False,
+            "delivery_status": current_status,
+            "seq": current_seq,
+            "failure_classification": current_failure,
+        }
+    if observed_status in {"reconciliation_incomplete", "matching_message_different_nonce"}:
+        return {
+            "state_write": False,
+            "delivery_status": current_status,
+            "seq": current_seq,
+            "failure_classification": current_failure,
+        }
+    if observed_status == "reconciled_absent":
+        return {
+            "state_write": (
+                current_status != "reconciled_absent"
+                or current_failure != observed_failure_classification
+            ),
+            "delivery_status": "reconciled_absent",
+            "seq": current_seq,
+            "failure_classification": observed_failure_classification,
+        }
+    return {
+        "state_write": False,
+        "delivery_status": current_status,
+        "seq": current_seq,
+        "failure_classification": current_failure,
+    }
+
+
+def send_result_delivery(
+    *,
+    state_dir: Path,
+    request_id: str,
+    destination: str,
+    live: bool,
+    confirm: str,
+    passphrase: str,
+    transport: ActivationTransport,
+    expected_state_dir: Path = DEFAULT_PRODUCTION_STATE,
+    expected_bench_did: str = BENCH_DID,
+) -> dict[str, Any]:
+    preview = result_delivery_preview(state_dir=state_dir, request_id=request_id)
+    preview_destination = preview["destination"]
+    _, destination_blockers = _delivery_destination_blockers(
+        reply_room=preview_destination,
+        destination=destination,
+    )
+    blockers = list(dict.fromkeys([*preview["blockers"], *destination_blockers]))
+    if blockers:
+        raise SafetyError("result delivery is blocked: " + ", ".join(blockers))
+    if destination != preview_destination:
+        raise SafetyError("result delivery destination_mismatch")
+    resolved_state = validate_live_gate(
+        live=live,
+        confirm=confirm,
+        expected_confirm=RESULT_SEND_CONFIRMATION,
+        state_dir=state_dir,
+        expected_state_dir=expected_state_dir,
+    )
+    envelope = preview["result_envelope"]
+    text = preview["result_text"]
+    if not isinstance(envelope, dict) or not isinstance(text, str):
+        raise SafetyError("result delivery preview did not produce sendable bytes")
+    digest = message_hash(text)
+    key = load_production_identity_key(
+        state_dir=resolved_state,
+        passphrase=passphrase,
+        expected_state_dir=expected_state_dir,
+        expected_did=expected_bench_did,
+    )
+    target_did = str(envelope["target_did"])
+    delivery_id = _start_result_delivery_audit(
+        resolved_state,
+        request_id=request_id,
+        destination=destination,
+        target_did=target_did,
+        message_hash_value=digest,
+        bench_did=expected_bench_did,
+    )
+    try:
+        preflight = scan_room_history_for_hash(
+            transport,
+            room=destination,
+            expected_did=expected_bench_did,
+            digest=digest,
+        )
+        if not preflight["history_scan_complete"]:
+            raise ActivationRequestError(
+                "Technocore result destination history could not be completely searched",
+                failure_classification=str(
+                    preflight["failure_classification"] or "history_scan_incomplete"
+                ),
+            )
+    except ActivationRequestError as exc:
+        _update_result_delivery_audit(
+            resolved_state,
+            delivery_id=delivery_id,
+            delivery_status="failed_preflight",
+            response_status=exc.response.status if exc.response else None,
+            nonce_used=None,
+            seq=None,
+            failure_classification=exc.failure_classification,
+        )
+        raise
+    if preflight["exact_match_found"]:
+        _update_result_delivery_audit(
+            resolved_state,
+            delivery_id=delivery_id,
+            delivery_status="already-posted",
+            response_status=None,
+            nonce_used=None,
+            seq=int(preflight["seq"]),
+            failure_classification=None,
+        )
+        return {
+            "ok": True,
+            "request_id": request_id,
+            "destination": destination,
+            "did": expected_bench_did,
+            "delivery_status": "already-posted",
+            "message_hash": digest,
+            "nonce": None,
+            "seq": preflight["seq"],
+            "delivery_id": delivery_id,
+            "idempotency_preflight": preflight,
+            "network_action": True,
+            "state_write": True,
+        }
+    nonce = _next_delivery_nonce(resolved_state)
+    try:
+        sig = b64u(key.sign(signed_post_preimage(destination, nonce, text)))
+    except Exception as exc:
+        _update_result_delivery_audit(
+            resolved_state,
+            delivery_id=delivery_id,
+            delivery_status="failed",
+            response_status=None,
+            nonce_used=nonce,
+            seq=None,
+            failure_classification="signing_failure",
+        )
+        raise SafetyError("Technocore result delivery signing failed") from exc
+    body = signed_post_body(did=expected_bench_did, sig=sig, nonce=nonce, text=text)
+    headers = signed_post_headers()
+    url = post_room_url(destination)
+    try:
+        response = transport.request("POST", url, body=body, headers=headers)
+        if response.final_url and response.final_url != url:
+            raise ActivationRequestError(
+                "Technocore redirect refused",
+                failure_classification="redirect_rejected",
+                response=response,
+            )
+        if len(response.body) > MAX_RESPONSE_BYTES:
+            raise ActivationRequestError(
+                "Technocore response exceeded local safety limit",
+                failure_classification="oversized_response",
+                response=response,
+            )
+        if response.status != 200:
+            raise ActivationRequestError(
+                f"Technocore result delivery failed: HTTP {response.status}",
+                failure_classification=classify_post_status(response.status),
+                response=response,
+            )
+        parsed = json.loads(response.body.decode("utf-8"))
+    except ActivationRequestError as exc:
+        delivery_status, failure_classification = classify_post_transport_failure(
+            exc.failure_classification
+        )
+        if exc.response is not None:
+            delivery_status = "confirmed_rejected"
+            failure_classification = exc.failure_classification
+        _update_result_delivery_audit(
+            resolved_state,
+            delivery_id=delivery_id,
+            delivery_status=delivery_status,
+            response_status=exc.response.status if exc.response else None,
+            nonce_used=nonce,
+            seq=None,
+            failure_classification=failure_classification,
+        )
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        _update_result_delivery_audit(
+            resolved_state,
+            delivery_id=delivery_id,
+            delivery_status="failed",
+            response_status=response.status if "response" in locals() else None,
+            nonce_used=nonce,
+            seq=None,
+            failure_classification="malformed_response",
+        )
+        raise SafetyError("Technocore returned an invalid JSON response") from exc
+    except Exception as exc:
+        _update_result_delivery_audit(
+            resolved_state,
+            delivery_id=delivery_id,
+            delivery_status="failed",
+            response_status=None,
+            nonce_used=nonce,
+            seq=None,
+            failure_classification="unexpected_local_failure",
+        )
+        raise SafetyError("Technocore result delivery failed unexpectedly") from exc
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("posted"), dict):
+        _update_result_delivery_audit(
+            resolved_state,
+            delivery_id=delivery_id,
+            delivery_status="failed",
+            response_status=response.status,
+            nonce_used=nonce,
+            seq=None,
+            failure_classification="malformed_response",
+        )
+        raise SafetyError("Technocore did not return a posted record")
+    posted = parsed["posted"]
+    seq = posted.get("seq")
+    if not posted_record_matches(posted, did=expected_bench_did, text=text, nonce=nonce):
+        _update_result_delivery_audit(
+            resolved_state,
+            delivery_id=delivery_id,
+            delivery_status="failed",
+            response_status=response.status,
+            nonce_used=nonce,
+            seq=seq if isinstance(seq, int) else None,
+            failure_classification="unverifiable_post",
+        )
+        raise SafetyError("returned posted record did not match signed result delivery")
+    _update_result_delivery_audit(
+        resolved_state,
+        delivery_id=delivery_id,
+        delivery_status="posted",
+        response_status=response.status,
+        nonce_used=nonce,
+        seq=seq,
+        failure_classification=None,
+    )
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "destination": destination,
+        "did": expected_bench_did,
+        "delivery_status": "posted",
+        "message_hash": digest,
+        "nonce": nonce,
+        "seq": seq,
+        "delivery_id": delivery_id,
+        "network_action": True,
+        "state_write": True,
+    }
+
+
+def reconcile_result_delivery(
+    *,
+    state_dir: Path,
+    delivery_id: int,
+    transport: ActivationTransport,
+    expected_bench_did: str = BENCH_DID,
+) -> dict[str, Any]:
+    resolved_state = state_dir.expanduser().resolve(strict=False)
+    attempt = result_delivery_attempt(resolved_state, delivery_id=delivery_id)
+    destination = str(attempt["destination"])
+    validate_signed_write_room(destination)
+    if not destination.startswith("mb-"):
+        raise SafetyError("result delivery reconcile is restricted to mb-* attempts")
+    if attempt["bench_did"] != expected_bench_did:
+        raise SafetyError("result delivery attempt DID does not match Bench DID")
+    attempt_nonce = attempt["nonce_used"]
+    if not isinstance(attempt_nonce, int):
+        raise SafetyError("result delivery reconcile attempt has no recorded nonce")
+    digest = str(attempt["message_hash"])
+    scan = scan_room_history_for_hash(
+        transport,
+        room=destination,
+        expected_did=expected_bench_did,
+        digest=digest,
+        attempt_nonce=attempt_nonce,
+    )
+    observed_seq: int | None
+    if scan["exact_attempt_match"]:
+        observed_status = "reconciled_posted"
+        observed_classification = None
+        observed_seq = int(scan["exact_attempt_seq"])
+    elif scan["matching_message_different_nonce"]:
+        observed_status = "matching_message_different_nonce"
+        observed_classification = None
+        observed_seq = attempt["seq"] if isinstance(attempt["seq"], int) else None
+    elif scan["history_scan_complete"]:
+        observed_status = "reconciled_absent"
+        observed_classification = "absent_not_proven_rejected"
+        observed_seq = None
+    else:
+        observed_status = "reconciliation_incomplete"
+        observed_classification = str(scan["failure_classification"] or "history_scan_incomplete")
+        observed_seq = attempt["seq"] if isinstance(attempt["seq"], int) else None
+    transition = _result_delivery_transition(
+        attempt,
+        observed_status=observed_status,
+        observed_seq=observed_seq,
+        observed_failure_classification=observed_classification,
+    )
+    state_write = bool(transition["state_write"])
+    if state_write:
+        _update_result_delivery_audit(
+            resolved_state,
+            delivery_id=delivery_id,
+            delivery_status=str(transition["delivery_status"]),
+            response_status=attempt["response_status"],
+            nonce_used=attempt_nonce,
+            seq=transition["seq"] if isinstance(transition["seq"], int) else None,
+            failure_classification=(
+                str(transition["failure_classification"])
+                if transition["failure_classification"] is not None
+                else None
+            ),
+        )
+    return {
+        "ok": scan["history_scan_complete"],
+        "delivery_id": delivery_id,
+        "request_id": attempt["request_id"],
+        "destination": destination,
+        "bench_did": expected_bench_did,
+        "message_hash": digest,
+        "exact_match_found": scan["exact_match_found"],
+        "exact_attempt_match": scan["exact_attempt_match"],
+        "attempt_nonce": attempt_nonce,
+        "matched_nonce": scan["matched_nonce"],
+        "matching_message_other_nonce": scan["matching_message_other_nonce"],
+        "matching_message_different_nonce": scan["matching_message_different_nonce"],
+        "matching_message_unattributable_nonce": scan["matching_message_unattributable_nonce"],
+        "seq": observed_seq if scan["exact_attempt_match"] else scan["seq"],
+        "history_scan_complete": scan["history_scan_complete"],
+        "pages_scanned": scan["pages_scanned"],
+        "reconciliation_status": observed_status,
+        "audit_status": transition["delivery_status"],
+        "audit_transition": "updated" if state_write else "preserved",
+        "state_write": state_write,
+        "network_action": "bounded_read_only",
+    }
+
+
+def result_history(*, state_dir: Path, limit: int) -> dict[str, Any]:
+    assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
+    return result_delivery_history(state_dir, limit=limit)

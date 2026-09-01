@@ -19,10 +19,15 @@ from .engine import router_export, verify_spec
 from .exceptions import FlopBenchError, IsolationError, LedgerError, SafetyError, ValidationError
 from .execution import (
     EXECUTE_PASSIVE_CONFIRMATION,
+    RESULT_SEND_CONFIRMATION,
     execute_passive,
     execution_history,
     execution_preview,
+    reconcile_result_delivery,
+    result_delivery_preview,
+    result_history,
     result_preview,
+    send_result_delivery,
 )
 from .identity import (
     IDENTITY_CONFIRMATION,
@@ -153,6 +158,21 @@ def build_parser() -> argparse.ArgumentParser:
     result_preview_cmd = result_sub.add_parser("preview")
     result_preview_cmd.add_argument("request_id")
     result_preview_cmd.add_argument("--state-dir", required=True, type=Path)
+    result_delivery_preview_cmd = result_sub.add_parser("delivery-preview")
+    result_delivery_preview_cmd.add_argument("request_id")
+    result_delivery_preview_cmd.add_argument("--state-dir", required=True, type=Path)
+    result_send_cmd = result_sub.add_parser("send")
+    result_send_cmd.add_argument("request_id")
+    result_send_cmd.add_argument("--state-dir", required=True, type=Path)
+    result_send_cmd.add_argument("--destination", required=True)
+    result_send_cmd.add_argument("--live", action="store_true")
+    result_send_cmd.add_argument("--confirm", required=True, choices=[RESULT_SEND_CONFIRMATION])
+    result_history_cmd = result_sub.add_parser("history")
+    result_history_cmd.add_argument("--state-dir", required=True, type=Path)
+    result_history_cmd.add_argument("--limit", required=True, type=int)
+    result_reconcile_cmd = result_sub.add_parser("reconcile")
+    result_reconcile_cmd.add_argument("--state-dir", required=True, type=Path)
+    result_reconcile_cmd.add_argument("--delivery-id", required=True, type=int)
     response = sub.add_parser("response")
     response_sub = response.add_subparsers(dest="response_cmd", required=True)
     response_prepare = response_sub.add_parser("prepare")
@@ -323,6 +343,33 @@ def run(argv: list[str] | None = None) -> int:
             _print_json(execution_history(state_dir=args.state_dir, limit=args.limit))
         elif args.cmd == "result" and args.result_cmd == "preview":
             _print_json(result_preview(state_dir=args.state_dir, request_id=args.request_id))
+        elif args.cmd == "result" and args.result_cmd == "delivery-preview":
+            _print_json(
+                result_delivery_preview(state_dir=args.state_dir, request_id=args.request_id)
+            )
+        elif args.cmd == "result" and args.result_cmd == "send":
+            passphrase = read_interactive_existing_passphrase()
+            _print_json(
+                send_result_delivery(
+                    state_dir=args.state_dir,
+                    request_id=args.request_id,
+                    destination=args.destination,
+                    live=args.live,
+                    confirm=args.confirm,
+                    passphrase=passphrase,
+                    transport=UrlLibActivationTransport(),
+                )
+            )
+        elif args.cmd == "result" and args.result_cmd == "history":
+            _print_json(result_history(state_dir=args.state_dir, limit=args.limit))
+        elif args.cmd == "result" and args.result_cmd == "reconcile":
+            _print_json(
+                reconcile_result_delivery(
+                    state_dir=args.state_dir,
+                    delivery_id=args.delivery_id,
+                    transport=UrlLibActivationTransport(),
+                )
+            )
         elif args.cmd == "response" and args.response_cmd == "prepare":
             passphrase = read_interactive_existing_passphrase()
             _print_json(
