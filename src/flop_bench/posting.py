@@ -31,6 +31,7 @@ from .exceptions import SafetyError, ValidationError
 from .identity import b64u, load_production_identity_key
 from .state import (
     connect_state,
+    mailbox_activation_state,
     post_attempt,
     post_history,
     record_post_attempt,
@@ -45,19 +46,37 @@ MAX_HISTORY_PAGES = 10
 MAX_HISTORY_ITEMS = 2_000
 MAX_HISTORY_BYTES = 1_000_000
 MAX_HISTORY_SCAN_SECONDS = 20.0
+MAX_TECHNOCORE_NONCE_DIGITS = 19
 URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
 STRONG_POST_STATUSES = frozenset({"posted", "reconciled_posted", "already-posted"})
 
 
-def service_manifest() -> dict[str, Any]:
+def service_manifest(*, state_dir: Path | None = None) -> dict[str, Any]:
+    activation = (
+        mailbox_activation_state(state_dir, mailbox=MAILBOX)
+        if state_dir is not None
+        else {
+            "active": False,
+            "activation_status": "inactive",
+            "protocol_version": "flop-bench.mailbox-request.v0.1",
+            "execution_mode": "manual_only",
+            "autonomous_polling": False,
+            "autonomous_execution": False,
+            "autonomous_reply": False,
+            "router_updates": False,
+        }
+    )
     return {
         "schema_version": "flop-bench.service-manifest.v0.2",
         "bench_did": BENCH_DID,
         "room": CANONICAL_ROOM,
         "mailbox": {
             "name": MAILBOX,
-            "status": "protocol-unconfirmed",
-            "active": False,
+            "status": "signed-write-only-room",
+            "active": activation["active"],
+            "activation_status": activation["activation_status"],
+            "protocol_version": activation["protocol_version"],
+            "execution_mode": activation["execution_mode"],
         },
         "capabilities": list(BENCH_SERVICE_CAPABILITIES),
         "operator_group": {
@@ -77,8 +96,15 @@ def service_manifest() -> dict[str, Any]:
             "wallets": False,
             "flop_transfers": False,
             "autonomous_outbound_posting": False,
-            "requests_accepted": False,
-            "request_intake_status": "disabled_until_mailbox_or_intake_activation",
+            "autonomous_polling": activation["autonomous_polling"],
+            "autonomous_reply": activation["autonomous_reply"],
+            "router_updates": activation["router_updates"],
+            "requests_accepted": activation["active"],
+            "request_intake_status": (
+                "pending_human_review"
+                if activation["active"]
+                else "inactive_valid_requests_classified_intake_inactive"
+            ),
         },
     }
 
@@ -161,11 +187,19 @@ def message_seq(raw: dict[str, Any]) -> int | None:
     return seq if seq > 0 else None
 
 
-def message_nonce(raw: dict[str, Any]) -> int | None:
+def message_nonce_text(raw: dict[str, Any]) -> str | None:
     value = raw.get("nonce")
     if type(value) is not int:
         return None
-    return value if value > 0 else None
+    text = str(value)
+    if value <= 0 or len(text) > MAX_TECHNOCORE_NONCE_DIGITS:
+        return None
+    return text
+
+
+def message_nonce(raw: dict[str, Any]) -> int | None:
+    text = message_nonce_text(raw)
+    return int(text) if text is not None else None
 
 
 def canonical_room_message(raw: dict[str, Any]) -> dict[str, Any]:
@@ -384,7 +418,7 @@ def preview_post(message_path: Path, *, state_dir: Path) -> dict[str, Any]:
         "message_hash": message_hash(text),
         "message_bytes": len(text.encode("utf-8")),
         "message_characters": len(text),
-        "manifest": service_manifest(),
+        "manifest": service_manifest(state_dir=state_dir),
         "proposed_initial_announcement": proposed_initial_announcement(),
         "will_sign": False,
         "will_acquire_nonce": False,
@@ -562,7 +596,8 @@ def protocol_check_post(message_path: Path, *, state_dir: Path) -> dict[str, Any
             "local_type": "integer",
             "request_body": "JSON string matching ^[0-9]{1,19}$",
             "response_posted_record": (
-                "JSON integer; bool, string, float, missing, or mismatch fail closed"
+                "JSON integer with 1-19 decimal digits; bool, string, float, zero, "
+                "negative, oversized, missing, or mismatch fail closed"
             ),
             "acquired": False,
         },

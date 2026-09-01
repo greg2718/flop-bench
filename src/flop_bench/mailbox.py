@@ -24,21 +24,26 @@ from .config import BENCH_DID, BENCH_SERVICE_CAPABILITIES, MAILBOX, BenchConfig,
 from .exceptions import SafetyError, ValidationError
 from .identity import is_valid_ed25519_did
 from .identity_note import did_profile_path, identity_note_value, note_hash
-from .posting import extract_room_messages, message_nonce, message_seq
+from .posting import extract_room_messages, message_nonce_text, message_seq
 from .protocol import parse_timestamp, validate_timestamp_window
 from .redaction import redact
 from .state import (
     STATE_DB,
     connect_state,
     latest_did_note_observation,
+    mailbox_activation_state,
     mailbox_cursor,
     mailbox_message_detail,
     mailbox_messages_history,
     migration_status,
+    record_mailbox_activation,
+    record_mailbox_deactivation,
     store_mailbox_poll,
 )
 
 MAILBOX_REQUEST_SCHEMA_VERSION = "flop-bench.mailbox-request.v0.1"
+MAILBOX_ACTIVATE_CONFIRMATION = "ACTIVATE-MB-FLOP-BENCH"
+MAILBOX_DEACTIVATE_CONFIRMATION = "DEACTIVATE-MB-FLOP-BENCH"
 MAX_MAILBOX_PAGE_LIMIT = 200
 MAX_MAILBOX_PAGES = 10
 MAX_MAILBOX_ITEMS = 2_000
@@ -174,7 +179,7 @@ def classify_authentication(raw: dict[str, Any], *, room: str = MAILBOX) -> tupl
     sender = raw.get("from")
     if not isinstance(sender, str) or not is_valid_ed25519_did(sender):
         return "malformed_or_unverifiable", None
-    nonce = message_nonce(raw)
+    nonce = message_nonce_text(raw)
     text = raw.get("text")
     if nonce is None or not isinstance(text, str):
         return "malformed_or_unverifiable", sender
@@ -192,7 +197,7 @@ def classify_mailbox_message(raw: dict[str, Any], *, now: datetime | None = None
     text = raw.get("text")
     if seq is None or not isinstance(text, str):
         raise ValidationError("mailbox message missing canonical seq or text")
-    nonce = message_nonce(raw)
+    nonce_text = message_nonce_text(raw)
     auth, sender = classify_authentication(raw)
     classification = "malformed_or_unverifiable"
     review_status = "rejected"
@@ -224,7 +229,7 @@ def classify_mailbox_message(raw: dict[str, Any], *, now: datetime | None = None
         "message_id": f"{MAILBOX}:{seq}",
         "seq": seq,
         "sender_did": sender,
-        "nonce": nonce,
+        "nonce_text": nonce_text,
         "message_hash": mailbox_message_hash(text),
         "untrusted_text": _safe_text(text),
         "remote_ts": str(raw["ts"]) if raw.get("ts") is not None else None,
@@ -236,6 +241,16 @@ def classify_mailbox_message(raw: dict[str, Any], *, now: datetime | None = None
         "expires_at": expires_at,
         "provenance_json": provenance_json,
     }
+
+
+def _inactive_mailbox_message(item: dict[str, Any]) -> dict[str, Any]:
+    if item["classification"] == "valid_request":
+        return {
+            **item,
+            "classification": "intake_inactive",
+            "review_status": "rejected",
+        }
+    return item
 
 
 class FlopBenchMailboxReject(SafetyError):
@@ -263,13 +278,7 @@ def _safe_classification_from_error(exc: Exception) -> str:
     return "invalid_request"
 
 
-def mailbox_status(*, state_dir: Path) -> dict[str, Any]:
-    assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
-    resolved = state_dir.expanduser().resolve(strict=False)
-    status = migration_status(resolved)
-    cursor = 0
-    pending = 0
-    total = 0
+def _did_note_advertisement_status(state_dir: Path) -> dict[str, Any]:
     namespace, key, _fingerprint = did_profile_path(BENCH_DID)
     expected_note_hash = note_hash(identity_note_value(BENCH_DID))
     latest_ad = latest_did_note_observation(state_dir, namespace=namespace, key=key)
@@ -292,6 +301,154 @@ def mailbox_status(*, state_dir: Path) -> dict[str, Any]:
     else:
         advertised = None
         advertisement_status = "unknown_not_reconciled"
+    return {
+        "advertised": advertised,
+        "advertisement_status": advertisement_status,
+        "advertisement_expected_hash": expected_note_hash,
+    }
+
+
+def _require_reconciled_did_note_advertisement(state_dir: Path) -> dict[str, Any]:
+    status = _did_note_advertisement_status(state_dir)
+    if status["advertised"] is not True:
+        raise SafetyError("mailbox activation requires reconciled DID-note mailbox advertisement")
+    return status
+
+
+def mailbox_activation_preview(*, state_dir: Path) -> dict[str, Any]:
+    assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
+    resolved = state_dir.expanduser().resolve(strict=False)
+    activation = mailbox_activation_state(resolved, mailbox=MAILBOX)
+    advertisement = _did_note_advertisement_status(resolved)
+    status = migration_status(resolved)
+    activation_blockers = []
+    if not status["database_exists"]:
+        activation_blockers.append("state_database_missing")
+    if status["pending_migrations"]:
+        activation_blockers.append("state_schema_migration_required")
+    if advertisement["advertised"] is not True:
+        activation_blockers.append("did_note_advertisement_not_reconciled")
+    can_activate = not activation_blockers
+    return {
+        "ok": True,
+        "mailbox": MAILBOX,
+        "protocol_version": MAILBOX_REQUEST_SCHEMA_VERSION,
+        "protocol": "signed-write-only-room",
+        "creation_required": False,
+        "state_dir": str(resolved),
+        "current_activation": activation,
+        "database_exists": status["database_exists"],
+        "schema_migrations": status["schema_migrations"],
+        "pending_migrations": status["pending_migrations"],
+        "migration_required": bool(status["pending_migrations"]),
+        "activation_blockers": activation_blockers,
+        **advertisement,
+        "activation_consequences": [
+            "valid signed mailbox requests will enter pending_human_review",
+            "approval remains approved_for_manual_execution only",
+            "remote content remains untrusted data",
+        ],
+        "disabled_behaviors": {
+            "state_creation": False,
+            "migration": False,
+            "network": False,
+            "identity_loading": False,
+            "signing": False,
+            "mailbox_creation": False,
+            "polling": False,
+            "execution": False,
+            "reply": False,
+            "posting": False,
+            "router_updates": False,
+            "autonomous_scheduler": False,
+        },
+        "required_confirmation": MAILBOX_ACTIVATE_CONFIRMATION,
+        "can_activate": can_activate,
+        "state_write": False,
+        "network_action": False,
+        "will_sign": False,
+        "will_post": False,
+        "will_execute": False,
+        "will_reply": False,
+        "will_update_router": False,
+    }
+
+
+def mailbox_activate(*, state_dir: Path, confirm: str) -> dict[str, Any]:
+    if confirm != MAILBOX_ACTIVATE_CONFIRMATION:
+        raise SafetyError("mailbox activation requires exact confirmation")
+    assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
+    resolved = state_dir.expanduser().resolve(strict=False)
+    status = migration_status(resolved)
+    if not status["database_exists"]:
+        raise SafetyError("mailbox activation requires existing Bench state database")
+    if status["pending_migrations"]:
+        raise SafetyError("mailbox activation requires migrated Bench state")
+    advertisement = _require_reconciled_did_note_advertisement(resolved)
+    with connect_state(resolved) as conn:
+        activation = record_mailbox_activation(
+            conn,
+            mailbox=MAILBOX,
+            protocol_version=MAILBOX_REQUEST_SCHEMA_VERSION,
+        )
+    return {
+        "ok": True,
+        **activation,
+        **advertisement,
+        "state_dir": str(resolved),
+        "state_write": True,
+        "network_action": False,
+        "will_create_mailbox": False,
+        "will_poll": False,
+        "will_sign": False,
+        "will_post": False,
+        "will_execute": False,
+        "will_reply": False,
+        "will_update_router": False,
+        "autonomous_scheduler": False,
+    }
+
+
+def mailbox_deactivate(*, state_dir: Path, confirm: str) -> dict[str, Any]:
+    if confirm != MAILBOX_DEACTIVATE_CONFIRMATION:
+        raise SafetyError("mailbox deactivation requires exact confirmation")
+    assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
+    resolved = state_dir.expanduser().resolve(strict=False)
+    status = migration_status(resolved)
+    if not status["database_exists"]:
+        raise SafetyError("mailbox deactivation requires existing Bench state database")
+    if status["pending_migrations"]:
+        raise SafetyError("mailbox deactivation requires migrated Bench state")
+    with connect_state(resolved) as conn:
+        activation = record_mailbox_deactivation(conn, mailbox=MAILBOX)
+    return {
+        "ok": True,
+        **activation,
+        "state_dir": str(resolved),
+        "new_valid_request_classification": "intake_inactive",
+        "existing_records_preserved": True,
+        "state_write": True,
+        "network_action": False,
+        "will_create_mailbox": False,
+        "will_poll": False,
+        "will_sign": False,
+        "will_post": False,
+        "will_execute": False,
+        "will_reply": False,
+        "will_update_router": False,
+        "autonomous_scheduler": False,
+    }
+
+
+def mailbox_status(*, state_dir: Path) -> dict[str, Any]:
+    assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
+    resolved = state_dir.expanduser().resolve(strict=False)
+    status = migration_status(resolved)
+    cursor = 0
+    pending = 0
+    total = 0
+    activation = mailbox_activation_state(resolved, mailbox=MAILBOX)
+    advertisement = _did_note_advertisement_status(resolved)
     if status["database_exists"]:
         uri = f"file:{(resolved / STATE_DB).as_posix()}?mode=ro"
         with sqlite3.connect(uri, uri=True) as conn:
@@ -326,9 +483,12 @@ def mailbox_status(*, state_dir: Path) -> dict[str, Any]:
         "mailbox": MAILBOX,
         "protocol": "signed-write-only-room",
         "creation_required": False,
-        "advertised": advertised,
-        "advertisement_status": advertisement_status,
-        "advertisement_expected_hash": expected_note_hash,
+        "activation": activation,
+        "intake_active": activation["active"],
+        "new_valid_request_classification": (
+            "valid_request" if activation["active"] else "intake_inactive"
+        ),
+        **advertisement,
         "cursor": cursor,
         "messages": total,
         "pending_human_review": pending,
@@ -383,6 +543,7 @@ def poll_mailbox(
     started = time.monotonic()
     with connect_state(state_dir) as conn:
         cursor = mailbox_cursor(conn, room=MAILBOX)
+        active = bool(mailbox_activation_state(state_dir, mailbox=MAILBOX)["active"])
     since = cursor
     pages = 0
     items = 0
@@ -449,7 +610,8 @@ def poll_mailbox(
             expected_next += 1
             max_seq = max(max_seq, seq)
             try:
-                classified.append(classify_mailbox_message(raw, now=now))
+                item = classify_mailbox_message(raw, now=now)
+                classified.append(item if active else _inactive_mailbox_message(item))
             except ValidationError:
                 failure = "malformed_response"
                 break
