@@ -55,7 +55,7 @@ While local intake is inactive, otherwise valid requests are stored with `classi
 
 Once local intake is active, valid signed requests enter `pending_human_review`. Human approval changes a pending request to `approved_for_manual_execution` only. Approval does not execute tests, sign responses, post replies, update Router, fetch URLs, or start a scheduler.
 
-Manual execution commands are explicit:
+Manual execution and result-preparation commands are explicit:
 
 ```bash
 flop-bench request execution-preview REQUEST_ID --state-dir PATH
@@ -63,6 +63,13 @@ flop-bench request execute-passive REQUEST_ID --state-dir PATH \
   --confirm EXECUTE-PASSIVE-BENCH-REQUEST
 flop-bench request execution-history --state-dir PATH --limit 20
 flop-bench result preview REQUEST_ID --state-dir PATH
+flop-bench result delivery-preview REQUEST_ID --state-dir PATH
+flop-bench result send REQUEST_ID --state-dir PATH \
+  --destination mb-NAME \
+  --live \
+  --confirm SEND-FLOP-BENCH-RESULT
+flop-bench result history --state-dir PATH --limit 20
+flop-bench result reconcile --state-dir PATH --delivery-id ID
 ```
 
 `execution-preview` is pure and reports all known blockers without creating or migrating state, loading identity material, executing, signing, posting, replying, fetching URLs, or using the network. `execute-passive` requires active intake, `classification: valid_request`, `review_status: approved_for_manual_execution`, unexpired request at execution time, supported service capability, supported passive `test_spec`, exact confirmation, and an atomic one-execution reservation.
@@ -77,7 +84,13 @@ The only Phase E1 remote procedure is:
 
 `actual` and `expected` must be bounded JSON scalars. Bench compares JSON type and canonical JSON value deterministically, so boolean `true` does not equal integer `1`. Strings that contain URLs, commands, imports, paths, shell syntax, or instructions remain inert data. Multiple remote procedures are rejected in v0.1. Remote requests cannot expose or select `approved-local-command`, `file-check`, local command adapters, filesystem adapters, network adapters, shell, subprocess, eval, import, environment access, wallet operations, FLOP transfers, replies, posting, or Router updates. A service capability such as `software.testing` does not grant an execution adapter.
 
-Phase E result delivery is currently unavailable: Bench does not automatically reply to `reply_room`, post results, or publish Router records. `result preview` produces only a bounded offline `flop-bench.mailbox-result.v0.1` envelope after completed execution, with `result_delivery_status: not_sent`, Bench DID, sender DID, optional untrusted `reply_room`, evidence ID/hash, verdict, common-control disclosure, and `independent_evidence: false`.
+Phase E2 result delivery is human-approved only. Bench never automatically replies to `reply_room`, posts results, or publishes Router records. `result delivery-preview` is pure: it does not create or migrate state, load identity material, acquire a nonce, sign, post, use the network, or follow URLs. It requires completed Phase E evidence and reports blockers, destination, message hash/bytes, and the safe canonical result envelope.
+
+Result delivery accepts only the exact request `reply_room` when it is canonical Technocore `mb-*` signed-write-only room syntax and exactly matches CLI `--destination`. `d-*`, `p-*`, `e-*`, URLs, notes, paths, overrides, and inferred destinations are rejected. Existing request `BENCH-E1B-20260901T140608Z` has `reply_room: d-flop-scout`; delivery preview must remain blocked with `unsupported_result_destination`.
+
+The delivered result envelope is canonical single-line JSON containing only schema/version, request ID, original sender DID as `target_did`, Bench DID, verdict, evidence ID/hash, common-control disclosure, `independent_evidence: false`, and URL/code/network safety disclosures. It does not include evidence paths, private state, raw procedures, response bodies, signatures, passphrases, or secrets.
+
+`result send` requires `--live`, exact confirmation, exact destination match, verified Bench identity/passphrase, a fresh locally monotonic nonce serialized as a decimal string in the signed POST body, and an audit row before the first network request. Delivery scans bounded destination history before posting; exact Bench DID plus message hash prevents duplicates. Timeout is audited as `unknown_outcome`; reconciliation attributes delivery by exact DID/hash/nonce and never downgrades a confirmed delivery.
 
 ## Example
 

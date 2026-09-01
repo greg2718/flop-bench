@@ -53,10 +53,15 @@ from flop_bench.engine import router_export, verify_spec
 from flop_bench.exceptions import IsolationError, LedgerError, SafetyError, ValidationError
 from flop_bench.execution import (
     EXECUTE_PASSIVE_CONFIRMATION,
+    RESULT_SEND_CONFIRMATION,
     execute_passive,
     execution_history,
     execution_preview,
+    reconcile_result_delivery,
+    result_delivery_preview,
+    result_history,
     result_preview,
+    send_result_delivery,
 )
 from flop_bench.identity import (
     IDENTITY_CONFIRMATION,
@@ -168,7 +173,8 @@ from flop_bench.state import (
 from flop_bench.transport import DisabledTechnocoreTransport
 
 REPO = Path(__file__).resolve().parents[1]
-SCOUT_PATH = Path("/Users/greg/Dev/flop_scout_v02/flop_scout.py")
+GOLDEN_SCOUT_TECHNOCORE_ORIGIN = "https://technocore.chat"
+GOLDEN_SCOUT_USER_AGENT = "flop-scout/0.3.2"
 
 
 def write_json(path: Path, value: object) -> Path:
@@ -205,7 +211,11 @@ def weak_test_phrase() -> str:
 
 
 def load_scout_module() -> object:
-    spec = importlib.util.spec_from_file_location("flop_scout_readonly", SCOUT_PATH)
+    source = os.environ.get("FLOP_SCOUT_SOURCE")
+    if not source:
+        pytest.skip("set FLOP_SCOUT_SOURCE to run optional cross-repo Scout parity")
+    scout_path = Path(source).expanduser()
+    spec = importlib.util.spec_from_file_location("flop_scout_opt_in", scout_path)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -221,7 +231,45 @@ def scout_signed_post_request_parts(
     nonce: int,
     text: str,
 ) -> dict[str, object]:
+    payload = f"{room}|{nonce}|{text}".encode()
+    sig = b64u(key.sign(payload))
+    body = json.dumps(
+        {"did": did, "sig": sig, "nonce": str(nonce), "text": text},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    request = urllib.request.Request(  # noqa: S310 - fixed Technocore URL in parity test.
+        f"{GOLDEN_SCOUT_TECHNOCORE_ORIGIN}/r/{urllib.parse.quote(room, safe='')}?format=json",
+        data=body,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": GOLDEN_SCOUT_USER_AGENT,
+        },
+    )
+    return {
+        "method": request.get_method(),
+        "url": request.full_url,
+        "body": request.data,
+        "headers": dict(request.header_items()),
+        "sig": sig,
+        "preimage": payload,
+    }
+
+
+def opt_in_scout_signed_post_request_parts(
+    *,
+    did: str,
+    key: Ed25519PrivateKey,
+    room: str,
+    nonce: int,
+    text: str,
+) -> dict[str, object]:
     scout = load_scout_module()
+    for name in ("BASE_URL", "USER_AGENT", "b64u"):
+        if not hasattr(scout, name):
+            raise AssertionError(f"FLOP_SCOUT_SOURCE missing required Scout attribute {name}")
     payload = f"{room}|{nonce}|{text}".encode()
     sig = scout.b64u(key.sign(payload))  # type: ignore[attr-defined]
     body = json.dumps(
@@ -229,7 +277,7 @@ def scout_signed_post_request_parts(
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    request = urllib.request.Request(  # noqa: S310 - fixed Technocore URL in parity test.
+    request = urllib.request.Request(  # noqa: S310 - opt-in source parity test.
         f"{scout.BASE_URL}/r/{urllib.parse.quote(room, safe='')}?format=json",  # type: ignore[attr-defined]
         data=body,
         method="POST",
@@ -309,7 +357,8 @@ class FakeActivationTransport:
                 {},
                 final_url=url,
             )
-        if method == "POST" and parts == ["r", "d-flop-bench"]:
+        if method == "POST" and len(parts) == 2 and parts[0] == "r":
+            room = urllib.parse.unquote(parts[1])
             assert headers["Accept"] == "application/json"
             assert headers["Content-Type"] == "application/json; charset=utf-8"
             assert body is not None
@@ -326,9 +375,9 @@ class FakeActivationTransport:
                 return TransportResponse(
                     status, b"post rejected token=abc123", headers, final_url=url
                 )
-            next_seq = len(self.room_messages.get("d-flop-bench", [])) + 1
+            next_seq = len(self.room_messages.get(room, [])) + 1
             posted_nonce = int(payload["nonce"])
-            self.room_messages.setdefault("d-flop-bench", []).append(
+            self.room_messages.setdefault(room, []).append(
                 {
                     "seq": next_seq,
                     "from": payload["did"],
@@ -1962,6 +2011,37 @@ def test_signed_post_golden_scout_parity_except_user_agent() -> None:
     assert bench_headers == scout_headers
 
 
+def test_signed_post_optional_scout_source_parity_except_user_agent() -> None:
+    key = Ed25519PrivateKey.generate()
+    did = public_did(key)
+    room = "d-flop-bench"
+    nonce = 1_788_096_000_001
+    text = "FLOP Bench golden parity text"
+    scout = opt_in_scout_signed_post_request_parts(
+        did=did,
+        key=key,
+        room=room,
+        nonce=nonce,
+        text=text,
+    )
+    sig = sign_post_message(room=room, nonce=nonce, text=text, key=key)
+    bench_request = urllib.request.Request(  # noqa: S310 - fixed Technocore URL in parity test.
+        post_room_url(room),
+        data=signed_post_body(did=did, sig=sig, nonce=nonce, text=text),
+        method="POST",
+        headers=signed_post_headers(),
+    )
+    assert bench_request.get_method() == scout["method"]
+    assert bench_request.full_url == scout["url"]
+    assert bench_request.data == scout["body"]
+    assert sig == scout["sig"]
+    assert signed_post_preimage(room, nonce, text) == scout["preimage"]
+    bench_headers = dict(bench_request.header_items())
+    scout_headers = dict(scout["headers"])
+    assert bench_headers.pop("User-agent") != scout_headers.pop("User-agent")
+    assert bench_headers == scout_headers
+
+
 def test_protocol_check_is_offline_and_reports_post_limits(tmp_path: Path) -> None:
     state = tmp_path / "state"
     message = tmp_path / "message.txt"
@@ -3483,7 +3563,7 @@ def test_mailbox_activation_preview_pending_activation_migration(tmp_path: Path)
     assert preview["can_activate"] is False
     assert preview["database_exists"] is True
     assert preview["schema_migrations"] == list(range(1, 8))
-    assert preview["pending_migrations"] == [8, 9]
+    assert preview["pending_migrations"] == list(range(8, SCHEMA_VERSION + 1))
     assert preview["migration_required"] is True
     assert preview["activation_blockers"] == ["state_schema_migration_required"]
     assert preview["advertised"] is True
@@ -4716,6 +4796,385 @@ def test_result_preview_schema_purity_and_requires_completed_execution(
     assert after_history == before_history
     assert after_ledger == before_ledger
     Draft202012Validator(MAILBOX_RESULT_SCHEMA).validate(preview)
+
+
+def completed_result_request(
+    tmp_path: Path,
+    *,
+    request_id: str = "result-delivery-e2",
+    reply_room: str = "mb-result-replies",
+) -> tuple[Path, str]:
+    state, sender = approved_literal_request(
+        tmp_path,
+        request_id=request_id,
+        extra={"reply_room": reply_room},
+    )
+    execute_passive(
+        state_dir=state,
+        request_id=request_id,
+        confirm=EXECUTE_PASSIVE_CONFIRMATION,
+    )
+    return state, sender
+
+
+def add_identity_to_state(state: Path) -> tuple[str, str]:
+    passphrase = strong_test_phrase()
+    metadata = create_production_identity(
+        state_dir=state,
+        confirm=IDENTITY_CONFIRMATION,
+        passphrase=passphrase,
+        passphrase_confirmation=passphrase,
+        expected_state_dir=state,
+    )
+    return passphrase, str(metadata["did"])
+
+
+def test_result_delivery_preview_is_pure_and_canonical(tmp_path: Path) -> None:
+    state, sender = completed_result_request(tmp_path)
+    before_db = (state / STATE_DB).read_bytes()
+    before_ledger = (state / "ledger.jsonl").read_text(encoding="utf-8")
+
+    preview = result_delivery_preview(state_dir=state, request_id="result-delivery-e2")
+
+    assert preview["can_send"] is True
+    assert preview["blockers"] == []
+    assert preview["destination"] == "mb-result-replies"
+    assert preview["state_write"] is False
+    assert preview["network_action"] is False
+    assert preview["will_load_private_key"] is False
+    assert preview["will_sign"] is False
+    assert preview["will_acquire_nonce"] is False
+    assert preview["will_post"] is False
+    envelope = preview["result_envelope"]
+    assert set(envelope) == {
+        "schema_version",
+        "request_id",
+        "target_did",
+        "bench_did",
+        "verdict",
+        "evidence_id",
+        "evidence_hash",
+        "common_control_disclosure",
+        "independent_evidence",
+        "urls_followed",
+        "code_executed",
+        "network_action",
+    }
+    assert envelope["target_did"] == sender
+    assert envelope["bench_did"] == BENCH_DID
+    assert preview["result_text"] == json.dumps(envelope, separators=(",", ":"), sort_keys=True)
+    assert "\n" not in preview["result_text"]
+    assert preview["message_hash"] == message_hash(preview["result_text"])
+    assert preview["message_bytes"] == len(preview["result_text"].encode("utf-8"))
+    visible = json.dumps(preview, sort_keys=True)
+    assert "evidence_path" not in visible
+    assert "request_json" not in visible
+    assert (state / STATE_DB).read_bytes() == before_db
+    assert (state / "ledger.jsonl").read_text(encoding="utf-8") == before_ledger
+
+
+def test_result_delivery_preview_blocks_existing_d_room_request(tmp_path: Path) -> None:
+    state, _sender = completed_result_request(
+        tmp_path,
+        request_id="BENCH-E1B-20260901T140608Z",
+        reply_room="d-flop-scout",
+    )
+
+    preview = result_delivery_preview(
+        state_dir=state,
+        request_id="BENCH-E1B-20260901T140608Z",
+    )
+
+    assert preview["can_send"] is False
+    assert preview["destination"] == "d-flop-scout"
+    assert "unsupported_result_destination" in preview["blockers"]
+    assert result_history(state_dir=state, limit=10)["deliveries"] == []
+
+
+def test_result_delivery_requires_completed_evidence_before_key_or_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, _sender = approved_literal_request(
+        tmp_path,
+        request_id="uncompleted-delivery-e2",
+        extra={"reply_room": "mb-result-replies"},
+    )
+
+    def fail_identity_load(*args: object, **kwargs: object) -> object:
+        raise AssertionError("result delivery must not load identity before local gates")
+
+    monkeypatch.setattr("flop_bench.execution.load_production_identity_key", fail_identity_load)
+    transport = FakeActivationTransport()
+    preview = result_delivery_preview(state_dir=state, request_id="uncompleted-delivery-e2")
+    assert preview["can_send"] is False
+    assert "result delivery requires completed execution" in preview["blockers"]
+    with pytest.raises(SafetyError, match="completed execution"):
+        send_result_delivery(
+            state_dir=state,
+            request_id="uncompleted-delivery-e2",
+            destination="mb-result-replies",
+            live=True,
+            confirm=RESULT_SEND_CONFIRMATION,
+            passphrase=strong_test_phrase(),
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=BENCH_DID,
+        )
+    assert transport.requests == []
+    assert result_history(state_dir=state, limit=10)["deliveries"] == []
+
+
+def test_result_delivery_blocks_missing_mismatched_and_non_mb_destinations(
+    tmp_path: Path,
+) -> None:
+    missing_state, _sender = approved_literal_request(
+        tmp_path,
+        request_id="missing-destination-e2",
+    )
+    execute_passive(
+        state_dir=missing_state,
+        request_id="missing-destination-e2",
+        confirm=EXECUTE_PASSIVE_CONFIRMATION,
+    )
+    missing = result_delivery_preview(
+        state_dir=missing_state,
+        request_id="missing-destination-e2",
+    )
+    assert missing["can_send"] is False
+    assert "missing_result_destination" in missing["blockers"]
+
+    non_mb_state, _sender = completed_result_request(
+        tmp_path,
+        request_id="non-mb-destination-e2",
+        reply_room="https://example.test/mb-result-replies",
+    )
+    non_mb = result_delivery_preview(
+        state_dir=non_mb_state,
+        request_id="non-mb-destination-e2",
+    )
+    assert non_mb["can_send"] is False
+    assert "unsupported_result_destination" in non_mb["blockers"]
+
+    state, _sender = completed_result_request(
+        tmp_path,
+        request_id="mismatch-destination-e2",
+        reply_room="mb-result-replies",
+    )
+    passphrase, did = add_identity_to_state(state)
+    transport = FakeActivationTransport()
+    with pytest.raises(SafetyError, match="destination_mismatch"):
+        send_result_delivery(
+            state_dir=state,
+            request_id="mismatch-destination-e2",
+            destination="mb-other-replies",
+            live=True,
+            confirm=RESULT_SEND_CONFIRMATION,
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    assert transport.requests == []
+    assert result_history(state_dir=state, limit=10)["deliveries"] == []
+
+
+def test_result_delivery_send_gates_nonce_body_audit_and_redaction(tmp_path: Path) -> None:
+    state, _sender = completed_result_request(tmp_path, request_id="send-result-e2")
+    passphrase, did = add_identity_to_state(state)
+    preview = result_delivery_preview(state_dir=state, request_id="send-result-e2")
+    transport = FakeActivationTransport()
+    with pytest.raises(SafetyError):
+        send_result_delivery(
+            state_dir=state,
+            request_id="send-result-e2",
+            destination="mb-result-replies",
+            live=False,
+            confirm=RESULT_SEND_CONFIRMATION,
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    with pytest.raises(SafetyError):
+        send_result_delivery(
+            state_dir=state,
+            request_id="send-result-e2",
+            destination="mb-result-replies",
+            live=True,
+            confirm="WRONG",
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    assert transport.requests == []
+    assert result_history(state_dir=state, limit=10)["deliveries"] == []
+
+    result = send_result_delivery(
+        state_dir=state,
+        request_id="send-result-e2",
+        destination="mb-result-replies",
+        live=True,
+        confirm=RESULT_SEND_CONFIRMATION,
+        passphrase=passphrase,
+        transport=transport,
+        expected_state_dir=state,
+        expected_bench_did=did,
+    )
+    assert result["delivery_status"] == "posted"
+    assert result["destination"] == "mb-result-replies"
+    body = transport.post_bodies[0]
+    assert body["did"] == did
+    assert body["text"] == preview["result_text"]
+    assert isinstance(body["nonce"], str)
+    assert (
+        signed_post_preimage(
+            "mb-result-replies",
+            int(body["nonce"]),
+            preview["result_text"],
+        )
+        == f"mb-result-replies|{body['nonce']}|{preview['result_text']}".encode()
+    )
+    public_key_from_did(did).verify(
+        b64u_decode(str(body["sig"])),
+        signed_post_preimage(
+            "mb-result-replies",
+            int(body["nonce"]),
+            preview["result_text"],
+        ),
+    )
+    history = result_history(state_dir=state, limit=10)["deliveries"]
+    assert len(history) == 1
+    audit = history[0]
+    assert audit["delivery_status"] == "posted"
+    assert audit["message_hash"] == preview["message_hash"]
+    visible = json.dumps(history, sort_keys=True)
+    assert preview["result_text"] not in visible
+    assert str(body["sig"]) not in visible
+    assert passphrase not in visible
+    assert "evidence_path" not in visible
+
+
+def test_result_delivery_send_idempotency_timeout_and_reconciliation_are_monotonic(
+    tmp_path: Path,
+) -> None:
+    state, _sender = completed_result_request(tmp_path, request_id="idem-result-e2")
+    passphrase, did = add_identity_to_state(state)
+    preview = result_delivery_preview(state_dir=state, request_id="idem-result-e2")
+    already = FakeActivationTransport()
+    already.room_messages["mb-result-replies"] = [
+        {"seq": 7, "from": did, "text": preview["result_text"], "nonce": 111}
+    ]
+    dup = send_result_delivery(
+        state_dir=state,
+        request_id="idem-result-e2",
+        destination="mb-result-replies",
+        live=True,
+        confirm=RESULT_SEND_CONFIRMATION,
+        passphrase=passphrase,
+        transport=already,
+        expected_state_dir=state,
+        expected_bench_did=did,
+    )
+    assert dup["delivery_status"] == "already-posted"
+    assert already.post_bodies == []
+
+    timeout_state, _sender = completed_result_request(
+        tmp_path,
+        request_id="timeout-result-e2",
+    )
+    timeout_passphrase, timeout_did = add_identity_to_state(timeout_state)
+    timeout_transport = FakeActivationTransport()
+    timeout_transport.timeout_after_accept = True
+    with pytest.raises(SafetyError):
+        send_result_delivery(
+            state_dir=timeout_state,
+            request_id="timeout-result-e2",
+            destination="mb-result-replies",
+            live=True,
+            confirm=RESULT_SEND_CONFIRMATION,
+            passphrase=timeout_passphrase,
+            transport=timeout_transport,
+            expected_state_dir=timeout_state,
+            expected_bench_did=timeout_did,
+        )
+    row = result_history(state_dir=timeout_state, limit=1)["deliveries"][0]
+    assert row["delivery_status"] == "unknown_outcome"
+    assert row["failure_classification"] == "post_outcome_unknown_timeout"
+    reconcile = reconcile_result_delivery(
+        state_dir=timeout_state,
+        delivery_id=row["id"],
+        transport=timeout_transport,
+        expected_bench_did=timeout_did,
+    )
+    after = result_history(state_dir=timeout_state, limit=1)["deliveries"][0]
+    assert reconcile["reconciliation_status"] == "reconciled_posted"
+    assert reconcile["audit_transition"] == "updated"
+    assert after["delivery_status"] == "reconciled_posted"
+    assert after["failure_classification"] is None
+
+    absent = FakeActivationTransport()
+    weaker = reconcile_result_delivery(
+        state_dir=timeout_state,
+        delivery_id=row["id"],
+        transport=absent,
+        expected_bench_did=timeout_did,
+    )
+    preserved = result_history(state_dir=timeout_state, limit=1)["deliveries"][0]
+    assert weaker["audit_transition"] == "preserved"
+    assert preserved["delivery_status"] == "reconciled_posted"
+
+
+def test_result_delivery_response_nonce_must_be_integer(tmp_path: Path) -> None:
+    state, _sender = completed_result_request(tmp_path, request_id="nonce-result-e2")
+    passphrase, did = add_identity_to_state(state)
+
+    class StringResponseNonceTransport(FakeActivationTransport):
+        def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            body: bytes | None = None,
+            headers: dict[str, str] | None = None,
+            timeout: float = 20.0,
+        ) -> TransportResponse:
+            response = super().request(
+                method,
+                url,
+                body=body,
+                headers=headers,
+                timeout=timeout,
+            )
+            if method == "POST" and response.status == 200:
+                parsed = json.loads(response.body.decode("utf-8"))
+                parsed["posted"]["nonce"] = str(parsed["posted"]["nonce"])
+                return TransportResponse(
+                    response.status,
+                    json.dumps(parsed, separators=(",", ":")).encode(),
+                    response.headers,
+                    final_url=response.final_url,
+                )
+            return response
+
+    transport = StringResponseNonceTransport()
+    with pytest.raises(SafetyError, match="returned posted record"):
+        send_result_delivery(
+            state_dir=state,
+            request_id="nonce-result-e2",
+            destination="mb-result-replies",
+            live=True,
+            confirm=RESULT_SEND_CONFIRMATION,
+            passphrase=passphrase,
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=did,
+        )
+    row = result_history(state_dir=state, limit=1)["deliveries"][0]
+    assert isinstance(transport.post_bodies[0]["nonce"], str)
+    assert row["delivery_status"] == "failed"
+    assert row["failure_classification"] == "unverifiable_post"
 
 
 def test_execution_does_not_shell_import_eval_network_file_or_url_from_remote_spec(

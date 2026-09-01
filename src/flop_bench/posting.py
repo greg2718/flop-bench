@@ -49,6 +49,7 @@ MAX_HISTORY_SCAN_SECONDS = 20.0
 MAX_TECHNOCORE_NONCE_DIGITS = 19
 URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
 STRONG_POST_STATUSES = frozenset({"posted", "reconciled_posted", "already-posted"})
+TECHNOCORE_MB_ROOM_RE = re.compile(r"^mb-[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$")
 
 
 def service_manifest(*, state_dir: Path | None = None) -> dict[str, Any]:
@@ -223,9 +224,16 @@ def exact_message_match(raw: dict[str, Any], *, expected_did: str, digest: str) 
     return parsed["seq"] if isinstance(parsed["seq"], int) else None
 
 
+def validate_signed_write_room(room: str) -> None:
+    if room == CANONICAL_ROOM:
+        return
+    if TECHNOCORE_MB_ROOM_RE.fullmatch(room):
+        return
+    raise SafetyError("signed posts are restricted to d-flop-bench or canonical mb-* rooms")
+
+
 def signed_post_preimage(room: str, nonce: int, text: str) -> bytes:
-    if room != CANONICAL_ROOM:
-        raise SafetyError("signed posts are restricted to d-flop-bench")
+    validate_signed_write_room(room)
     return f"{room}|{nonce}|{text}".encode()
 
 
@@ -263,14 +271,12 @@ def sign_post_message(*, room: str, nonce: int, text: str, key: Any) -> str:
 
 
 def post_room_url(room: str = CANONICAL_ROOM) -> str:
-    if room != CANONICAL_ROOM:
-        raise SafetyError("signed posts are restricted to d-flop-bench")
+    validate_signed_write_room(room)
     return f"{TECHNOCORE_ORIGIN}/r/{quote(room)}?format=json"
 
 
 def room_history_url(room: str = CANONICAL_ROOM, *, limit: int, since: int | None = None) -> str:
-    if room != CANONICAL_ROOM:
-        raise SafetyError("room history is restricted to d-flop-bench")
+    validate_signed_write_room(room)
     if not 1 <= limit <= ROOM_HISTORY_PAGE_LIMIT:
         raise SafetyError("room history limit is outside the supported bound")
     query = f"format=json&limit={limit}"
@@ -284,6 +290,7 @@ def scan_room_history_for_hash(
     *,
     expected_did: str,
     digest: str,
+    room: str = CANONICAL_ROOM,
     attempt_nonce: int | None = None,
     max_pages: int = MAX_HISTORY_PAGES,
     page_limit: int = ROOM_HISTORY_PAGE_LIMIT,
@@ -308,7 +315,7 @@ def scan_room_history_for_hash(
         if time.monotonic() - started > max_seconds:
             failure = "history_scan_timeout"
             break
-        url = room_history_url(limit=page_limit, since=since)
+        url = room_history_url(room, limit=page_limit, since=since)
         try:
             response = transport.request("GET", url, headers=headers)
         except ActivationRequestError as exc:

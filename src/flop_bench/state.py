@@ -10,7 +10,7 @@ from typing import Any, cast
 
 from .exceptions import SafetyError
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 STATE_DB = "state.sqlite"
 SQLITE_SIGNED_64_MAX = 9_223_372_036_854_775_807
 PRIVATE_FILE_MODE = 0o600
@@ -26,6 +26,7 @@ PRIVATE_STATE_FILENAMES = (
 MAILBOX_CURSOR_KEY = "mailbox:mb-flop-bench:cursor"
 MAILBOX_INTAKE_ACTIVATION_TABLE = "mailbox_intake_activation"
 MAILBOX_EXECUTION_TABLE = "mailbox_request_executions"
+RESULT_DELIVERY_TABLE = "mailbox_result_deliveries"
 
 
 def private_state_paths(state_dir: Path) -> list[Path]:
@@ -254,6 +255,87 @@ def post_attempt(state_dir: Path, *, attempt_id: int) -> dict[str, Any]:
     return dict(row)
 
 
+def result_delivery_history(state_dir: Path, *, limit: int) -> dict[str, Any]:
+    if limit < 1 or limit > 100:
+        raise SafetyError("result delivery history limit must be between 1 and 100")
+    resolved = state_dir.expanduser().resolve(strict=False)
+    status = migration_status(resolved)
+    if not status["database_exists"]:
+        return {
+            "ok": True,
+            "state_dir": str(resolved),
+            "state_write": False,
+            "network_action": False,
+            "limit": limit,
+            "deliveries": [],
+            "permission_issues": status["permission_issues"],
+        }
+    uri = f"file:{(resolved / STATE_DB).as_posix()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (RESULT_DELIVERY_TABLE,),
+        ).fetchone()
+        if table_exists is None:
+            rows: list[sqlite3.Row] = []
+        else:
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT id, request_id, destination, bench_did, target_did,
+                           message_hash, delivery_status, request_timestamp,
+                           response_status, nonce_used, seq, failure_classification
+                    FROM mailbox_result_deliveries
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+            )
+    return {
+        "ok": True,
+        "state_dir": str(resolved),
+        "state_write": False,
+        "network_action": False,
+        "limit": limit,
+        "deliveries": [dict(row) for row in rows],
+        "permission_issues": status["permission_issues"],
+    }
+
+
+def result_delivery_attempt(state_dir: Path, *, delivery_id: int) -> dict[str, Any]:
+    if delivery_id < 1:
+        raise SafetyError("result delivery id must be positive")
+    resolved = state_dir.expanduser().resolve(strict=False)
+    status = migration_status(resolved)
+    if not status["database_exists"]:
+        raise SafetyError("result delivery state database does not exist")
+    uri = f"file:{(resolved / STATE_DB).as_posix()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (RESULT_DELIVERY_TABLE,),
+        ).fetchone()
+        if table_exists is None:
+            row = None
+        else:
+            row = conn.execute(
+                """
+                SELECT id, request_id, destination, bench_did, target_did,
+                       message_hash, delivery_status, request_timestamp,
+                       response_status, nonce_used, seq, failure_classification
+                FROM mailbox_result_deliveries
+                WHERE id = ?
+                """,
+                (delivery_id,),
+            ).fetchone()
+    if row is None:
+        raise SafetyError("result delivery not found")
+    return dict(row)
+
+
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
 
@@ -476,6 +558,45 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
             """
         )
         applied.append(9)
+    if current < 10:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS mailbox_result_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                bench_did TEXT NOT NULL,
+                target_did TEXT NOT NULL,
+                message_hash TEXT NOT NULL,
+                delivery_status TEXT NOT NULL,
+                request_timestamp TEXT NOT NULL,
+                response_status INTEGER,
+                nonce_used INTEGER,
+                seq INTEGER,
+                failure_classification TEXT,
+                CHECK (
+                    delivery_status IN (
+                        'started',
+                        'failed_preflight',
+                        'posted',
+                        'already-posted',
+                        'failed',
+                        'failed_pre_transmission',
+                        'unknown_outcome',
+                        'confirmed_rejected',
+                        'reconciled_posted',
+                        'reconciled_absent'
+                    )
+                )
+            );
+            CREATE INDEX IF NOT EXISTS idx_mailbox_result_deliveries_request_id
+                ON mailbox_result_deliveries(request_id, id);
+            CREATE INDEX IF NOT EXISTS idx_mailbox_result_deliveries_hash
+                ON mailbox_result_deliveries(destination, bench_did, message_hash, id);
+            INSERT OR IGNORE INTO schema_migrations(version) VALUES (10);
+            """
+        )
+        applied.append(10)
     conn.commit()
     return applied
 
@@ -881,6 +1002,81 @@ def update_post_attempt(
         WHERE id = ?
         """,
         (post_status, response_status, nonce_used, seq, failure_classification, post_id),
+    )
+    conn.commit()
+
+
+def record_result_delivery_attempt(
+    conn: sqlite3.Connection,
+    *,
+    request_id: str,
+    destination: str,
+    bench_did: str,
+    target_did: str,
+    message_hash: str,
+    delivery_status: str,
+    response_status: int | None,
+    nonce_used: int | None,
+    seq: int | None,
+    failure_classification: str | None,
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO mailbox_result_deliveries(
+            request_id, destination, bench_did, target_did, message_hash,
+            delivery_status, request_timestamp, response_status, nonce_used,
+            seq, failure_classification
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            request_id,
+            destination,
+            bench_did,
+            target_did,
+            message_hash,
+            delivery_status,
+            datetime.now(UTC).isoformat(),
+            response_status,
+            nonce_used,
+            seq,
+            failure_classification,
+        ),
+    )
+    conn.commit()
+    if cursor.lastrowid is None:
+        raise SafetyError("result delivery audit insert did not return an id")
+    return int(cursor.lastrowid)
+
+
+def update_result_delivery_attempt(
+    conn: sqlite3.Connection,
+    *,
+    delivery_id: int,
+    delivery_status: str,
+    response_status: int | None,
+    nonce_used: int | None,
+    seq: int | None,
+    failure_classification: str | None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE mailbox_result_deliveries
+        SET delivery_status = ?,
+            response_status = ?,
+            nonce_used = ?,
+            seq = ?,
+            failure_classification = ?
+        WHERE id = ?
+        """,
+        (
+            delivery_status,
+            response_status,
+            nonce_used,
+            seq,
+            failure_classification,
+            delivery_id,
+        ),
     )
     conn.commit()
 
