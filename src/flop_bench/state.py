@@ -10,8 +10,9 @@ from typing import Any, cast
 
 from .exceptions import SafetyError
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 STATE_DB = "state.sqlite"
+SQLITE_SIGNED_64_MAX = 9_223_372_036_854_775_807
 PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_STATE_FILENAMES = (
@@ -23,6 +24,7 @@ PRIVATE_STATE_FILENAMES = (
     "activity.jsonl",
 )
 MAILBOX_CURSOR_KEY = "mailbox:mb-flop-bench:cursor"
+MAILBOX_INTAKE_ACTIVATION_TABLE = "mailbox_intake_activation"
 
 
 def private_state_paths(state_dir: Path) -> list[Path]:
@@ -251,6 +253,32 @@ def post_attempt(state_dir: Path, *, attempt_id: int) -> dict[str, Any]:
     return dict(row)
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate_mailbox_nonce_text(conn: sqlite3.Connection) -> None:
+    table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mailbox_messages'"
+    ).fetchone()
+    if table is None:
+        return
+    columns = _table_columns(conn, "mailbox_messages")
+    if "nonce_text" not in columns:
+        try:
+            conn.execute("ALTER TABLE mailbox_messages ADD COLUMN nonce_text TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).casefold():
+                raise
+    conn.execute(
+        """
+        UPDATE mailbox_messages
+        SET nonce_text = CAST(nonce AS TEXT)
+        WHERE nonce_text IS NULL AND nonce IS NOT NULL
+        """
+    )
+
+
 def migrate(conn: sqlite3.Connection) -> list[int]:
     applied: list[int] = []
     conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)")
@@ -385,8 +413,218 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
             """
         )
         applied.append(6)
+    if current < 7:
+        _migrate_mailbox_nonce_text(conn)
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (7)")
+        applied.append(7)
+    if current < 8:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS mailbox_intake_activation (
+                mailbox TEXT PRIMARY KEY,
+                protocol_version TEXT NOT NULL,
+                activation_status TEXT NOT NULL,
+                activated_at TEXT NOT NULL,
+                activated_by TEXT NOT NULL,
+                execution_mode TEXT NOT NULL,
+                autonomous_polling INTEGER NOT NULL,
+                autonomous_execution INTEGER NOT NULL,
+                autonomous_reply INTEGER NOT NULL,
+                router_updates INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT OR IGNORE INTO schema_migrations(version) VALUES (8);
+            """
+        )
+        applied.append(8)
     conn.commit()
     return applied
+
+
+def _mailbox_activation_row_dict(row: sqlite3.Row | None, *, mailbox: str) -> dict[str, Any]:
+    defaults: dict[str, Any] = {
+        "protocol_version": "flop-bench.mailbox-request.v0.1",
+        "mailbox": mailbox,
+        "activation_status": "inactive",
+        "activated_at": None,
+        "activated_by": "human_operator",
+        "execution_mode": "manual_only",
+        "autonomous_polling": False,
+        "autonomous_execution": False,
+        "autonomous_reply": False,
+        "router_updates": False,
+        "updated_at": None,
+        "active": False,
+    }
+    if row is None:
+        return defaults
+    result = dict(row)
+    for key in (
+        "autonomous_polling",
+        "autonomous_execution",
+        "autonomous_reply",
+        "router_updates",
+    ):
+        result[key] = bool(result[key])
+    result["active"] = result["activation_status"] == "active"
+    return {**defaults, **result}
+
+
+def mailbox_activation_state(state_dir: Path, *, mailbox: str) -> dict[str, Any]:
+    resolved = state_dir.expanduser().resolve(strict=False)
+    status = migration_status(resolved)
+    if not status["database_exists"]:
+        return {
+            **_mailbox_activation_row_dict(None, mailbox=mailbox),
+            "state_dir": str(resolved),
+            "database_exists": False,
+            "state_write": False,
+            "network_action": False,
+            "permission_issues": status["permission_issues"],
+        }
+    uri = f"file:{(resolved / STATE_DB).as_posix()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        table_exists = conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'mailbox_intake_activation'
+            """
+        ).fetchone()
+        row = None
+        if table_exists is not None:
+            row = conn.execute(
+                """
+                SELECT protocol_version, mailbox, activation_status, activated_at,
+                       activated_by, execution_mode, autonomous_polling,
+                       autonomous_execution, autonomous_reply, router_updates, updated_at
+                FROM mailbox_intake_activation
+                WHERE mailbox = ?
+                """,
+                (mailbox,),
+            ).fetchone()
+    return {
+        **_mailbox_activation_row_dict(row, mailbox=mailbox),
+        "state_dir": str(resolved),
+        "database_exists": True,
+        "state_write": False,
+        "network_action": False,
+        "permission_issues": status["permission_issues"],
+    }
+
+
+def record_mailbox_activation(
+    conn: sqlite3.Connection,
+    *,
+    mailbox: str,
+    protocol_version: str,
+) -> dict[str, Any]:
+    now = datetime.now(UTC).isoformat()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            """
+            SELECT activation_status, activated_at
+            FROM mailbox_intake_activation
+            WHERE mailbox = ?
+            """,
+            (mailbox,),
+        ).fetchone()
+        activated_at = (
+            str(row["activated_at"])
+            if row is not None and row["activation_status"] == "active"
+            else now
+        )
+        conn.execute(
+            """
+            INSERT INTO mailbox_intake_activation(
+                mailbox, protocol_version, activation_status, activated_at,
+                activated_by, execution_mode, autonomous_polling, autonomous_execution,
+                autonomous_reply, router_updates, updated_at
+            )
+            VALUES (?, ?, 'active', ?, 'human_operator', 'manual_only', 0, 0, 0, 0, ?)
+            ON CONFLICT(mailbox) DO UPDATE SET
+                protocol_version = excluded.protocol_version,
+                activation_status = 'active',
+                activated_at = ?,
+                activated_by = 'human_operator',
+                execution_mode = 'manual_only',
+                autonomous_polling = 0,
+                autonomous_execution = 0,
+                autonomous_reply = 0,
+                router_updates = 0,
+                updated_at = excluded.updated_at
+            """,
+            (mailbox, protocol_version, activated_at, now, activated_at),
+        )
+        result = conn.execute(
+            """
+            SELECT protocol_version, mailbox, activation_status, activated_at,
+                   activated_by, execution_mode, autonomous_polling,
+                   autonomous_execution, autonomous_reply, router_updates, updated_at
+            FROM mailbox_intake_activation
+            WHERE mailbox = ?
+            """,
+            (mailbox,),
+        ).fetchone()
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    return _mailbox_activation_row_dict(result, mailbox=mailbox)
+
+
+def record_mailbox_deactivation(conn: sqlite3.Connection, *, mailbox: str) -> dict[str, Any]:
+    now = datetime.now(UTC).isoformat()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing = conn.execute(
+            """
+            SELECT activated_at
+            FROM mailbox_intake_activation
+            WHERE mailbox = ?
+            """,
+            (mailbox,),
+        ).fetchone()
+        activated_at = str(existing["activated_at"]) if existing is not None else now
+        conn.execute(
+            """
+            INSERT INTO mailbox_intake_activation(
+                mailbox, protocol_version, activation_status, activated_at,
+                activated_by, execution_mode, autonomous_polling, autonomous_execution,
+                autonomous_reply, router_updates, updated_at
+            )
+            VALUES (
+                ?, 'flop-bench.mailbox-request.v0.1', 'inactive', ?,
+                'human_operator', 'manual_only', 0, 0, 0, 0, ?
+            )
+            ON CONFLICT(mailbox) DO UPDATE SET
+                activation_status = 'inactive',
+                activated_by = 'human_operator',
+                execution_mode = 'manual_only',
+                autonomous_polling = 0,
+                autonomous_execution = 0,
+                autonomous_reply = 0,
+                router_updates = 0,
+                updated_at = excluded.updated_at
+            """,
+            (mailbox, activated_at, now),
+        )
+        result = conn.execute(
+            """
+            SELECT protocol_version, mailbox, activation_status, activated_at,
+                   activated_by, execution_mode, autonomous_polling,
+                   autonomous_execution, autonomous_reply, router_updates, updated_at
+            FROM mailbox_intake_activation
+            WHERE mailbox = ?
+            """,
+            (mailbox,),
+        ).fetchone()
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    return _mailbox_activation_row_dict(result, mailbox=mailbox)
 
 
 def insert_run(
@@ -633,24 +871,31 @@ def store_mailbox_poll(
     conn.execute("BEGIN IMMEDIATE")
     try:
         for item in messages:
+            nonce_text = item.get("nonce_text")
+            nonce_integer: int | None = None
+            if isinstance(nonce_text, str):
+                nonce_value = int(nonce_text)
+                if nonce_value <= SQLITE_SIGNED_64_MAX:
+                    nonce_integer = nonce_value
             before = conn.total_changes
             try:
                 conn.execute(
                     """
                     INSERT INTO mailbox_messages(
-                        message_id, room, seq, sender_did, nonce, message_hash,
+                        message_id, room, seq, sender_did, nonce, nonce_text, message_hash,
                         untrusted_text, remote_ts, authentication_level, request_id,
                         requested_capability, classification, review_status,
                         received_at, expires_at, provenance_json, evidence_id, result_link
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
                     """,
                     (
                         item["message_id"],
                         room,
                         item["seq"],
                         item.get("sender_did"),
-                        item.get("nonce"),
+                        nonce_integer,
+                        nonce_text,
                         item["message_hash"],
                         item["untrusted_text"],
                         item.get("remote_ts"),
@@ -676,19 +921,20 @@ def store_mailbox_poll(
                     conn.execute(
                         """
                         INSERT OR IGNORE INTO mailbox_messages(
-                            message_id, room, seq, sender_did, nonce, message_hash,
+                            message_id, room, seq, sender_did, nonce, nonce_text, message_hash,
                             untrusted_text, remote_ts, authentication_level, request_id,
                             requested_capability, classification, review_status,
                             received_at, expires_at, provenance_json, evidence_id, result_link
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL)
                         """,
                         (
                             fallback["message_id"],
                             room,
                             fallback["seq"],
                             fallback.get("sender_did"),
-                            fallback.get("nonce"),
+                            nonce_integer,
+                            nonce_text,
                             fallback["message_hash"],
                             fallback["untrusted_text"],
                             fallback.get("remote_ts"),
@@ -725,6 +971,18 @@ def store_mailbox_poll(
     }
 
 
+def _mailbox_row_dict(row: sqlite3.Row) -> dict[str, Any]:
+    result = dict(row)
+    nonce_text = result.pop("nonce_text", None)
+    if nonce_text is not None:
+        result["nonce_decimal"] = str(nonce_text)
+        if result.get("nonce") is None:
+            result["nonce"] = str(nonce_text)
+    elif result.get("nonce") is not None:
+        result["nonce_decimal"] = str(result["nonce"])
+    return result
+
+
 def mailbox_messages_history(state_dir: Path, *, limit: int) -> dict[str, Any]:
     if limit < 1 or limit > 100:
         raise SafetyError("mailbox message limit must be between 1 and 100")
@@ -752,7 +1010,7 @@ def mailbox_messages_history(state_dir: Path, *, limit: int) -> dict[str, Any]:
             rows = list(
                 conn.execute(
                     """
-                    SELECT message_id, room, seq, sender_did, nonce, message_hash,
+                    SELECT message_id, room, seq, sender_did, nonce, nonce_text, message_hash,
                            authentication_level, request_id, requested_capability,
                            classification, review_status, received_at, expires_at,
                            evidence_id, result_link
@@ -769,7 +1027,7 @@ def mailbox_messages_history(state_dir: Path, *, limit: int) -> dict[str, Any]:
         "state_write": False,
         "network_action": False,
         "limit": limit,
-        "messages": [dict(row) for row in rows],
+        "messages": [_mailbox_row_dict(row) for row in rows],
         "permission_issues": status["permission_issues"],
     }
 
@@ -784,7 +1042,7 @@ def mailbox_message_detail(state_dir: Path, *, message_id: str) -> dict[str, Any
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             """
-            SELECT message_id, room, seq, sender_did, nonce, message_hash,
+            SELECT message_id, room, seq, sender_did, nonce, nonce_text, message_hash,
                    untrusted_text, remote_ts, authentication_level, request_id,
                    requested_capability, classification, review_status,
                    received_at, expires_at, provenance_json, evidence_id, result_link
@@ -795,7 +1053,7 @@ def mailbox_message_detail(state_dir: Path, *, message_id: str) -> dict[str, Any
         ).fetchone()
     if row is None:
         raise SafetyError("mailbox message not found")
-    result = dict(row)
+    result = _mailbox_row_dict(row)
     if result["provenance_json"]:
         result["provenance"] = json.loads(result.pop("provenance_json"))
     return result

@@ -33,6 +33,9 @@ from .identity_note import (
 )
 from .ledger import verify_ledger
 from .mailbox import (
+    mailbox_activate,
+    mailbox_activation_preview,
+    mailbox_deactivate,
     mailbox_inspect,
     mailbox_messages,
     mailbox_status,
@@ -44,6 +47,12 @@ from .mailbox import (
 )
 from .posting import POST_CONFIRMATION, preview_post, protocol_check_post, reconcile_post, send_post
 from .posting import history as post_history
+from .provenance import (
+    export_room,
+    provenance_doctor,
+    verify_export_file,
+    verify_record_file,
+)
 from .schemas import validate_test_spec
 from .service import (
     dry_run_sign_payload,
@@ -181,6 +190,14 @@ def build_parser() -> argparse.ArgumentParser:
     post_reconcile.add_argument("--attempt-id", required=True, type=int)
     mailbox = sub.add_parser("mailbox")
     mailbox_sub = mailbox.add_subparsers(dest="mailbox_cmd", required=True)
+    mailbox_activation_preview_cmd = mailbox_sub.add_parser("activation-preview")
+    mailbox_activation_preview_cmd.add_argument("--state-dir", required=True, type=Path)
+    mailbox_activate_cmd = mailbox_sub.add_parser("activate")
+    mailbox_activate_cmd.add_argument("--state-dir", required=True, type=Path)
+    mailbox_activate_cmd.add_argument("--confirm", required=True)
+    mailbox_deactivate_cmd = mailbox_sub.add_parser("deactivate")
+    mailbox_deactivate_cmd.add_argument("--state-dir", required=True, type=Path)
+    mailbox_deactivate_cmd.add_argument("--confirm", required=True)
     mailbox_status_cmd = mailbox_sub.add_parser("status")
     mailbox_status_cmd.add_argument("--state-dir", required=True, type=Path)
     mailbox_poll_cmd = mailbox_sub.add_parser("poll")
@@ -205,6 +222,17 @@ def build_parser() -> argparse.ArgumentParser:
     identity_note_publish.add_argument("--state-dir", required=True, type=Path)
     identity_note_publish.add_argument("--live", action="store_true")
     identity_note_publish.add_argument("--confirm", required=True, choices=[DID_NOTE_CONFIRMATION])
+    provenance = sub.add_parser("provenance")
+    provenance_sub = provenance.add_subparsers(dest="provenance_cmd", required=True)
+    provenance_sub.add_parser("doctor")
+    provenance_verify_record = provenance_sub.add_parser("verify-record")
+    provenance_verify_record.add_argument("json_file", type=Path)
+    provenance_verify_export = provenance_sub.add_parser("verify-export")
+    provenance_verify_export.add_argument("jsonl_file", type=Path)
+    provenance_verify_export.add_argument("--manifest", required=True, type=Path)
+    provenance_export_room = provenance_sub.add_parser("export-room")
+    provenance_export_room.add_argument("room")
+    provenance_export_room.add_argument("--yes", action="store_true")
     return parser
 
 
@@ -351,6 +379,12 @@ def run(argv: list[str] | None = None) -> int:
             )
         elif args.cmd == "mailbox" and args.mailbox_cmd == "status":
             _print_json(mailbox_status(state_dir=args.state_dir))
+        elif args.cmd == "mailbox" and args.mailbox_cmd == "activation-preview":
+            _print_json(mailbox_activation_preview(state_dir=args.state_dir))
+        elif args.cmd == "mailbox" and args.mailbox_cmd == "activate":
+            _print_json(mailbox_activate(state_dir=args.state_dir, confirm=args.confirm))
+        elif args.cmd == "mailbox" and args.mailbox_cmd == "deactivate":
+            _print_json(mailbox_deactivate(state_dir=args.state_dir, confirm=args.confirm))
         elif args.cmd == "mailbox" and args.mailbox_cmd == "poll":
             _print_json(
                 poll_mailbox(
@@ -387,6 +421,20 @@ def run(argv: list[str] | None = None) -> int:
                     live=args.live,
                     confirm=args.confirm,
                     transport=UrlLibActivationTransport(),
+                )
+            )
+        elif args.cmd == "provenance" and args.provenance_cmd == "doctor":
+            _print_json(provenance_doctor())
+        elif args.cmd == "provenance" and args.provenance_cmd == "verify-record":
+            _print_json(verify_record_file(args.json_file))
+        elif args.cmd == "provenance" and args.provenance_cmd == "verify-export":
+            _print_json(verify_export_file(args.jsonl_file, args.manifest))
+        elif args.cmd == "provenance" and args.provenance_cmd == "export-room":
+            _print_json(
+                export_room(
+                    args.room,
+                    yes=args.yes,
+                    transport=UrlLibActivationTransport() if args.yes else None,
                 )
             )
         else:

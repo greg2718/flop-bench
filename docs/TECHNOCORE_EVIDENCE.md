@@ -12,7 +12,7 @@ This caches local protocol evidence. Do not fetch the web for routine future wor
 - Signing preimage: `room|nonce|text` encoded as UTF-8 bytes.
 - DID encoding: Ed25519 `did:key` with multicodec prefix.
 - Signature encoding: unpadded base64url Ed25519 signature.
-- Nonce semantics: locally generated and audited signed-POST nonces are integers; Scout and Bench serialize signed-POST request-body `nonce` as a decimal string without changing the `room|nonce|text` signature preimage. Successful room-history/posted-record `nonce` is an integer; bool, string, float, missing, or mismatched response nonces fail closed. Room ownership writes use nonce greater than `/kv/room-nonce/{room}`.
+- Nonce semantics: locally generated and audited signed-POST nonces are integers; Scout and Bench serialize signed-POST request-body `nonce` as a decimal string without changing the `room|nonce|text` signature preimage. Successful room-history/posted-record `nonce` is a JSON integer with 1-19 decimal digits. Bench rejects bool, string, float, zero, negative, oversized, missing, or mismatched response nonces for attribution; mailbox storage preserves valid remote nonce digits as canonical decimal text and mirrors only SQLite signed-64-compatible values into the legacy integer column. Room ownership writes use nonce greater than `/kv/room-nonce/{room}`.
 - Current post length limit from Scout code: 4096 characters after Scout message normalization. Bench additionally enforces 4096 UTF-8 bytes.
 - Room ownership endpoint: `/kv/room-owners/{room}/set-signed/{did}/{sig}/{nonce}/{value}?if_absent=1`.
 - Room ownership preimage: `room-owners|{room}|{nonce}|{did}`.
@@ -32,7 +32,7 @@ This caches local protocol evidence. Do not fetch the web for routine future wor
 
 - Live production failures may still arise from network, TLS, proxy, redirect, or Technocore server behavior not reproducible offline.
 - DID profile notes are unsigned convention metadata and do not cryptographically prove ownership; authoritative Bench identity evidence remains signed DID activity and owned room evidence.
-- Mailbox polling semantics are not implemented or production-tested.
+- Mailbox polling semantics are implemented as bounded read-only history scans but have not been production-tested by this implementation.
 
 ## Source URLs And Local Sources
 

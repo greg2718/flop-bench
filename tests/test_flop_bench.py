@@ -53,6 +53,7 @@ from flop_bench.engine import router_export, verify_spec
 from flop_bench.exceptions import IsolationError, LedgerError, SafetyError, ValidationError
 from flop_bench.identity import (
     IDENTITY_CONFIRMATION,
+    b64u,
     create_ephemeral_test_identity,
     create_production_identity,
     public_did,
@@ -74,8 +75,13 @@ from flop_bench.identity_note import (
 )
 from flop_bench.ledger import append_record, verify_ledger
 from flop_bench.mailbox import (
+    MAILBOX_ACTIVATE_CONFIRMATION,
+    MAILBOX_DEACTIVATE_CONFIRMATION,
     MAILBOX_REQUEST_SCHEMA_VERSION,
     classify_authentication,
+    mailbox_activate,
+    mailbox_activation_preview,
+    mailbox_deactivate,
     mailbox_inspect,
     mailbox_messages,
     mailbox_status,
@@ -117,8 +123,18 @@ from flop_bench.protocol import (
     sign_envelope,
     verify_signed_envelope,
 )
+from flop_bench.provenance import (
+    UNKNOWN_LEGACY,
+    export_room,
+    provenance_doctor,
+    technocore_signed_post_preimage,
+    verify_export_file,
+    verify_record_file,
+    verify_record_mapping,
+)
 from flop_bench.schemas import (
     EVIDENCE_BUNDLE_SCHEMA,
+    MAILBOX_REQUEST_SCHEMA,
     ROUTER_EXPORT_SCHEMA,
     TEST_SPEC_SCHEMA,
     validate_test_spec,
@@ -133,7 +149,14 @@ from flop_bench.service import (
     verify_request,
     verify_signed_response,
 )
-from flop_bench.state import activation_history, connect_state, migration_status
+from flop_bench.state import (
+    SCHEMA_VERSION,
+    STATE_DB,
+    activation_history,
+    connect_state,
+    migration_status,
+    record_did_note_observation,
+)
 from flop_bench.transport import DisabledTechnocoreTransport
 
 REPO = Path(__file__).resolve().parents[1]
@@ -1685,7 +1708,8 @@ def test_post_manifest_and_preview_are_pure(tmp_path: Path) -> None:
     assert preview["manifest"] == manifest
     assert manifest["bench_did"] == BENCH_DID
     assert manifest["room"] == "d-flop-bench"
-    assert manifest["mailbox"]["status"] == "protocol-unconfirmed"
+    assert manifest["mailbox"]["status"] == "signed-write-only-room"
+    assert manifest["mailbox"]["activation_status"] == "inactive"
     assert manifest["safety"]["url_following"] is False
     assert manifest["safety"]["automatic_code_execution"] is False
     assert manifest["safety"]["wallets"] is False
@@ -2410,6 +2434,36 @@ def test_reconcile_reports_missing_null_and_malformed_remote_nonce(tmp_path: Pat
         assert result["matched_nonce"] is None
 
 
+def test_room_history_remote_nonce_accepts_documented_19_digit_range() -> None:
+    did = public_did(Ed25519PrivateKey.generate())
+    cases = [
+        (9_223_372_036_854_775_807, True),
+        (9_223_372_036_854_775_808, True),
+        (9_999_999_999_999_999_999, True),
+        (10_000_000_000_000_000_000, False),
+    ]
+    for idx, (nonce, should_match) in enumerate(cases, start=1):
+        text = f"FLOP Bench nonce edge {idx}"
+        transport = FakeActivationTransport()
+        transport.room_messages["d-flop-bench"] = [
+            {"seq": idx, "from": did, "text": text, "nonce": nonce}
+        ]
+        result = scan_room_history_for_hash(
+            transport,
+            expected_did=did,
+            digest=message_hash(text),
+            attempt_nonce=nonce,
+        )
+        assert result["history_scan_complete"] is True
+        assert result["exact_match_found"] is True
+        assert result["exact_attempt_match"] is should_match
+        if should_match:
+            assert result["matched_nonce"] == nonce
+        else:
+            assert result["matched_nonce"] is None
+            assert result["matching_message_unattributable_nonce"] == {"seq": idx, "nonce": None}
+
+
 def test_unverified_did_field_is_not_treated_as_verified_from() -> None:
     did = public_did(Ed25519PrivateKey.generate())
     text = "FLOP Bench unsigned did field"
@@ -2850,7 +2904,7 @@ def test_service_doctor_read_only_does_not_create_or_migrate_state(tmp_path: Pat
     assert report["database_exists"] is False
     assert report["permission_issues"] == []
     assert report["schema_migrations"] == []
-    assert report["pending_migrations"] == [1, 2, 3, 4, 5, 6]
+    assert report["pending_migrations"] == [1, 2, 3, 4, 5, 6, 7, 8]
     assert not state.exists()
 
 
@@ -2859,8 +2913,8 @@ def test_service_doctor_reports_migrations_applied_and_plan_is_read_only(tmp_pat
     report = service_doctor(state_dir=state)
     assert report["read_only"] is False
     assert report["state_write"] is True
-    assert report["migrations_applied"] == [1, 2, 3, 4, 5, 6]
-    assert report["schema_migrations"] == [1, 2, 3, 4, 5, 6]
+    assert report["migrations_applied"] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert report["schema_migrations"] == [1, 2, 3, 4, 5, 6, 7, 8]
     status = migration_status(state)
     assert status["pending_migrations"] == []
     plan = plan_init(state_dir=state)
@@ -2877,13 +2931,13 @@ def test_service_doctor_read_only_reports_outdated_state_without_migrating(tmp_p
     read_only = service_doctor(state_dir=state, read_only=True)
     assert read_only["state_write"] is False
     assert read_only["schema_migrations"] == [1]
-    assert read_only["pending_migrations"] == [2, 3, 4, 5, 6]
+    assert read_only["pending_migrations"] == [2, 3, 4, 5, 6, 7, 8]
     after_read_only = migration_status(state)
     assert after_read_only["schema_migrations"] == [1]
     normal = service_doctor(state_dir=state)
     assert normal["state_write"] is True
-    assert normal["migrations_applied"] == [2, 3, 4, 5, 6]
-    assert normal["schema_migrations"] == [1, 2, 3, 4, 5, 6]
+    assert normal["migrations_applied"] == [2, 3, 4, 5, 6, 7, 8]
+    assert normal["schema_migrations"] == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
 def test_private_state_database_and_sidecar_permissions(tmp_path: Path) -> None:
@@ -3264,6 +3318,23 @@ def write_bench_identity_json(state: Path) -> None:
     )
 
 
+def write_reconciled_did_note_observation(state: Path) -> None:
+    namespace, key, _fingerprint = did_profile_path(BENCH_DID)
+    expected_hash = note_hash(identity_note_value(BENCH_DID))
+    with connect_state(state) as conn:
+        record_did_note_observation(
+            conn,
+            namespace=namespace,
+            key=key,
+            expected_hash=expected_hash,
+            observed_hash=expected_hash,
+            action="reconcile",
+            status="already-matching",
+            response_status=200,
+            failure_classification=None,
+        )
+
+
 def test_mailbox_capability_validation_uses_advertised_service_capabilities() -> None:
     sender = public_did(Ed25519PrivateKey.generate())
     assert BENCH_SERVICE_CAPABILITIES == (
@@ -3295,8 +3366,348 @@ def test_mailbox_capability_validation_uses_advertised_service_capabilities() ->
             )
 
 
+def test_mailbox_activation_preview_is_pure(tmp_path: Path) -> None:
+    state = tmp_path / "missing-state"
+    preview = mailbox_activation_preview(state_dir=state)
+    assert preview["mailbox"] == "mb-flop-bench"
+    assert preview["protocol_version"] == MAILBOX_REQUEST_SCHEMA_VERSION
+    assert preview["can_activate"] is False
+    assert preview["database_exists"] is False
+    assert preview["schema_migrations"] == []
+    assert preview["pending_migrations"] == list(range(1, SCHEMA_VERSION + 1))
+    assert preview["migration_required"] is True
+    assert preview["activation_blockers"] == [
+        "state_database_missing",
+        "state_schema_migration_required",
+        "did_note_advertisement_not_reconciled",
+    ]
+    assert preview["current_activation"]["activation_status"] == "inactive"
+    assert preview["disabled_behaviors"]["network"] is False
+    assert preview["disabled_behaviors"]["identity_loading"] is False
+    assert preview["disabled_behaviors"]["mailbox_creation"] is False
+    assert preview["state_write"] is False
+    assert preview["network_action"] is False
+    assert preview["will_sign"] is False
+    assert preview["will_execute"] is False
+    assert not state.exists()
+
+
+def test_mailbox_activation_preview_pending_activation_migration(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    db_path = state / STATE_DB
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TABLE mailbox_intake_activation")
+        conn.execute("DELETE FROM schema_migrations WHERE version = 8")
+        conn.commit()
+    before = db_path.read_bytes()
+    before_mtime = db_path.stat().st_mtime_ns
+    preview = mailbox_activation_preview(state_dir=state)
+    assert preview["can_activate"] is False
+    assert preview["database_exists"] is True
+    assert preview["schema_migrations"] == list(range(1, 8))
+    assert preview["pending_migrations"] == [8]
+    assert preview["migration_required"] is True
+    assert preview["activation_blockers"] == ["state_schema_migration_required"]
+    assert preview["advertised"] is True
+    assert preview["advertisement_status"] == "already-matching"
+    assert preview["current_activation"]["activation_status"] == "inactive"
+    assert db_path.read_bytes() == before
+    assert db_path.stat().st_mtime_ns == before_mtime
+
+
+def test_mailbox_activation_preview_fully_migrated_inactive_ready(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    preview = mailbox_activation_preview(state_dir=state)
+    assert preview["can_activate"] is True
+    assert preview["activation_blockers"] == []
+    assert preview["database_exists"] is True
+    assert preview["schema_migrations"] == list(range(1, SCHEMA_VERSION + 1))
+    assert preview["pending_migrations"] == []
+    assert preview["migration_required"] is False
+    assert preview["current_activation"]["activation_status"] == "inactive"
+
+
+def test_mailbox_activation_preview_already_active(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
+    preview = mailbox_activation_preview(state_dir=state)
+    assert preview["can_activate"] is True
+    assert preview["activation_blockers"] == []
+    assert preview["current_activation"]["activation_status"] == "active"
+    assert preview["current_activation"]["active"] is True
+
+
+def test_mailbox_activation_preview_unreconciled_advertisement(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    with connect_state(state):
+        pass
+    preview = mailbox_activation_preview(state_dir=state)
+    assert preview["can_activate"] is False
+    assert preview["migration_required"] is False
+    assert preview["activation_blockers"] == ["did_note_advertisement_not_reconciled"]
+    assert preview["advertised"] is None
+    assert preview["advertisement_status"] == "unknown_not_reconciled"
+
+
+def test_mailbox_activation_preview_multiple_blockers(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    with connect_state(state):
+        pass
+    db_path = state / STATE_DB
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TABLE mailbox_intake_activation")
+        conn.execute("DELETE FROM schema_migrations WHERE version = 8")
+        conn.commit()
+    preview = mailbox_activation_preview(state_dir=state)
+    assert preview["can_activate"] is False
+    assert preview["database_exists"] is True
+    assert preview["migration_required"] is True
+    assert preview["activation_blockers"] == [
+        "state_schema_migration_required",
+        "did_note_advertisement_not_reconciled",
+    ]
+
+
+def test_mailbox_activation_wrong_confirmation_and_missing_advertisement_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "state"
+    with connect_state(state) as conn:
+        assert [int(row[0]) for row in conn.execute("SELECT version FROM schema_migrations")]
+    with pytest.raises(SafetyError):
+        mailbox_activate(state_dir=state, confirm="wrong")
+    with pytest.raises(SafetyError) as exc:
+        mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
+    assert "DID-note" in str(exc.value)
+
+    def fail_identity_load(*args: object, **kwargs: object) -> object:
+        raise AssertionError("activation must not load identity material")
+
+    monkeypatch.setattr("flop_bench.identity.load_production_identity_key", fail_identity_load)
+    write_reconciled_did_note_observation(state)
+    activated = mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
+    assert activated["activation_status"] == "active"
+    assert activated["network_action"] is False
+    assert activated["will_create_mailbox"] is False
+    assert activated["will_poll"] is False
+
+
+def test_mailbox_activation_success_idempotency_private_permissions_and_manifest(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    first = mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
+    second = mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
+    assert first["activation_status"] == "active"
+    assert second["activation_status"] == "active"
+    assert second["activated_at"] == first["activated_at"]
+    assert first["execution_mode"] == "manual_only"
+    assert first["autonomous_polling"] is False
+    assert first["autonomous_execution"] is False
+    assert first["autonomous_reply"] is False
+    assert first["router_updates"] is False
+    assert (state / "state.sqlite").stat().st_mode & 0o777 == 0o600
+    assert (state / "state.sqlite-wal").stat().st_mode & 0o777 == 0o600
+    status = mailbox_status(state_dir=state)
+    manifest = service_manifest(state_dir=state)
+    assert status["intake_active"] is True
+    assert manifest["mailbox"]["active"] is True
+    assert manifest["safety"]["requests_accepted"] is True
+    assert manifest["safety"]["autonomous_polling"] is False
+    assert manifest["safety"]["autonomous_reply"] is False
+    assert manifest["safety"]["router_updates"] is False
+
+
+def test_mailbox_deactivation_preserves_existing_requests_and_blocks_new_intake(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
+    sender = public_did(Ed25519PrivateKey.generate())
+    first_transport = FakeActivationTransport()
+    first_transport.room_messages["mb-flop-bench"] = [
+        {
+            "seq": 1,
+            "from": sender,
+            "nonce": 1,
+            "text": mailbox_request_text(sender_did=sender, request_id="active-req"),
+        }
+    ]
+    poll_mailbox(state_dir=state, network=True, transport=first_transport, sleep_on_429=False)
+    deactivated = mailbox_deactivate(
+        state_dir=state,
+        confirm=MAILBOX_DEACTIVATE_CONFIRMATION,
+    )
+    assert deactivated["activation_status"] == "inactive"
+    second_transport = FakeActivationTransport()
+    second_transport.room_messages["mb-flop-bench"] = [
+        {
+            "seq": 2,
+            "from": sender,
+            "nonce": 2,
+            "text": mailbox_request_text(sender_did=sender, request_id="inactive-req"),
+        }
+    ]
+    result = poll_mailbox(state_dir=state, network=True, transport=second_transport)
+    assert result["ok"] is True
+    messages = mailbox_messages(state_dir=state, limit=10)["messages"]
+    by_request = {item["request_id"]: item for item in messages}
+    assert by_request["active-req"]["review_status"] == "pending_human_review"
+    assert by_request["inactive-req"]["classification"] == "intake_inactive"
+    assert by_request["inactive-req"]["review_status"] == "rejected"
+    assert request_queue(state_dir=state)["requests"][0]["request_id"] == "active-req"
+
+
+def test_mailbox_active_request_pending_review_lifecycle_remains_non_executing(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
+    sender = public_did(Ed25519PrivateKey.generate())
+    marker = tmp_path / "must-not-exist"
+    transport = FakeActivationTransport()
+    transport.room_messages["mb-flop-bench"] = [
+        {
+            "seq": 1,
+            "from": sender,
+            "nonce": 1,
+            "text": mailbox_request_text(
+                sender_did=sender,
+                request_id="active-lifecycle",
+                extra={
+                    "test_spec": spec(
+                        tmp_path,
+                        [
+                            {
+                                "adapter": "local_command",
+                                "argv": [
+                                    sys.executable,
+                                    "-c",
+                                    f"open({str(marker)!r}, 'w').write('bad')",
+                                ],
+                                "cwd": str(tmp_path),
+                            }
+                        ],
+                        mode="approved-local",
+                    )
+                },
+            ),
+        }
+    ]
+    polled = poll_mailbox(state_dir=state, network=True, transport=transport, sleep_on_429=False)
+    approved = request_approve(
+        state_dir=state,
+        request_id="active-lifecycle",
+        confirm="APPROVE-BENCH-REQUEST",
+    )
+    assert polled["will_sign"] is False
+    assert polled["will_post"] is False
+    assert polled["will_acquire_nonce"] is False
+    assert polled["followed_urls"] is False
+    assert polled["executed_remote_content"] is False
+    assert approved["will_execute"] is False
+    assert approved["will_reply"] is False
+    assert approved["will_update_router"] is False
+    assert not marker.exists()
+    assert all(method == "GET" for method, _url in transport.requests)
+    assert transport.post_bodies == []
+    assert transport.note_bodies == []
+
+
+def test_mailbox_schema_and_parser_agree_on_example() -> None:
+    schema_file = json.loads((REPO / "schemas" / "mailbox-request-v0.1.json").read_text())
+    assert schema_file == MAILBOX_REQUEST_SCHEMA
+    sender = public_did(Ed25519PrivateKey.generate())
+    payload = json.loads(
+        mailbox_request_text(
+            sender_did=sender,
+            extra={"reply_room": "mb-fictional-replies", "operator_group": None},
+        )
+    )
+    errors = sorted(Draft202012Validator(schema_file).iter_errors(payload), key=str)
+    assert errors == []
+    parsed = parse_mailbox_envelope(
+        json.dumps(payload, separators=(",", ":")),
+        remote_sender=sender,
+    )
+    assert parsed["request_id"] == payload["request_id"]
+    bad_payload = {**payload, "extra": True}
+    assert list(Draft202012Validator(schema_file).iter_errors(bad_payload))
+    with pytest.raises(ValidationError):
+        parse_mailbox_envelope(json.dumps(bad_payload, separators=(",", ":")), remote_sender=sender)
+
+
+def test_mailbox_cli_activation_and_no_autonomous_scheduler(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    preview = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "mailbox",
+            "activation-preview",
+            "--state-dir",
+            str(state),
+        ],
+        cwd=REPO,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert preview.returncode == 0
+    parsed_preview = json.loads(preview.stdout)
+    assert parsed_preview["state_write"] is False
+    activate = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "mailbox",
+            "activate",
+            "--state-dir",
+            str(state),
+            "--confirm",
+            MAILBOX_ACTIVATE_CONFIRMATION,
+        ],
+        cwd=REPO,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert activate.returncode == 0
+    parsed_activate = json.loads(activate.stdout)
+    assert parsed_activate["autonomous_scheduler"] is False
+    assert parsed_activate["will_poll"] is False
+
+
 def test_mailbox_service_capability_does_not_authorize_actions(tmp_path: Path) -> None:
     state = tmp_path / "state"
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
     sender = public_did(Ed25519PrivateKey.generate())
     marker = tmp_path / "must-not-exist"
     transport = FakeActivationTransport()
@@ -3390,6 +3801,10 @@ def test_mailbox_unused_404_and_empty_mailbox_advance_safely(tmp_path: Path) -> 
 
 def test_mailbox_canonical_parsing_authentication_and_pending_review(tmp_path: Path) -> None:
     state = tmp_path / "state"
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
     sender = public_did(Ed25519PrivateKey.generate())
     text = mailbox_request_text(sender_did=sender)
     transport = FakeActivationTransport()
@@ -3419,6 +3834,247 @@ def test_mailbox_canonical_parsing_authentication_and_pending_review(tmp_path: P
     assert inspected["nonce"] == 123
     assert inspected["remote_text_is_untrusted"] is True
     assert inspected["urls_followed"] is False
+
+
+def test_mailbox_nonce_storage_preserves_19_digit_decimal_text(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    sender = public_did(Ed25519PrivateKey.generate())
+    edge_nonces = [
+        9_223_372_036_854_775_807,
+        9_223_372_036_854_775_808,
+        9_999_999_999_999_999_999,
+    ]
+    transport = FakeActivationTransport()
+    transport.room_messages["mb-flop-bench"] = [
+        {
+            "seq": idx,
+            "from": sender,
+            "nonce": nonce,
+            "text": mailbox_request_text(sender_did=sender, request_id=f"nonce-edge-{idx}"),
+        }
+        for idx, nonce in enumerate(edge_nonces, start=1)
+    ]
+    result = poll_mailbox(
+        state_dir=state,
+        network=True,
+        transport=transport,
+        sleep_on_429=False,
+    )
+    assert result["ok"] is True
+    messages = mailbox_messages(state_dir=state, limit=10)["messages"]
+    by_seq = {item["seq"]: item for item in messages}
+    assert by_seq[1]["nonce"] == edge_nonces[0]
+    assert by_seq[1]["nonce_decimal"] == str(edge_nonces[0])
+    assert by_seq[2]["nonce"] == str(edge_nonces[1])
+    assert by_seq[2]["nonce_decimal"] == str(edge_nonces[1])
+    assert by_seq[3]["nonce"] == str(edge_nonces[2])
+    assert by_seq[3]["nonce_decimal"] == "9999999999999999999"
+    inspected = mailbox_inspect(state_dir=state, message_id="mb-flop-bench:3")
+    assert inspected["nonce"] == "9999999999999999999"
+    assert inspected["nonce_decimal"] == "9999999999999999999"
+    with sqlite3.connect(state / "state.sqlite") as conn:
+        conn.row_factory = sqlite3.Row
+        rows = list(
+            conn.execute("SELECT seq, nonce, nonce_text FROM mailbox_messages ORDER BY seq")
+        )
+    assert rows[0]["nonce"] == edge_nonces[0]
+    assert rows[0]["nonce_text"] == str(edge_nonces[0])
+    assert rows[1]["nonce"] is None
+    assert rows[1]["nonce_text"] == str(edge_nonces[1])
+    assert rows[2]["nonce"] is None
+    assert rows[2]["nonce_text"] == "9999999999999999999"
+
+
+def test_mailbox_malformed_and_oversized_nonce_do_not_abort_poll(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    sender = public_did(Ed25519PrivateKey.generate())
+    text = mailbox_request_text(sender_did=sender)
+    bad_nonces: list[object] = [
+        False,
+        0,
+        -1,
+        1.0,
+        "1",
+        "+1",
+        " 1",
+        "01",
+        10_000_000_000_000_000_000,
+    ]
+    transport = FakeActivationTransport()
+    transport.room_messages["mb-flop-bench"] = [
+        {"seq": idx, "from": sender, "nonce": nonce, "text": text}
+        for idx, nonce in enumerate(bad_nonces, start=1)
+    ]
+    result = poll_mailbox(
+        state_dir=state,
+        network=True,
+        transport=transport,
+        sleep_on_429=False,
+    )
+    assert result["ok"] is True
+    assert result["cursor_after"] == len(bad_nonces)
+    assert result["inserted"] == len(bad_nonces)
+    messages = mailbox_messages(state_dir=state, limit=20)["messages"]
+    assert {item["authentication_level"] for item in messages} == {"malformed_or_unverifiable"}
+    assert {item["classification"] for item in messages} == {"malformed_or_unverifiable"}
+    assert all(item["review_status"] == "rejected" for item in messages)
+    assert all(item["nonce"] is None for item in messages)
+    assert all("nonce_decimal" not in item for item in messages)
+
+
+def test_mailbox_nonce_migration_dedup_and_inspection_preserve_integer_records(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    db_path = state / "state.sqlite"
+    sender = public_did(Ed25519PrivateKey.generate())
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+            INSERT INTO schema_migrations(version) VALUES (1),(2),(3),(4),(5),(6);
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE mailbox_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id TEXT NOT NULL UNIQUE,
+                room TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                sender_did TEXT,
+                nonce INTEGER,
+                message_hash TEXT NOT NULL,
+                untrusted_text TEXT NOT NULL,
+                remote_ts TEXT,
+                authentication_level TEXT NOT NULL,
+                request_id TEXT,
+                requested_capability TEXT,
+                classification TEXT NOT NULL,
+                review_status TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                expires_at TEXT,
+                provenance_json TEXT,
+                evidence_id TEXT,
+                result_link TEXT,
+                UNIQUE(room, seq)
+            );
+            CREATE UNIQUE INDEX idx_mailbox_messages_request_id
+                ON mailbox_messages(request_id)
+                WHERE request_id IS NOT NULL;
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO mailbox_messages(
+                message_id, room, seq, sender_did, nonce, message_hash,
+                untrusted_text, remote_ts, authentication_level, request_id,
+                requested_capability, classification, review_status,
+                received_at, expires_at, provenance_json, evidence_id, result_link
+            )
+            VALUES (?, 'mb-flop-bench', 1, ?, 123, ?, '{}', NULL,
+                    'server_verified_signed_lane', 'legacy-req', 'software.testing',
+                    'valid_request', 'pending_human_review', ?, NULL, NULL, NULL, NULL)
+            """,
+            ("mb-flop-bench:1", sender, message_hash("{}"), datetime.now(UTC).isoformat()),
+        )
+        conn.execute(
+            """
+            INSERT INTO metadata(key, value, updated_at)
+            VALUES ('mailbox:mb-flop-bench:cursor', '1', ?)
+            """,
+            (datetime.now(UTC).isoformat(),),
+        )
+        conn.commit()
+
+    with connect_state(state) as conn:
+        first_applied = [
+            int(row[0]) for row in conn.execute("SELECT version FROM schema_migrations")
+        ]
+    with connect_state(state) as conn:
+        second_applied = [
+            int(row[0]) for row in conn.execute("SELECT version FROM schema_migrations")
+        ]
+    assert first_applied == second_applied
+    assert 7 in first_applied
+
+    history = mailbox_messages(state_dir=state, limit=10)["messages"]
+    assert history[0]["nonce"] == 123
+    assert history[0]["nonce_decimal"] == "123"
+    inspected = mailbox_inspect(state_dir=state, message_id="mb-flop-bench:1")
+    assert inspected["nonce"] == 123
+    assert inspected["nonce_decimal"] == "123"
+
+    transport = FakeActivationTransport()
+    transport.room_messages["mb-flop-bench"] = [
+        {
+            "seq": 2,
+            "from": sender,
+            "nonce": 9_999_999_999_999_999_999,
+            "text": mailbox_request_text(sender_did=sender, request_id="legacy-req"),
+        },
+        {
+            "seq": 3,
+            "from": sender,
+            "nonce": 9_999_999_999_999_999_999,
+            "text": mailbox_request_text(sender_did=sender, request_id="fresh-req"),
+        },
+    ]
+    result = poll_mailbox(
+        state_dir=state,
+        network=True,
+        transport=transport,
+        sleep_on_429=False,
+    )
+    assert result["ok"] is True
+    assert result["cursor_before"] == 1
+    assert result["cursor_after"] == 3
+    assert result["inserted"] == 2
+    assert result["duplicate_request_ids"] == 1
+    inspected_huge = mailbox_inspect(state_dir=state, message_id="mb-flop-bench:3")
+    assert inspected_huge["nonce"] == "9999999999999999999"
+    assert inspected_huge["nonce_decimal"] == "9999999999999999999"
+
+
+def test_mailbox_nonce_handling_never_uses_float_rounding(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
+    sender = public_did(Ed25519PrivateKey.generate())
+    precise = 9_999_999_999_999_999_999
+    transport = FakeActivationTransport()
+    transport.room_messages["mb-flop-bench"] = [
+        {
+            "seq": 1,
+            "from": sender,
+            "nonce": precise,
+            "text": mailbox_request_text(sender_did=sender, request_id="precise-int"),
+        },
+        {
+            "seq": 2,
+            "from": sender,
+            "nonce": float(precise),
+            "text": mailbox_request_text(sender_did=sender, request_id="rounded-float"),
+        },
+    ]
+    result = poll_mailbox(
+        state_dir=state,
+        network=True,
+        transport=transport,
+        sleep_on_429=False,
+    )
+    assert result["ok"] is True
+    first = mailbox_inspect(state_dir=state, message_id="mb-flop-bench:1")
+    second = mailbox_inspect(state_dir=state, message_id="mb-flop-bench:2")
+    assert first["nonce_decimal"] == "9999999999999999999"
+    assert first["classification"] == "valid_request"
+    assert "nonce_decimal" not in second
+    assert second["classification"] == "malformed_or_unverifiable"
+    assert second["review_status"] == "rejected"
 
 
 def test_mailbox_poll_pagination_duplicates_and_request_id_replay(tmp_path: Path) -> None:
@@ -3567,6 +4223,10 @@ def test_mailbox_unverified_from_is_not_treated_as_signed_lane(tmp_path: Path) -
 
 def test_request_approval_and_rejection_are_local_status_only(tmp_path: Path) -> None:
     state = tmp_path / "state"
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
     sender = public_did(Ed25519PrivateKey.generate())
     transport = FakeActivationTransport()
     transport.room_messages["mb-flop-bench"] = [
@@ -3936,6 +4596,339 @@ def test_identity_note_publish_audits_safe_lifecycle_and_ambiguous_outcome(
             for row in conn.execute("SELECT status FROM did_note_observations ORDER BY id")
         ]
     assert statuses == ["publish_started", "publish_unknown"]
+
+
+def signed_technocore_record(
+    key: Ed25519PrivateKey,
+    *,
+    room: str = "d-flop-bench",
+    generation: str = "4",
+    seq: int = 1,
+    nonce: int = 123,
+    text: str = "I traced a Technocore signed POST failure.",
+) -> dict[str, object]:
+    did = public_did(key)
+    sig = b64u(key.sign(technocore_signed_post_preimage(room, nonce, text)))
+    return {
+        "room": room,
+        "generation": generation,
+        "seq": seq,
+        "ts": "2026-08-31T12:00:00Z",
+        "from": did,
+        "nonce": nonce,
+        "sig": sig,
+        "text": text,
+    }
+
+
+def test_provenance_doctor_is_local_and_read_only() -> None:
+    result = provenance_doctor()
+    assert result["status"] == "OK"
+    assert result["canonical_payload"] == "room|nonce|text"
+    assert result["generation_aware"] is True
+    assert result["private_key_required"] is False
+    assert result["network_action"] is False
+    assert result["state_write"] is False
+
+
+def test_provenance_verify_record_statuses_and_generation_identity(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    record = signed_technocore_record(key, text="Run tests for the signed POST nonce bug.")
+    path = write_json(tmp_path / "record.json", record)
+    verified = verify_record_file(path)
+    assert verified["room"] == "d-flop-bench"
+    assert verified["generation"] == "4"
+    assert verified["seq"] == 1
+    assert verified["sig_present"] is True
+    assert verified["verification_status"] == "VERIFIED_OFFLINE"
+    assert verified["canonical_payload_hash"]
+    altered = dict(record)
+    altered["text"] = "Run altered tests for the signed POST nonce bug."
+    assert verify_record_mapping(altered)["verification_status"] == "INVALID_SIGNATURE"
+    legacy = {
+        "room": "d-flop-bench",
+        "seq": 2,
+        "from": str(record["from"]),
+        "text": "Legacy server-verified record",
+        "signed": True,
+    }
+    legacy_result = verify_record_mapping(legacy)
+    assert legacy_result["generation"] == UNKNOWN_LEGACY
+    assert legacy_result["verification_status"] == "LEGACY_SERVER_VERIFIED_NO_SIGNATURE"
+
+
+def test_provenance_official_export_record_uses_manifest_context(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    record = signed_technocore_record(
+        key,
+        text="Exact official Technocore export text; do not trim or normalize.",
+    )
+    official = {key: value for key, value in record.items() if key not in {"room", "generation"}}
+    raw_line = json.dumps(official, separators=(",", ":")) + "\n"
+    export_path = tmp_path / "official.jsonl"
+    export_path.write_text(raw_line, encoding="utf-8")
+    before = export_path.read_bytes()
+    manifest_path = write_json(
+        tmp_path / "manifest.json",
+        {
+            "room": "d-flop-bench",
+            "generation": "1",
+            "export_sha256": hashlib.sha256(before).hexdigest(),
+            "record_count": 1,
+            "signed_records": 1,
+            "verified_records": 1,
+            "legacy_records_without_sig": 0,
+            "unsigned_records": 0,
+            "invalid_signatures": 0,
+        },
+    )
+    result = verify_export_file(export_path, manifest_path)
+    assert result["room"] == "d-flop-bench"
+    assert result["generation"] == "1"
+    assert result["observed_records"] == 1
+    assert result["signed"] == 1
+    assert result["verified_offline"] == 1
+    assert result["invalid_signatures"] == 0
+    assert result["malformed"] == 0
+    assert result["record_parsing"] == "PASS"
+    assert result["signature_verification"] == "PASS"
+    assert result["result"] == "PASS"
+    assert export_path.read_bytes() == before
+
+
+def test_provenance_conflicting_from_and_did_fails_closed() -> None:
+    key = Ed25519PrivateKey.generate()
+    other_key = Ed25519PrivateKey.generate()
+    record = signed_technocore_record(key)
+    record["did"] = public_did(other_key)
+    result = verify_record_mapping(record)
+    assert result["verification_status"] == "PROVENANCE_INCOMPLETE"
+    assert result["provenance_conflict"] is True
+
+
+def test_provenance_verify_record_never_opens_private_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    path = write_json(tmp_path / "record.json", signed_technocore_record(key))
+    original_open = Path.open
+
+    def refuse_identity_open(self: Path, *args: object, **kwargs: object) -> object:
+        if self.name == "identity.pem":
+            raise AssertionError("identity.pem must not be opened")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", refuse_identity_open)
+    assert verify_record_file(path)["verification_status"] == "VERIFIED_OFFLINE"
+
+
+def test_provenance_verify_export_counts_and_preserves_raw_jsonl(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    good = signed_technocore_record(key, seq=1, text="Run tests for the signed POST nonce bug.")
+    bad = dict(good)
+    bad["seq"] = 2
+    bad["text"] = "Tampered after signing."
+    legacy = {
+        "room": "d-flop-bench",
+        "generation": "4",
+        "seq": 3,
+        "from": str(good["from"]),
+        "signed": True,
+        "text": "Legacy server verified without original signature.",
+    }
+    unsigned = {
+        "room": "d-flop-bench",
+        "generation": "4",
+        "seq": 4,
+        "from": str(good["from"]),
+        "text": "Unsigned record.",
+    }
+    export_path = tmp_path / "export.jsonl"
+    export_path.write_text(
+        "\n".join(json.dumps(item) for item in [good, bad, legacy, unsigned]) + "\n{not-json\n",
+        encoding="utf-8",
+    )
+    before = export_path.read_bytes()
+    manifest_path = write_json(
+        tmp_path / "manifest.json", {"export_sha256": hashlib.sha256(before).hexdigest()}
+    )
+    result = verify_export_file(export_path, manifest_path)
+    assert result["room"] == "d-flop-bench"
+    assert result["generation"] == "4"
+    assert result["records"] == 4
+    assert result["verified_offline"] == 1
+    assert result["legacy_without_sig"] == 1
+    assert result["unsigned"] == 1
+    assert result["invalid_signatures"] == 1
+    assert result["malformed"] == 1
+    assert result["result"] == "FAIL"
+    assert export_path.read_bytes() == before
+
+
+def test_provenance_verify_export_detects_conflicting_generation_seq(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    first = signed_technocore_record(key, seq=5, text="Run tests for the signed POST nonce bug.")
+    second = signed_technocore_record(key, seq=5, text="Debug a different signed POST bug.")
+    export_path = tmp_path / "conflict.jsonl"
+    export_path.write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n", encoding="utf-8")
+    manifest_path = write_json(
+        tmp_path / "manifest.json",
+        {"sha256": hashlib.sha256(export_path.read_bytes()).hexdigest()},
+    )
+    result = verify_export_file(export_path, manifest_path)
+    assert result["conflicts"] == 1
+    assert result["result"] == "FAIL"
+
+
+def test_provenance_verify_export_detects_old_manifest_count_mismatch(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    record = signed_technocore_record(key)
+    official = {key: value for key, value in record.items() if key not in {"room", "generation"}}
+    export_path = tmp_path / "official.jsonl"
+    export_path.write_text(json.dumps(official) + "\n", encoding="utf-8")
+    manifest_path = write_json(
+        tmp_path / "manifest.json",
+        {
+            "room": "d-flop-bench",
+            "generation": "1",
+            "export_sha256": hashlib.sha256(export_path.read_bytes()).hexdigest(),
+            "record_count": 0,
+            "signed_records": 0,
+            "verified_records": 0,
+        },
+    )
+    result = verify_export_file(export_path, manifest_path)
+    assert result["raw_export_integrity"] == "PASS"
+    assert result["record_parsing"] == "PASS"
+    assert result["signature_verification"] == "PASS"
+    assert result["manifest_statistics"] == "MISMATCH"
+    assert result["result"] == "MANIFEST_MISMATCH"
+    assert result["manifest_record_count"] == 0
+    assert result["observed_record_count"] == 1
+    assert result["manifest_signed_records"] == 0
+    assert result["observed_signed_records"] == 1
+
+
+def test_provenance_same_seq_different_manifest_generations_remains_distinct(
+    tmp_path: Path,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    record = signed_technocore_record(key, seq=2)
+    official = {key: value for key, value in record.items() if key not in {"room", "generation"}}
+    ids = []
+    for generation in ("1", "2"):
+        export_path = tmp_path / f"generation-{generation}.jsonl"
+        export_path.write_text(json.dumps(official) + "\n", encoding="utf-8")
+        manifest_path = write_json(
+            tmp_path / f"manifest-{generation}.json",
+            {
+                "room": "d-flop-bench",
+                "generation": generation,
+                "export_sha256": hashlib.sha256(export_path.read_bytes()).hexdigest(),
+            },
+        )
+        result = verify_export_file(export_path, manifest_path)
+        ids.append(result)
+    assert ids[0]["generation"] == "1"
+    assert ids[1]["generation"] == "2"
+
+
+def test_provenance_verify_export_manifest_mismatch_fails_safely(tmp_path: Path) -> None:
+    export_path = tmp_path / "export.jsonl"
+    export_path.write_text("{}\n", encoding="utf-8")
+    manifest_path = write_json(tmp_path / "manifest.json", {"export_sha256": "0" * 64})
+    with pytest.raises(ValidationError):
+        verify_export_file(export_path, manifest_path)
+
+
+def test_provenance_export_room_is_dry_run_without_yes(tmp_path: Path) -> None:
+    class FailingTransport:
+        def request(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("dry run must not fetch")
+
+    result = export_room(
+        "d-flop-bench",
+        yes=False,
+        transport=FailingTransport(),  # type: ignore[arg-type]
+        state_dir=tmp_path / "state",
+    )
+    assert result["dry_run"] is True
+    assert result["network_action"] is False
+    assert result["state_write"] is False
+    assert not (tmp_path / "state").exists()
+
+
+def test_provenance_export_room_yes_fetches_get_only_and_preserves_export(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    raw = (json.dumps(signed_technocore_record(key)) + "\n").encode()
+
+    class ExportTransport:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, str, bytes | None]] = []
+
+        def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            body: bytes | None = None,
+            headers: dict[str, str] | None = None,
+            timeout: float = 0,
+        ) -> TransportResponse:
+            del headers, timeout
+            self.requests.append((method, url, body))
+            return TransportResponse(200, raw, {"X-Room-Generation": "4"}, url)
+
+    transport = ExportTransport()
+    result = export_room(
+        "d-flop-bench", yes=True, transport=transport, state_dir=tmp_path / "state"
+    )
+    assert transport.requests == [("GET", f"{TECHNOCORE_ORIGIN}/r/d-flop-bench/export", None)]
+    assert result["network_action"] is True
+    assert result["state_write"] is True
+    assert Path(str(result["destination"])).read_bytes() == raw
+    manifest = json.loads(Path(str(result["manifest"])).read_text(encoding="utf-8"))
+    assert manifest["generation"] == "4"
+    assert manifest["export_sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+def test_provenance_cli_dispatch_and_help(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from flop_bench import cli
+
+    key = Ed25519PrivateKey.generate()
+    record_path = write_json(tmp_path / "record.json", signed_technocore_record(key))
+    export_path = tmp_path / "export.jsonl"
+    export_path.write_text(record_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    manifest_path = write_json(
+        tmp_path / "manifest.json",
+        {"export_sha256": hashlib.sha256(export_path.read_bytes()).hexdigest()},
+    )
+    with pytest.raises(SystemExit) as help_exit:
+        cli.build_parser().parse_args(["provenance", "--help"])
+    assert help_exit.value.code == 0
+    assert cli.run(["provenance", "doctor"]) == 0
+    assert cli.run(["provenance", "verify-record", str(record_path)]) == 0
+    assert (
+        cli.run(["provenance", "verify-export", str(export_path), "--manifest", str(manifest_path)])
+        == 0
+    )
+    assert cli.run(["provenance", "export-room", "d-flop-bench"]) == 0
+    output = capsys.readouterr().out
+    assert "DRY_RUN_ONLY" in output
+    help_text = cli.build_parser().format_help()
+    for command in (
+        "doctor",
+        "service",
+        "request",
+        "response",
+        "technocore",
+        "mailbox",
+        "identity-note",
+        "provenance",
+    ):
+        assert command in help_text
 
 
 def test_cli_phase_d_local_commands_smoke(tmp_path: Path) -> None:

@@ -207,6 +207,50 @@ ROUTER_EXPORT_SCHEMA: dict[str, Any] = {
     },
 }
 
+MAILBOX_REQUEST_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://flop-bench.local/schemas/mailbox-request-v0.1.json",
+    "type": "object",
+    "required": [
+        "schema_version",
+        "request_id",
+        "sender_did",
+        "target_did",
+        "requested_capability",
+        "hypothesis",
+        "test_spec",
+        "created_at",
+        "expires_at",
+        "provenance",
+    ],
+    "additionalProperties": False,
+    "properties": {
+        "schema_version": {"const": "flop-bench.mailbox-request.v0.1"},
+        "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
+        "sender_did": {"type": "string", "pattern": "^did:key:z[1-9A-HJ-NP-Za-km-z]+$"},
+        "target_did": {"type": "string", "pattern": "^did:key:z[1-9A-HJ-NP-Za-km-z]+$"},
+        "requested_capability": {
+            "enum": [
+                "software.testing",
+                "software.api",
+                "software.debugging",
+                "technocore.api",
+                "technocore.signed_post",
+                "technocore.protocol",
+                "reproducibility",
+                "verification",
+            ]
+        },
+        "hypothesis": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "test_spec": {"type": "object"},
+        "created_at": {"type": "string", "format": "date-time"},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "provenance": {"type": "object"},
+        "reply_room": {"type": ["string", "null"], "minLength": 1, "maxLength": 2048},
+        "operator_group": {"type": ["object", "null"]},
+    },
+}
+
 
 def validate_with_schema(instance: dict[str, Any], schema: dict[str, Any]) -> None:
     errors = sorted(

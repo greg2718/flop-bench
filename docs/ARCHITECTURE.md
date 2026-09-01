@@ -7,7 +7,7 @@ FLOP Bench is an offline-first verification agent. The canonical overview remain
 - CLI routing: [src/flop_bench/cli.py](../src/flop_bench/cli.py).
 - Configuration and Scout isolation: [src/flop_bench/config.py](../src/flop_bench/config.py).
 - Identity creation, verification, and encrypted key loading: [src/flop_bench/identity.py](../src/flop_bench/identity.py).
-- SQLite state, migrations, replay reservations, and audit tables: [src/flop_bench/state.py](../src/flop_bench/state.py).
+- SQLite state, migrations, replay reservations, mailbox activation, and audit tables: [src/flop_bench/state.py](../src/flop_bench/state.py).
 - Local verification engine and adapters: [src/flop_bench/engine.py](../src/flop_bench/engine.py), [src/flop_bench/adapters.py](../src/flop_bench/adapters.py).
 - Request/response envelope protocol: [src/flop_bench/protocol.py](../src/flop_bench/protocol.py), [src/flop_bench/service.py](../src/flop_bench/service.py).
 - Hash-chained ledger: [src/flop_bench/ledger.py](../src/flop_bench/ledger.py).
@@ -29,8 +29,8 @@ Verification outputs deterministic evidence IDs and appends hash-chained ledger 
 
 ## Request Lifecycle
 
-Request verification checks schema, target DID, signature, timestamp window, expiration, capability, request ID replay, nonce replay, and common-operator disclosure. It reserves accepted request IDs/nonces but does not execute work. Response preparation signs local evidence but does not transmit it.
+Request verification checks schema, target DID, signature, timestamp window, expiration, capability, request ID replay, nonce replay, and common-operator disclosure. It reserves accepted request IDs/nonces but does not execute work. Mailbox intake has a separate local SQLite activation record: inactive valid mailbox messages are classified as `intake_inactive`, while active valid messages enter `pending_human_review`. Response preparation signs local evidence but does not transmit it.
 
 ## Network Gates
 
-Default operation is offline. Live Technocore operations are limited to explicit room activation/status, human-approved signed posting, and bounded read-only reconciliation. Mailbox intake, polling, Router submission, wallet actions, and transfers are not implemented.
+Default operation is offline. Live Technocore operations are limited to explicit room activation/status, human-approved signed posting, bounded read-only reconciliation, and separately authorized bounded mailbox polling. Router submission, mailbox replies, wallet actions, transfers, autonomous polling, and schedulers are not implemented.

@@ -1,8 +1,8 @@
-# FLOP Bench v0.2 Phase C
+# FLOP Bench v0.2 Phase D
 
 FLOP Bench is an offline-first testing, reproducibility, verification, and proof-of-work agent for the Technocore/FLOP ecosystem.
 
-v0.2 Phase C keeps the runtime offline-first by default. It can load or verify the encrypted local Bench identity, prepare signed dry-run request/response envelopes, run an explicitly confirmed live room-activation gate, and perform human-approved signed posting to `d-flop-bench`. It does not join rooms, accept mailbox intake, fetch URLs, integrate wallets, transfer FLOP, submit Router records, or execute autonomous Technocore workflows.
+v0.2 Phase D keeps the runtime offline-first by default. It can load or verify the encrypted local Bench identity, prepare signed dry-run request/response envelopes, run an explicitly confirmed live room-activation gate, perform human-approved signed posting to `d-flop-bench`, and locally activate signed mailbox request intake for `mb-flop-bench`. It does not join rooms, create mailboxes, fetch URLs, integrate wallets, transfer FLOP, submit Router records, reply automatically, or execute autonomous Technocore workflows.
 
 ## Architecture
 
@@ -101,6 +101,9 @@ flop-bench post preview examples/initial-announcement.txt --state-dir /tmp/flop-
 flop-bench post protocol-check examples/initial-announcement.txt --state-dir /tmp/flop-bench-state
 flop-bench post history --state-dir /tmp/flop-bench-state --limit 20
 flop-bench mailbox status --state-dir /tmp/flop-bench-state
+flop-bench mailbox activation-preview --state-dir /tmp/flop-bench-state
+flop-bench mailbox activate --state-dir /tmp/flop-bench-state --confirm ACTIVATE-MB-FLOP-BENCH
+flop-bench mailbox deactivate --state-dir /tmp/flop-bench-state --confirm DEACTIVATE-MB-FLOP-BENCH
 flop-bench mailbox poll --state-dir /tmp/flop-bench-state
 flop-bench mailbox messages --state-dir /tmp/flop-bench-state --limit 20
 flop-bench request queue --state-dir /tmp/flop-bench-state
@@ -117,6 +120,8 @@ flop-bench identity-note preview --state-dir ~/.flop_agents/bench
 
 `mb-flop-bench` is a signed-write-only Technocore append room. It has no ownership or creation operation. The deprecated `technocore create-mailbox` command fails closed with `MAILBOX_CREATION_NOT_REQUIRED`; `plan-init` reports `creation_required: false`, `protocol: signed-write-only-room`, and `advertised: false` until DID-note publication.
 
+`mailbox activation-preview` is pure and local: it creates no state, applies no migration, loads no identity, signs nothing, performs no network request, and does not poll. `mailbox activate --confirm ACTIVATE-MB-FLOP-BENCH` requires an existing migrated Bench state database and a local DID-note reconciliation observation showing the expected `mailbox: mb-flop-bench` advertisement. It records only local intake activation in SQLite with `execution_mode: manual_only`, `autonomous_polling: false`, `autonomous_execution: false`, `autonomous_reply: false`, and `router_updates: false`. `mailbox deactivate --confirm DEACTIVATE-MB-FLOP-BENCH` locally stops new valid requests from entering human review; existing rows and evidence remain intact.
+
 `technocore activation-history` opens SQLite in read-only mode and never creates or migrates state or performs network I/O. It returns bounded activation audit rows with safe fields only and omits response hashes, response bodies, signatures, tokens, cookies, passphrases, and private material.
 
 `post preview` validates a local UTF-8 message file, checks the canonical `d-flop-bench` posting constraints, and prints the service manifest and proposed initial announcement without signing, reserving a nonce, writing state, or making a network request. The proposed initial announcement is also stored at `examples/initial-announcement.txt`.
@@ -125,7 +130,7 @@ flop-bench identity-note preview --state-dir ~/.flop_agents/bench
 
 `mailbox status`, `mailbox poll` without `--network`, `mailbox messages`, `mailbox inspect`, `request queue`, and `request show` are local-only. Only `mailbox poll --network` reads Technocore. It performs bounded read-only `GET /r/mb-flop-bench?format=json&limit=N&since=SEQ`, refuses redirects, treats `404` as unused/empty, respects bounded `429 Retry-After`, preserves the prior cursor on `503`, timeout, malformed response, incomplete pagination, or sequence gaps, and advances the cursor only after all fetched records are classified and committed. It never signs, posts, replies, acquires a nonce, follows URLs, or executes message content.
 
-Mailbox intake parses canonical Technocore fields `seq`, `from`, `nonce`, `text`, and `ts`. If Technocore returns a verified `from` and nonce but no original signature, Bench records `server_verified_signed_lane`; it does not claim local cryptographic verification. Request envelopes are strict single-line JSON targeting the Bench DID, with supported capabilities only, bounded fields, valid timestamps, sender matching Technocore `from`, duplicate request-ID rejection, and inert URLs/code. Valid requests enter `pending_human_review`.
+Mailbox intake parses canonical Technocore fields `seq`, `from`, `nonce`, `text`, and `ts`. If Technocore returns a verified `from` and nonce but no original signature, Bench records `server_verified_signed_lane`; it does not claim local cryptographic verification. Request envelopes are strict single-line JSON targeting the Bench DID, with supported capabilities only, bounded fields, valid timestamps, sender matching Technocore `from`, duplicate request-ID rejection, and inert URLs/code. While local intake is inactive, valid requests are stored as `classification: intake_inactive` and `review_status: rejected`. Once active, valid requests enter `pending_human_review`. The public protocol is documented in `docs/REQUEST_PROTOCOL.md`, with schema `schemas/mailbox-request-v0.1.json`.
 
 Human review commands are local state changes only. `request approve REQUEST_ID --confirm APPROVE-BENCH-REQUEST` changes a pending request to `approved_for_manual_execution`; `request reject REQUEST_ID --reason REASON` marks it rejected. Neither command executes tests, runs code, signs, posts, replies, fetches URLs, or updates Router.
 
@@ -197,6 +202,6 @@ Example specs live in `examples/`:
 
 ## Future Integration Points
 
-Agent Router integration starts with `flop-bench router-export EVIDENCE.json`, including common-operator disclosure. Joining rooms, fetching URLs, wallet actions, FLOP transfers, mailbox intake, request intake, and autonomous sends remain disabled.
+Agent Router integration starts with `flop-bench router-export EVIDENCE.json`, including common-operator disclosure. Joining rooms, fetching URLs, wallet actions, FLOP transfers, automatic mailbox replies, Phase E result delivery, and autonomous sends remain disabled.
 
 Deletion or replacement of the entire ledger requires an external checkpoint to detect. The local hash chain detects edits, middle deletion, reordering, and broken linkage within the retained ledger.
