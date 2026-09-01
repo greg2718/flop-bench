@@ -15,7 +15,7 @@ Last updated: 2026-09-01.
 - Production safety posture: offline-first; no autonomous service loop, scheduler, wallet, FLOP transfer, Router submission, URL following, request execution, mailbox reply, or autonomous posting. `mailbox poll --network`, `identity-note status`, and `identity-note publish --live` are implemented but require explicit human operation.
 - Current blockers: production mailbox local intake activation and polling have not been run by this implementation.
 - Credential status: production identity `SET`; wallet credentials `MISSING`; mailbox polling credentials `MISSING`.
-- Latest full test count: 142 tests collected and passing after activation-preview readiness diagnostics.
+- Latest full test count: 143 tests collected and passing after request-intake announcement and post-preview correction.
 - Scheduler/daemon status: none.
 - Safe production sequence: merge reviewed code; run `flop-bench service doctor --state-dir ~/.flop_agents/bench --read-only`; explicitly run normal `flop-bench service doctor --state-dir ~/.flop_agents/bench` to apply pending migrations; rerun `flop-bench mailbox activation-preview --state-dir ~/.flop_agents/bench`; activate only when `can_activate` is true.
 - Next immediate task: If desired, after the safe sequence above reports `can_activate=true`, run local mailbox activation against already reconciled production state, then perform the first separately authorized mailbox poll.

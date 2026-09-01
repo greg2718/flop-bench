@@ -1696,11 +1696,14 @@ def test_activation_http_status_retry_nonce_and_redaction(tmp_path: Path) -> Non
 
 def test_post_manifest_and_preview_are_pure(tmp_path: Path) -> None:
     message_path = tmp_path / "message.txt"
-    message_path.write_text(f"{proposed_initial_announcement()}\n", encoding="utf-8")
+    message_text = proposed_initial_announcement()
+    message_path.write_text(f"{message_text}\n", encoding="utf-8")
     state = tmp_path / "missing-state"
     preview = preview_post(message_path, state_dir=state)
     manifest = service_manifest()
     assert preview["room"] == "d-flop-bench"
+    assert preview["message_text"] == message_text
+    assert "proposed_initial_announcement" not in preview
     assert preview["will_sign"] is False
     assert preview["will_acquire_nonce"] is False
     assert preview["network_action"] is False
@@ -1718,6 +1721,19 @@ def test_post_manifest_and_preview_are_pure(tmp_path: Path) -> None:
     assert manifest["safety"]["requests_accepted"] is False
     assert "https://" not in proposed_initial_announcement()
     assert not state.exists()
+
+
+def test_post_preview_arbitrary_file_reports_selected_message_only(tmp_path: Path) -> None:
+    message_path = tmp_path / "message.txt"
+    message_text = "Narrow arbitrary preview text for a local dry run"
+    message_path.write_text(message_text, encoding="utf-8")
+
+    preview = preview_post(message_path, state_dir=tmp_path / "state")
+
+    assert preview["message_text"] == message_text
+    assert preview["message_hash"] == message_hash(message_text)
+    assert "proposed_initial_announcement" not in preview
+    assert proposed_initial_announcement() not in json.dumps(preview)
 
 
 def test_post_message_validation_rejects_url_control_length_and_utf8(tmp_path: Path) -> None:
