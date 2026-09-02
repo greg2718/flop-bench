@@ -75,6 +75,7 @@ from .service import (
     verify_request,
 )
 from .state import activation_history, connect_state_with_migrations
+from .verification import verify_request_file
 
 
 def _print_json(value: Any) -> None:
@@ -277,6 +278,12 @@ def build_parser() -> argparse.ArgumentParser:
     provenance_export_room = provenance_sub.add_parser("export-room")
     provenance_export_room.add_argument("room")
     provenance_export_room.add_argument("--yes", action="store_true")
+    verification = sub.add_parser("verification")
+    verification_sub = verification.add_subparsers(dest="verification_cmd", required=True)
+    verification_verify = verification_sub.add_parser("verify-request")
+    verification_verify.add_argument("request", type=Path)
+    verification_verify.add_argument("--output", type=Path)
+    verification_verify.add_argument("--completed-at")
     return parser
 
 
@@ -520,6 +527,14 @@ def run(argv: list[str] | None = None) -> int:
                     args.room,
                     yes=args.yes,
                     transport=UrlLibActivationTransport() if args.yes else None,
+                )
+            )
+        elif args.cmd == "verification" and args.verification_cmd == "verify-request":
+            _print_json(
+                verify_request_file(
+                    args.request,
+                    output=args.output,
+                    completed_at=args.completed_at,
                 )
             )
         else:

@@ -1,6 +1,6 @@
 # Codex State
 
-Last updated: 2026-09-01.
+Last updated: 2026-09-02.
 
 - Current main commit: `f806029795af762db508bd5650ec268a83798f81`.
 - Current development branch: `chore/codex-efficiency-context`.
@@ -20,6 +20,7 @@ Last updated: 2026-09-01.
 - Current production facts: `mb-flop-bench` intake is active for manual operation, polling is manual, requests enter `pending_human_review`, approval changes status to `approved_for_manual_execution` only, and existing request `BENCH-FIXTURE-20260831T155341Z` is expired plumbing evidence that must not execute or count as independent reputation. During Phase E2 validation, Technocore had intermittent `530`, `remote_unavailable`, and `read_timeout` failures; Bench preserved cursors and state on incomplete reads, did not immediately retry ambiguous writes, failed closed on expired requests, and produced no duplicate request, execution, or result.
 - Credential status: production identity `SET`; wallet credentials `MISSING`; mailbox polling credentials `MISSING`.
 - Latest targeted E2 result-delivery checks: `.venv/bin/pytest -q -k 'result and (delivery or reconcile or history)'` passed with 6 selected tests; `.venv/bin/ruff check src tests` and `.venv/bin/mypy src` passed on 2026-09-01. Latest full gate remains the prior 2026-09-01 run.
+- Local Router -> Scout -> Bench workflow prototype: Bench now supports unsigned local `flop-verification-request/v1` intake through `flop-bench verification verify-request`, currently limited to deterministic synthetic Technocore signing-payload-order verification. It emits `flop-verification-result/v1` with same-operator disclosure, `independent_reputation: false`, reproducibility metadata, artifact hashes, and explicit zero network/key/TCLK-settlement counters. This is controlled same-operator validation plumbing only, not independent reputation evidence and not production posting.
 - Scheduler/daemon status: none.
 - Safe production sequence: merge reviewed code; run `flop-bench service doctor --state-dir ~/.flop_agents/bench --read-only`; explicitly run normal `flop-bench service doctor --state-dir ~/.flop_agents/bench` to apply pending migrations; rerun `flop-bench mailbox activation-preview --state-dir ~/.flop_agents/bench`; activate only when `can_activate` is true.
 - Next immediate task: small Phase F design for human-approved Router-compatible evidence export, followed by validation from an independently operated DID. Mailbox polling remains manual; Router updates remain separately gated.

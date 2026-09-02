@@ -171,6 +171,12 @@ from flop_bench.state import (
     record_did_note_observation,
 )
 from flop_bench.transport import DisabledTechnocoreTransport
+from flop_bench.verification import (
+    LOCAL_OPERATOR_GROUP,
+    canonical_json_hash,
+    verify_request_file,
+    verify_signing_request,
+)
 
 REPO = Path(__file__).resolve().parents[1]
 GOLDEN_SCOUT_TECHNOCORE_ORIGIN = "https://technocore.chat"
@@ -180,6 +186,40 @@ GOLDEN_SCOUT_USER_AGENT = "flop-scout/0.3.2"
 def write_json(path: Path, value: object) -> Path:
     path.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
     return path
+
+
+def verification_request_fixture() -> dict[str, object]:
+    return {
+        "schema_version": "flop-verification-request/v1",
+        "request_id": "FVR-local-1",
+        "routing_decision_id": "frd1-local",
+        "routing_decision_hash": "0" * 64,
+        "task_hash": "1" * 64,
+        "created_at": "2026-09-02T12:00:00Z",
+        "requester_did": SCOUT_DID,
+        "target_agent_did": "did:key:z6MkSyntheticExternal",
+        "task_type": "technocore.synthetic_signing_payload_order",
+        "required_capabilities": ["technocore.signed_post", "software.debugging"],
+        "verification_mode": "OBJECTIVE_BENCH",
+        "specimen": {
+            "room": "technocore",
+            "nonce": "123",
+            "text": "synthetic signing specimen",
+            "supplied_payload": "technocore|synthetic signing specimen|123",
+            "supplied_order": "room|text|nonce",
+            "expected_payload": "technocore|123|synthetic signing specimen",
+            "expected_order": "room|nonce|text",
+        },
+        "expected_properties": {
+            "canonical_order": "room|nonce|text",
+            "broken_order": "room|text|nonce",
+            "expected_finding": "nonce/text ordering defect identified",
+        },
+        "response_destination": "local://scout/bench-result",
+        "operator_group": LOCAL_OPERATOR_GROUP,
+        "same_operator": True,
+        "independent_reputation": False,
+    }
 
 
 def spec(
@@ -208,6 +248,77 @@ def different_test_phrase() -> str:
 
 def weak_test_phrase() -> str:
     return "".join(["we", "ak"])
+
+
+def test_verification_request_detects_broken_technocore_payload_order() -> None:
+    request = verification_request_fixture()
+    result = verify_signing_request(request, completed_at="2026-09-02T12:00:01Z")
+    assert result["schema_version"] == "flop-verification-result/v1"
+    assert result["request_id"] == "FVR-local-1"
+    assert result["routing_decision_id"] == "frd1-local"
+    assert result["routing_decision_hash"] == "0" * 64
+    assert result["task_hash"] == "1" * 64
+    assert result["verification_mode"] == "OBJECTIVE_BENCH"
+    assert result["status"] == "PASS"
+    assert result["score"] == 100
+    assert result["checks"]["canonical_order_expected"] is True
+    assert result["checks"]["broken_payload_detected"] is True
+    assert result["checks"]["preimage_differs"] is True
+    assert result["checks"]["correct_reconstruction_identified"] is True
+    assert result["findings"] == ["nonce/text ordering defect identified"]
+    assert result["same_operator"] is True
+    assert result["independent_reputation"] is False
+    assert result["operator_group"] == LOCAL_OPERATOR_GROUP
+    assert result["evidence_classification"] == "CONTROLLED_SAME_OPERATOR_VALIDATION"
+    assert result["network_writes"] == 0
+    assert result["private_key_accesses"] == 0
+    assert result["tclk_settlement_actions"] == 0
+    expected_hash = canonical_json_hash(
+        {key: value for key, value in result.items() if key != "result_hash"}
+    )
+    assert result["result_hash"] == expected_hash
+
+
+def test_verification_result_preserves_same_operator_for_synthetic_external_target() -> None:
+    request = verification_request_fixture()
+    request["target_agent_did"] = "did:key:z6MkExternalSyntheticTarget"
+    result = verify_signing_request(request, completed_at="2026-09-02T12:00:01Z")
+    assert result["status"] == "PASS"
+    assert result["same_operator"] is True
+    assert result["independent_reputation"] is False
+    assert result["operator_group"] == LOCAL_OPERATOR_GROUP
+
+
+def test_verification_result_is_deterministic_for_fixed_completion_time() -> None:
+    request = verification_request_fixture()
+    first = verify_signing_request(request, completed_at="2026-09-02T12:00:01Z")
+    second = verify_signing_request(request, completed_at="2026-09-02T12:00:01Z")
+    assert first == second
+
+
+def test_verification_failed_request_does_not_pass() -> None:
+    request = verification_request_fixture()
+    specimen = dict(request["specimen"])  # type: ignore[arg-type]
+    specimen["supplied_payload"] = "technocore|123|synthetic signing specimen"
+    request["specimen"] = specimen
+    result = verify_signing_request(request, completed_at="2026-09-02T12:00:01Z")
+    assert result["status"] == "FAIL"
+    assert result["score"] == 0
+    assert result["findings"] == []
+
+
+def test_verification_request_file_writes_local_result_artifact(tmp_path: Path) -> None:
+    request_path = write_json(tmp_path / "request.json", verification_request_fixture())
+    output_path = tmp_path / "result.json"
+    result = verify_request_file(
+        request_path,
+        output=output_path,
+        completed_at="2026-09-02T12:00:01Z",
+    )
+    stored = json.loads(output_path.read_text(encoding="utf-8"))
+    assert stored == result
+    assert stored["artifact_hashes"]["request_sha256"]
+    assert stored["reproducibility"] == "DETERMINISTIC"
 
 
 def load_scout_module() -> object:
