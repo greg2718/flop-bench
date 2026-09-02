@@ -57,6 +57,7 @@ from .state import (
     result_delivery_attempt,
     result_delivery_history,
     update_result_delivery_attempt,
+    verification_result_import,
 )
 from .state import next_post_nonce as reserve_post_nonce
 
@@ -526,6 +527,39 @@ def execution_history(*, state_dir: Path, limit: int) -> dict[str, Any]:
 
 def result_preview(*, state_dir: Path, request_id: str) -> dict[str, Any]:
     assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
+    imported = verification_result_import(state_dir, request_id=request_id)
+    if imported is not None:
+        return {
+            "schema_version": "flop-bench.verification-result-preview.v1",
+            "request_id": request_id,
+            "bench_did": imported["bench_did"],
+            "routing_decision_id": imported["routing_decision_id"],
+            "routing_decision_hash": imported["routing_decision_hash"],
+            "task_hash": imported["task_hash"],
+            "verification_mode": imported["verification_mode"],
+            "status": imported["status"],
+            "score": imported["score"],
+            "findings": imported["findings"],
+            "checks": imported["checks"],
+            "reproducibility": imported["reproducibility"],
+            "same_operator": imported["same_operator"],
+            "independent_reputation": imported["independent_reputation"],
+            "operator_group": imported["operator_group"],
+            "evidence_classification": imported["evidence_classification"],
+            "result_hash": imported["result_hash"],
+            "artifact_hashes": imported["artifact_hashes"],
+            "completed_at": imported["completed_at"],
+            "authenticity_status": "UNSIGNED_LOCAL",
+            "result_delivery_status": "not_sent",
+            "state_write": False,
+            "network_action": False,
+            "will_load_private_key": False,
+            "will_sign": False,
+            "will_post": False,
+            "will_reply": False,
+            "will_update_router": False,
+            "urls_followed": False,
+        }
     row = mailbox_request_for_execution(state_dir, request_id=request_id)
     if row is None:
         raise SafetyError("request not found")
@@ -584,6 +618,30 @@ def _completed_result_envelope(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _imported_verification_result_envelope(imported: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": "flop-bench.verification-result-delivery.v1",
+        "request_id": imported["request_id"],
+        "bench_did": imported["bench_did"],
+        "routing_decision_id": imported["routing_decision_id"],
+        "routing_decision_hash": imported["routing_decision_hash"],
+        "task_hash": imported["task_hash"],
+        "verification_mode": imported["verification_mode"],
+        "status": imported["status"],
+        "score": imported["score"],
+        "findings": imported["findings"],
+        "reproducibility": imported["reproducibility"],
+        "same_operator": imported["same_operator"],
+        "independent_reputation": imported["independent_reputation"],
+        "operator_group": imported["operator_group"],
+        "evidence_classification": imported["evidence_classification"],
+        "result_hash": imported["result_hash"],
+        "artifact_hashes": imported["artifact_hashes"],
+        "completed_at": imported["completed_at"],
+        "authenticity_status": "UNSIGNED_LOCAL",
+    }
+
+
 def _canonical_result_text(envelope: dict[str, Any]) -> str:
     return canonical_json_bytes(envelope).decode("utf-8")
 
@@ -621,7 +679,18 @@ def result_delivery_preview(*, state_dir: Path, request_id: str) -> dict[str, An
     resolved = state_dir.expanduser().resolve(strict=False)
     blockers: list[str] = []
     status = migration_status(resolved)
-    if not status["database_exists"]:
+    imported = (
+        None
+        if not status["database_exists"]
+        else verification_result_import(resolved, request_id=request_id)
+    )
+    if imported is not None:
+        row = None
+        reply_room = None
+        envelope = _imported_verification_result_envelope(imported)
+        blockers.append("missing_result_destination")
+        blockers.append("result_delivery_target_did_unavailable")
+    elif not status["database_exists"]:
         blockers.append("state_database_missing")
         row = None
         envelope = None
@@ -648,8 +717,7 @@ def result_delivery_preview(*, state_dir: Path, request_id: str) -> dict[str, An
                 blockers.append(str(exc))
                 envelope = None
     destination, destination_blockers = _delivery_destination_blockers(
-        reply_room=reply_room,
-        destination=None,
+        reply_room=reply_room, destination=None
     )
     blockers.extend(destination_blockers)
     result_text = _canonical_result_text(envelope) if envelope is not None else None

@@ -10,7 +10,7 @@ from typing import Any, cast
 
 from .exceptions import SafetyError
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 STATE_DB = "state.sqlite"
 SQLITE_SIGNED_64_MAX = 9_223_372_036_854_775_807
 PRIVATE_FILE_MODE = 0o600
@@ -27,6 +27,7 @@ MAILBOX_CURSOR_KEY = "mailbox:mb-flop-bench:cursor"
 MAILBOX_INTAKE_ACTIVATION_TABLE = "mailbox_intake_activation"
 MAILBOX_EXECUTION_TABLE = "mailbox_request_executions"
 RESULT_DELIVERY_TABLE = "mailbox_result_deliveries"
+VERIFICATION_RESULT_IMPORT_TABLE = "verification_result_imports"
 
 
 def private_state_paths(state_dir: Path) -> list[Path]:
@@ -597,8 +598,99 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
             """
         )
         applied.append(10)
+    if current < 11:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS verification_result_imports (
+                request_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL,
+                bench_did TEXT NOT NULL,
+                routing_decision_id TEXT NOT NULL,
+                routing_decision_hash TEXT NOT NULL,
+                task_hash TEXT NOT NULL,
+                verification_mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                findings_json TEXT NOT NULL,
+                checks_json TEXT NOT NULL,
+                reproducibility TEXT NOT NULL,
+                same_operator INTEGER NOT NULL,
+                independent_reputation INTEGER NOT NULL,
+                operator_group TEXT NOT NULL,
+                evidence_classification TEXT,
+                result_hash TEXT NOT NULL,
+                artifact_hashes_json TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                imported_at TEXT NOT NULL
+            );
+            INSERT OR IGNORE INTO schema_migrations(version) VALUES (11);
+            """
+        )
+        applied.append(11)
     conn.commit()
     return applied
+
+
+def record_verification_result_import(conn: sqlite3.Connection, *, result: dict[str, Any]) -> bool:
+    """Persist a validated Router-linked result once, without legacy evidence coercion."""
+    now = datetime.now(UTC).isoformat()
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO verification_result_imports(
+            request_id, schema_version, bench_did, routing_decision_id,
+            routing_decision_hash, task_hash, verification_mode, status, score,
+            findings_json, checks_json, reproducibility, same_operator,
+            independent_reputation, operator_group, evidence_classification,
+            result_hash, artifact_hashes_json, completed_at, imported_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            result["request_id"],
+            result["schema_version"],
+            result["bench_did"],
+            result["routing_decision_id"],
+            result["routing_decision_hash"],
+            result["task_hash"],
+            result["verification_mode"],
+            result["status"],
+            result["score"],
+            json.dumps(result["findings"], sort_keys=True, separators=(",", ":")),
+            json.dumps(result["checks"], sort_keys=True, separators=(",", ":")),
+            result["reproducibility"],
+            int(result["same_operator"]),
+            int(result["independent_reputation"]),
+            result["operator_group"],
+            result.get("evidence_classification"),
+            result["result_hash"],
+            json.dumps(result["artifact_hashes"], sort_keys=True, separators=(",", ":")),
+            result["completed_at"],
+            now,
+        ),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def verification_result_import(state_dir: Path, *, request_id: str) -> dict[str, Any] | None:
+    with readonly_state_connection(state_dir) as conn:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (VERIFICATION_RESULT_IMPORT_TABLE,),
+        ).fetchone()
+        if table is None:
+            return None
+        row = conn.execute(
+            "SELECT * FROM verification_result_imports WHERE request_id = ?", (request_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["findings"] = json.loads(result.pop("findings_json"))
+    result["checks"] = json.loads(result.pop("checks_json"))
+    result["artifact_hashes"] = json.loads(result.pop("artifact_hashes_json"))
+    result["same_operator"] = bool(result["same_operator"])
+    result["independent_reputation"] = bool(result["independent_reputation"])
+    return result
 
 
 def _mailbox_activation_row_dict(row: sqlite3.Row | None, *, mailbox: str) -> dict[str, Any]:

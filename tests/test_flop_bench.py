@@ -174,6 +174,7 @@ from flop_bench.transport import DisabledTechnocoreTransport
 from flop_bench.verification import (
     LOCAL_OPERATOR_GROUP,
     canonical_json_hash,
+    prepare_verification_delivery,
     verify_request_file,
     verify_signing_request,
 )
@@ -319,6 +320,64 @@ def test_verification_request_file_writes_local_result_artifact(tmp_path: Path) 
     assert stored == result
     assert stored["artifact_hashes"]["request_sha256"]
     assert stored["reproducibility"] == "DETERMINISTIC"
+
+
+def test_verification_result_prepare_delivery_preserves_router_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = verify_signing_request(
+        verification_request_fixture(), completed_at="2026-09-02T12:00:01Z"
+    )
+    result_path = write_json(tmp_path / "verification-result.json", result)
+    state = tmp_path / "state"
+
+    def fail_identity_load(*args: object, **kwargs: object) -> object:
+        raise AssertionError("verification result preparation must not load an identity")
+
+    def fail_network(*args: object, **kwargs: object) -> object:
+        raise AssertionError("verification result preparation must not access the network")
+
+    monkeypatch.setattr("flop_bench.identity.load_production_identity_key", fail_identity_load)
+    monkeypatch.setattr("urllib.request.urlopen", fail_network)
+    prepared = prepare_verification_delivery(result_path, state_dir=state)
+
+    assert prepared["status"] == "prepared"
+    assert prepared["private_key_accesses"] == 0
+    assert prepared["network_writes"] == 0
+    assert prepared["authenticity_status"] == "UNSIGNED_LOCAL"
+    preview = result_preview(state_dir=state, request_id="FVR-local-1")
+    assert preview["routing_decision_id"] == "frd1-local"
+    assert preview["routing_decision_hash"] == "0" * 64
+    assert preview["task_hash"] == "1" * 64
+    assert preview["verification_mode"] == "OBJECTIVE_BENCH"
+    assert preview["same_operator"] is True
+    assert preview["independent_reputation"] is False
+    assert preview["operator_group"] == LOCAL_OPERATOR_GROUP
+    assert preview["result_hash"] == result["result_hash"]
+    delivery = result_delivery_preview(state_dir=state, request_id="FVR-local-1")
+    assert delivery["can_send"] is False
+    assert "missing_result_destination" in delivery["blockers"]
+    assert "result_delivery_target_did_unavailable" in delivery["blockers"]
+    assert delivery["result_envelope"]["routing_decision_id"] == "frd1-local"
+    assert delivery["state_write"] is False
+    assert delivery["network_action"] is False
+
+
+def test_verification_result_prepare_rejects_invalid_input_before_identity_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = verify_signing_request(
+        verification_request_fixture(), completed_at="2026-09-02T12:00:01Z"
+    )
+    result.pop("routing_decision_id")
+    result_path = write_json(tmp_path / "invalid-verification-result.json", result)
+
+    def fail_identity_load(*args: object, **kwargs: object) -> object:
+        raise AssertionError("invalid verification result must fail before identity access")
+
+    monkeypatch.setattr("flop_bench.identity.load_production_identity_key", fail_identity_load)
+    with pytest.raises(ValidationError, match="missing required fields"):
+        prepare_verification_delivery(result_path, state_dir=tmp_path / "state")
 
 
 def load_scout_module() -> object:

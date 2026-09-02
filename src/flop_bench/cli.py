@@ -75,7 +75,7 @@ from .service import (
     verify_request,
 )
 from .state import activation_history, connect_state_with_migrations
-from .verification import verify_request_file
+from .verification import prepare_verification_delivery, verify_request_file
 
 
 def _print_json(value: Any) -> None:
@@ -284,6 +284,9 @@ def build_parser() -> argparse.ArgumentParser:
     verification_verify.add_argument("request", type=Path)
     verification_verify.add_argument("--output", type=Path)
     verification_verify.add_argument("--completed-at")
+    verification_prepare_delivery = verification_sub.add_parser("prepare-delivery")
+    verification_prepare_delivery.add_argument("result", type=Path)
+    verification_prepare_delivery.add_argument("--state-dir", required=True, type=Path)
     return parser
 
 
@@ -537,6 +540,8 @@ def run(argv: list[str] | None = None) -> int:
                     completed_at=args.completed_at,
                 )
             )
+        elif args.cmd == "verification" and args.verification_cmd == "prepare-delivery":
+            _print_json(prepare_verification_delivery(args.result, state_dir=args.state_dir))
         else:
             raise FlopBenchError("unknown command")
     except LedgerError as exc:
