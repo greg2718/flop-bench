@@ -10,7 +10,7 @@
 
 ## Blockers
 
-- No scheduler or daemon policy exists for production operation.
+- A production supervisor/cloud deployment policy for the Phase G1 intake worker is not configured.
 - Router-compatible evidence export is not designed or validated yet.
 - Router-compatible local verification result ingestion exists only as same-operator controlled validation; preparation requires an explicit target DID and `mb-*` reply room, while legacy imports without that metadata remain delivery-blocked. Independent reputation handling remains blocked on independent-operator evidence.
 - Independent-operator validation has not been performed.

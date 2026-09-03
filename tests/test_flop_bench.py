@@ -166,10 +166,14 @@ from flop_bench.service import (
 from flop_bench.state import (
     SCHEMA_VERSION,
     STATE_DB,
+    acquire_mailbox_worker_lease,
     activation_history,
     connect_state,
+    mailbox_worker_state,
     migration_status,
     record_did_note_observation,
+    release_mailbox_worker_lease,
+    update_mailbox_worker,
 )
 from flop_bench.transport import DisabledTechnocoreTransport
 from flop_bench.verification import (
@@ -178,6 +182,13 @@ from flop_bench.verification import (
     prepare_verification_delivery,
     verify_request_file,
     verify_signing_request,
+)
+from flop_bench.worker import (
+    run_worker,
+    validate_worker_timing,
+    worker_health,
+    worker_status,
+    worker_stop_handler,
 )
 
 REPO = Path(__file__).resolve().parents[1]
@@ -580,6 +591,297 @@ def test_non_live_result_delivery_does_not_load_key_nonce_or_sign(
     assert calls == {"key": 0, "nonce": 0, "sign": 0}
     assert transport.requests == []
     assert result_history(state_dir=state, limit=10)["deliveries"] == []
+
+
+def test_worker_once_lease_recovery_backoff_and_read_only_status(tmp_path: Path) -> None:
+    state = tmp_path / "worker-state"
+    now_value = datetime(2026, 9, 3, tzinfo=UTC)
+
+    def clock() -> datetime:
+        return now_value
+
+    successful = run_worker(
+        state_dir=state,
+        transport=FakeActivationTransport(),
+        once=True,
+        clock=clock,
+        sleeper=lambda _seconds: (_ for _ in ()).throw(AssertionError("once must not sleep")),
+        poll=lambda **_kwargs: {
+            "ok": True,
+            "history_scan_complete": True,
+            "cursor_after": 4,
+            "poll_status": "complete",
+        },
+    )
+    assert successful["ok"] is True
+    status = worker_status(state_dir=state, now=clock)
+    assert status["worker_status"] == "stopped"
+    assert status["last_successful_poll_at"] == now_value.isoformat()
+    assert status["consecutive_failures"] == 0
+    assert worker_health(state_dir=state, now=clock)["health"] == "stopped"
+
+    delays: list[float] = []
+    calls = 0
+
+    def fail_then_stop(**_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {
+            "ok": False,
+            "history_scan_complete": False,
+            "failure_classification": "remote_unavailable",
+        }
+
+    failed = run_worker(
+        state_dir=state,
+        transport=FakeActivationTransport(),
+        clock=clock,
+        poll_interval=2,
+        max_backoff=4,
+        sleeper=lambda seconds: delays.append(seconds),
+        jitter=lambda: 1.0,
+        poll=fail_then_stop,
+        should_stop=lambda: calls >= 1,
+    )
+    assert failed["ok"] is False
+    assert delays == [2.2]
+    assert (
+        worker_status(state_dir=state, now=clock)["last_failure_classification"]
+        == "remote_unavailable"
+    )
+    assert worker_status(state_dir=tmp_path / "missing", now=clock)["state_write"] is False
+    assert not (tmp_path / "missing").exists()
+
+
+def test_worker_lease_lifecycle_and_signal_boundary(tmp_path: Path) -> None:
+    state = tmp_path / "lease-state"
+    now = datetime(2026, 9, 3, tzinfo=UTC)
+    with connect_state(state) as conn:
+        assert acquire_mailbox_worker_lease(
+            conn,
+            mailbox="mb-flop-bench",
+            instance_id="first",
+            now=now,
+            lease_seconds=60,
+            poll_interval_seconds=30,
+        )
+    with connect_state(state) as conn:
+        assert not acquire_mailbox_worker_lease(
+            conn,
+            mailbox="mb-flop-bench",
+            instance_id="second",
+            now=now,
+            lease_seconds=60,
+            poll_interval_seconds=30,
+        )
+        assert update_mailbox_worker(
+            conn, mailbox="mb-flop-bench", instance_id="first", now=now, lease_seconds=60
+        )
+        release_mailbox_worker_lease(conn, mailbox="mb-flop-bench", instance_id="first")
+    with connect_state(state) as conn:
+        assert acquire_mailbox_worker_lease(
+            conn,
+            mailbox="mb-flop-bench",
+            instance_id="second",
+            now=now,
+            lease_seconds=60,
+            poll_interval_seconds=30,
+        )
+        assert not update_mailbox_worker(
+            conn, mailbox="mb-flop-bench", instance_id="first", now=now, lease_seconds=60
+        )
+        release_mailbox_worker_lease(conn, mailbox="mb-flop-bench", instance_id="first")
+    assert mailbox_worker_state(state, mailbox="mb-flop-bench")["instance_id"] == "second"
+    stopped: list[bool] = []
+    worker_stop_handler(lambda: stopped.append(True))(15, None)
+    assert stopped == [True]
+
+
+def test_worker_expired_lease_backoff_health_timing_and_safe_logs(tmp_path: Path) -> None:
+    state = tmp_path / "worker-state"
+    then = datetime(2026, 9, 3, tzinfo=UTC)
+    later = datetime(2026, 9, 3, 0, 2, tzinfo=UTC)
+    with connect_state(state) as conn:
+        assert acquire_mailbox_worker_lease(
+            conn,
+            mailbox="mb-flop-bench",
+            instance_id="crashed",
+            now=then,
+            lease_seconds=1,
+            poll_interval_seconds=2,
+        )
+        assert update_mailbox_worker(
+            conn,
+            mailbox="mb-flop-bench",
+            instance_id="crashed",
+            now=then,
+            lease_seconds=1,
+            successful=False,
+            backoff_seconds=4,
+            failure_classification="remote_unavailable",
+        )
+    records: list[dict[str, object]] = []
+    run_worker(
+        state_dir=state,
+        transport=FakeActivationTransport(),
+        once=True,
+        clock=lambda: later,
+        poll_interval=2,
+        max_backoff=4,
+        jitter=lambda: 99,
+        poll=lambda **kwargs: {
+            "ok": False,
+            "history_scan_complete": False,
+            "failure_classification": "timeout",
+            "text": "secret",
+        },
+        log=records.append,
+    )
+    row = mailbox_worker_state(state, mailbox="mb-flop-bench")
+    assert row["consecutive_failures"] == 2
+    assert row["current_backoff_seconds"] == 4
+    assert records[0].keys() == {
+        "event",
+        "timestamp",
+        "worker_instance_id",
+        "poll_status",
+        "cursor",
+        "failure_classification",
+        "backoff_seconds",
+    }
+    assert "secret" not in json.dumps(records[0])
+    assert worker_health(state_dir=state, now=lambda: later)["health"] == "stopped"
+    for value in (0, -1, float("nan"), float("inf"), 3601):
+        with pytest.raises(SafetyError):
+            validate_worker_timing(poll_interval=value, max_backoff=300)
+
+
+def test_worker_health_healthy_degraded_stale_and_unavailable(tmp_path: Path) -> None:
+    state = tmp_path / "health-state"
+    now = datetime(2026, 9, 3, tzinfo=UTC)
+    with connect_state(state) as conn:
+        assert acquire_mailbox_worker_lease(
+            conn,
+            mailbox="mb-flop-bench",
+            instance_id="worker",
+            now=now,
+            lease_seconds=60,
+            poll_interval_seconds=10,
+        )
+    assert worker_health(state_dir=state, now=lambda: now)["health"] == "healthy"
+    with connect_state(state) as conn:
+        assert update_mailbox_worker(
+            conn,
+            mailbox="mb-flop-bench",
+            instance_id="worker",
+            now=now,
+            lease_seconds=60,
+            successful=False,
+            backoff_seconds=10,
+            failure_classification="remote_unavailable",
+        )
+    assert worker_health(state_dir=state, now=lambda: now)["health"] == "degraded"
+    assert worker_health(state_dir=state, now=lambda: now.replace(second=31))["health"] == "stale"
+    assert worker_health(state_dir=tmp_path / "missing", now=lambda: now)["health"] == "unavailable"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "read_timeout",
+        "remote_unavailable",
+        "rate_limited",
+        "malformed_response",
+        "history_scan_incomplete",
+    ],
+)
+def test_worker_failure_classifications_use_injected_backoff_only(
+    tmp_path: Path, failure: str
+) -> None:
+    state = tmp_path / failure
+    delays: list[float] = []
+    calls = 0
+
+    def poll(**kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        assert kwargs["sleep_on_429"] is False
+        return {
+            "ok": False,
+            "history_scan_complete": False,
+            "failure_classification": failure,
+            "cursor_before": 0,
+            "cursor_after": 0,
+        }
+
+    run_worker(
+        state_dir=state,
+        transport=FakeActivationTransport(),
+        poll=poll,
+        poll_interval=2,
+        max_backoff=4,
+        sleeper=delays.append,
+        jitter=lambda: 0,
+        should_stop=lambda: calls >= 1,
+        clock=lambda: datetime(2026, 9, 3, tzinfo=UTC),
+    )
+    status = worker_status(state_dir=state, now=lambda: datetime(2026, 9, 3, tzinfo=UTC))
+    assert status["cursor"] == 0
+    assert status["consecutive_failures"] == 1
+    assert status["current_backoff_seconds"] == 2
+    assert status["last_failure_classification"] == failure
+    assert delays == [2]
+
+
+def test_worker_delayed_visibility_and_duplicate_intake_are_idempotent(tmp_path: Path) -> None:
+    state = tmp_path / "intake"
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
+    sender = public_did(Ed25519PrivateKey.generate())
+    transport = FakeActivationTransport()
+    run_worker(state_dir=state, transport=transport, once=True)
+    assert worker_status(state_dir=state)["cursor"] == 0
+    transport.room_messages["mb-flop-bench"] = [
+        {
+            "seq": 1,
+            "from": sender,
+            "nonce": 1,
+            "text": mailbox_request_text(sender_did=sender, request_id="worker-delayed"),
+        }
+    ]
+    run_worker(state_dir=state, transport=transport, once=True)
+    assert worker_status(state_dir=state)["cursor"] == 1
+    assert len(request_queue(state_dir=state)["requests"]) == 1
+    run_worker(state_dir=state, transport=transport, once=True)
+    assert worker_status(state_dir=state)["cursor"] == 1
+    assert len(request_queue(state_dir=state)["requests"]) == 1
+
+
+def test_worker_cycle_never_calls_capabilities_beyond_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    traps = [
+        "flop_bench.mailbox.request_approve",
+        "flop_bench.execution.execute_passive",
+        "flop_bench.identity.load_production_identity_key",
+        "flop_bench.execution._next_delivery_nonce",
+        "flop_bench.execution.send_result_delivery",
+        "flop_bench.posting.send_post",
+    ]
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("worker invoked a forbidden capability")
+
+    for target in traps:
+        monkeypatch.setattr(target, forbidden)
+    run_worker(
+        state_dir=tmp_path / "negative",
+        transport=FakeActivationTransport(),
+        once=True,
+        poll=lambda **_kwargs: {"ok": True, "history_scan_complete": True},
+    )
 
 
 def load_scout_module() -> object:

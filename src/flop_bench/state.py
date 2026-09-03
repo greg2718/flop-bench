@@ -10,7 +10,7 @@ from typing import Any, cast
 
 from .exceptions import SafetyError
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 STATE_DB = "state.sqlite"
 SQLITE_SIGNED_64_MAX = 9_223_372_036_854_775_807
 PRIVATE_FILE_MODE = 0o600
@@ -28,6 +28,7 @@ MAILBOX_INTAKE_ACTIVATION_TABLE = "mailbox_intake_activation"
 MAILBOX_EXECUTION_TABLE = "mailbox_request_executions"
 RESULT_DELIVERY_TABLE = "mailbox_result_deliveries"
 VERIFICATION_RESULT_IMPORT_TABLE = "verification_result_imports"
+MAILBOX_WORKER_TABLE = "mailbox_intake_worker"
 
 
 def private_state_paths(state_dir: Path) -> list[Path]:
@@ -643,6 +644,27 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
                     raise
         conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (12)")
         applied.append(12)
+    if current < 13:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS mailbox_intake_worker (
+                mailbox TEXT PRIMARY KEY,
+                worker_status TEXT NOT NULL,
+                instance_id TEXT,
+                started_at TEXT,
+                last_heartbeat_at TEXT,
+                last_poll_started_at TEXT,
+                last_successful_poll_at TEXT,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                current_backoff_seconds REAL NOT NULL DEFAULT 0,
+                last_failure_classification TEXT,
+                lease_expires_at TEXT,
+                poll_interval_seconds REAL NOT NULL DEFAULT 30
+            );
+            INSERT OR IGNORE INTO schema_migrations(version) VALUES (13);
+            """
+        )
+        applied.append(13)
     conn.commit()
     return applied
 
@@ -729,6 +751,197 @@ def verification_result_import(state_dir: Path, *, request_id: str) -> dict[str,
     result["artifact_hashes"] = json.loads(result.pop("artifact_hashes_json"))
     result["same_operator"] = bool(result["same_operator"])
     result["independent_reputation"] = bool(result["independent_reputation"])
+    return result
+
+
+def acquire_mailbox_worker_lease(
+    conn: sqlite3.Connection,
+    *,
+    mailbox: str,
+    instance_id: str,
+    now: datetime,
+    lease_seconds: float,
+    poll_interval_seconds: float,
+) -> bool:
+    now_text = now.isoformat()
+    expiry = datetime.fromtimestamp(now.timestamp() + lease_seconds, UTC).isoformat()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT instance_id, lease_expires_at FROM mailbox_intake_worker WHERE mailbox = ?",
+            (mailbox,),
+        ).fetchone()
+        valid_other = False
+        if row is not None and row["instance_id"] is not None and row["instance_id"] != instance_id:
+            try:
+                valid_other = datetime.fromisoformat(str(row["lease_expires_at"])) > now
+            except (TypeError, ValueError):
+                valid_other = True
+        if valid_other:
+            conn.rollback()
+            return False
+        conn.execute(
+            """
+            INSERT INTO mailbox_intake_worker(
+                mailbox, worker_status, instance_id, started_at, last_heartbeat_at,
+                consecutive_failures, current_backoff_seconds, lease_expires_at,
+                poll_interval_seconds
+            ) VALUES (?, 'running', ?, ?, ?, 0, 0, ?, ?)
+            ON CONFLICT(mailbox) DO UPDATE SET
+                worker_status = 'running', instance_id = excluded.instance_id,
+                started_at = excluded.started_at, last_heartbeat_at = excluded.last_heartbeat_at,
+                lease_expires_at = excluded.lease_expires_at,
+                poll_interval_seconds = excluded.poll_interval_seconds
+            """,
+            (mailbox, instance_id, now_text, now_text, expiry, poll_interval_seconds),
+        )
+        conn.commit()
+        return True
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+
+
+def update_mailbox_worker(
+    conn: sqlite3.Connection,
+    *,
+    mailbox: str,
+    instance_id: str,
+    now: datetime,
+    lease_seconds: float,
+    poll_started: bool = False,
+    successful: bool | None = None,
+    backoff_seconds: float | None = None,
+    failure_classification: str | None = None,
+) -> bool:
+    expiry = datetime.fromtimestamp(now.timestamp() + lease_seconds, UTC).isoformat()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT instance_id, consecutive_failures FROM mailbox_intake_worker WHERE mailbox = ?",
+            (mailbox,),
+        ).fetchone()
+        if row is None or row["instance_id"] != instance_id:
+            conn.rollback()
+            return False
+        conn.execute(
+            """
+            UPDATE mailbox_intake_worker
+            SET last_heartbeat_at = ?, lease_expires_at = ?,
+                last_poll_started_at = CASE WHEN ? THEN ? ELSE last_poll_started_at END,
+                last_successful_poll_at = CASE WHEN ? THEN ? ELSE last_successful_poll_at END,
+                consecutive_failures = CASE WHEN ? THEN 0 WHEN ? THEN
+                    consecutive_failures + 1 ELSE consecutive_failures END,
+                current_backoff_seconds = CASE WHEN ? THEN 0 WHEN ? THEN ?
+                    ELSE current_backoff_seconds END,
+                last_failure_classification = CASE WHEN ? THEN NULL WHEN ? THEN ?
+                    ELSE last_failure_classification END
+            WHERE mailbox = ? AND instance_id = ?
+            """,
+            (
+                now.isoformat(),
+                expiry,
+                poll_started,
+                now.isoformat(),
+                successful is True,
+                now.isoformat(),
+                successful is True,
+                successful is False,
+                successful is True,
+                successful is False,
+                backoff_seconds or 0,
+                successful is True,
+                successful is False,
+                failure_classification,
+                mailbox,
+                instance_id,
+            ),
+        )
+        conn.commit()
+        return True
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+
+
+def release_mailbox_worker_lease(
+    conn: sqlite3.Connection, *, mailbox: str, instance_id: str
+) -> None:
+    conn.execute(
+        """
+        UPDATE mailbox_intake_worker
+        SET worker_status = 'stopped', instance_id = NULL, lease_expires_at = NULL
+        WHERE mailbox = ? AND instance_id = ?
+        """,
+        (mailbox, instance_id),
+    )
+    conn.commit()
+
+
+def mailbox_worker_state(state_dir: Path, *, mailbox: str) -> dict[str, Any] | None:
+    resolved = state_dir.expanduser().resolve(strict=False)
+    if not (resolved / STATE_DB).exists():
+        return None
+    uri = f"file:{(resolved / STATE_DB).as_posix()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (MAILBOX_WORKER_TABLE,)
+        ).fetchone()
+        row = (
+            None
+            if table is None
+            else conn.execute(
+                "SELECT * FROM mailbox_intake_worker WHERE mailbox = ?", (mailbox,)
+            ).fetchone()
+        )
+    return None if row is None else dict(row)
+
+
+def mailbox_worker_snapshot(state_dir: Path, *, mailbox: str) -> dict[str, Any] | None:
+    """Read worker state and mailbox counters from one read-only SQLite snapshot."""
+    resolved = state_dir.expanduser().resolve(strict=False)
+    db_path = resolved / STATE_DB
+    if not db_path.exists():
+        return None
+    uri = f"file:{db_path.as_posix()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        worker_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (MAILBOX_WORKER_TABLE,),
+        ).fetchone()
+        row = (
+            None
+            if worker_table is None
+            else conn.execute(
+                "SELECT * FROM mailbox_intake_worker WHERE mailbox = ?", (mailbox,)
+            ).fetchone()
+        )
+        message_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mailbox_messages'"
+        ).fetchone()
+        cursor_row = conn.execute(
+            "SELECT value FROM metadata WHERE key = ?", (f"mailbox:{mailbox}:cursor",)
+        ).fetchone()
+        pending = (
+            0
+            if message_table is None
+            else int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM mailbox_messages "
+                    "WHERE review_status = 'pending_human_review'"
+                ).fetchone()[0]
+            )
+        )
+    if row is None:
+        return None
+    result = dict(row)
+    try:
+        result["cursor"] = int(cursor_row["value"]) if cursor_row is not None else 0
+    except (TypeError, ValueError):
+        result["cursor"] = 0
+    result["pending_human_review"] = pending
     return result
 
 
