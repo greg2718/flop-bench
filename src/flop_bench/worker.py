@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import re
-import sqlite3
 import time
 import uuid
 from collections.abc import Callable
@@ -15,7 +14,6 @@ from .config import BENCH_DID, MAILBOX, BenchConfig, assert_isolated
 from .exceptions import SafetyError
 from .mailbox import poll_mailbox
 from .state import (
-    STATE_DB,
     acquire_mailbox_worker_lease,
     connect_state,
     mailbox_worker_snapshot,
@@ -60,31 +58,16 @@ def worker_stop_handler(stop: Callable[[], None]) -> Callable[[int, Any], None]:
     return handler
 
 
-def _pending_count(state_dir: Path) -> int:
-    db = state_dir.expanduser().resolve(strict=False) / STATE_DB
-    if not db.exists():
-        return 0
-    uri = f"file:{db.as_posix()}?mode=ro"
-    with sqlite3.connect(uri, uri=True) as conn:
-        table = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mailbox_messages'"
-        ).fetchone()
-        if table is None:
-            return 0
-        return int(
-            conn.execute(
-                "SELECT COUNT(*) FROM mailbox_messages WHERE review_status = 'pending_human_review'"
-            ).fetchone()[0]
-        )
-
-
 def worker_status(*, state_dir: Path, now: Callable[[], datetime] = _now) -> dict[str, Any]:
     assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
     row = mailbox_worker_snapshot(state_dir, mailbox=MAILBOX)
     if row is None:
         status = "unavailable"
         lease_status = "absent"
-        row = {}
+        row = {"cursor": None, "pending_human_review": 0}
+    elif not row.get("worker_row_present"):
+        status = "unavailable"
+        lease_status = "absent"
     else:
         try:
             lease_active = (
@@ -114,21 +97,6 @@ def worker_status(*, state_dir: Path, now: Callable[[], datetime] = _now) -> dic
         "state_write": False,
         "network_action": False,
     }
-
-
-def _cursor(state_dir: Path) -> int:
-    db = state_dir.expanduser().resolve(strict=False) / STATE_DB
-    if not db.exists():
-        return 0
-    uri = f"file:{db.as_posix()}?mode=ro"
-    with sqlite3.connect(uri, uri=True) as conn:
-        row = conn.execute(
-            "SELECT value FROM metadata WHERE key = ?", (f"mailbox:{MAILBOX}:cursor",)
-        ).fetchone()
-    try:
-        return int(row[0]) if row is not None else 0
-    except (TypeError, ValueError):
-        return 0
 
 
 def worker_health(*, state_dir: Path, now: Callable[[], datetime] = _now) -> dict[str, Any]:
