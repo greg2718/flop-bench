@@ -1,6 +1,6 @@
 # Codex State
 
-Last updated: 2026-09-02.
+Last updated: 2026-09-03.
 
 - Current main commit: `f806029795af762db508bd5650ec268a83798f81`.
 - Current development branch: `chore/codex-efficiency-context`.
@@ -21,8 +21,8 @@ Last updated: 2026-09-02.
 - Credential status: production identity `SET`; wallet credentials `MISSING`; mailbox polling credentials `MISSING`.
 - Latest targeted E2 result-delivery checks: `.venv/bin/pytest -q -k 'result and (delivery or reconcile or history)'` passed with 6 selected tests; `.venv/bin/ruff check src tests` and `.venv/bin/mypy src` passed on 2026-09-01. Latest full gate remains the prior 2026-09-01 run.
 - Local Router -> Scout -> Bench workflow prototype: Bench now supports unsigned local `flop-verification-request/v1` intake through `flop-bench verification verify-request`, currently limited to deterministic synthetic Technocore signing-payload-order verification. It emits `flop-verification-result/v1` with same-operator disclosure, `independent_reputation: false`, reproducibility metadata, artifact hashes, and explicit zero network/key/TCLK-settlement counters. `flop-bench verification prepare-delivery` validates and persistently imports that result with an explicit canonical `mb-*` reply room and validated target DID, preserves Router linkage, and leaves it `UNSIGNED_LOCAL`; missing legacy routing remains delivery-blocked. This is controlled same-operator validation plumbing only, not independent reputation evidence and not production posting.
-- Phase G1 worker: supervised bounded mailbox-intake worker with a persistent lease, heartbeat, and backoff state is implemented locally; status/health read the canonical mailbox cursor directly from metadata even when no worker row exists. It performs intake only and requires later production supervisor/cloud configuration.
+- Phase G1.1 worker: supervised bounded mailbox-intake worker now has explicit local continuous-polling activation-preview/activate/deactivate commands with exact tokens. Persistent `worker run` fails closed unless supervised continuous polling is active; `--once` remains available as a manual diagnostic. Running workers recheck deactivation between polls and exit cleanly. Status/health/manifest expose `supervised_continuous_polling`; approval, execution, signing, result delivery, replies, posting, and Router updates remain manual/disabled.
 - Safe production sequence: merge reviewed code; run `flop-bench service doctor --state-dir ~/.flop_agents/bench --read-only`; explicitly run normal `flop-bench service doctor --state-dir ~/.flop_agents/bench` to apply pending migrations; rerun `flop-bench mailbox activation-preview --state-dir ~/.flop_agents/bench`; activate only when `can_activate` is true.
-- Next immediate task: small Phase F design for human-approved Router-compatible evidence export, followed by validation from an independently operated DID. Mailbox polling remains manual; Router updates remain separately gated.
+- Next immediate task: small Phase F design for human-approved Router-compatible evidence export, followed by validation from an independently operated DID. Supervised continuous mailbox polling is locally gated by explicit worker activation; Router updates remain separately gated.
 
 For durable design context, see [ARCHITECTURE.md](ARCHITECTURE.md), [RISK_CONSTITUTION.md](RISK_CONSTITUTION.md), and [TECHNOCORE_EVIDENCE.md](TECHNOCORE_EVIDENCE.md).

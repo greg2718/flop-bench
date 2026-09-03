@@ -44,6 +44,7 @@ from .state import (
 MAILBOX_REQUEST_SCHEMA_VERSION = "flop-bench.mailbox-request.v0.1"
 MAILBOX_ACTIVATE_CONFIRMATION = "ACTIVATE-MB-FLOP-BENCH"
 MAILBOX_DEACTIVATE_CONFIRMATION = "DEACTIVATE-MB-FLOP-BENCH"
+SUPERVISED_POLLING_ACTIVATION_KEY = f"{MAILBOX}:supervised-continuous-polling"
 MAX_MAILBOX_PAGE_LIMIT = 200
 MAX_MAILBOX_PAGES = 10
 MAX_MAILBOX_ITEMS = 2_000
@@ -453,6 +454,9 @@ def mailbox_status(*, state_dir: Path) -> dict[str, Any]:
     pending = 0
     total = 0
     activation = mailbox_activation_state(resolved, mailbox=MAILBOX)
+    supervised_polling = mailbox_activation_state(
+        resolved, mailbox=SUPERVISED_POLLING_ACTIVATION_KEY
+    )
     advertisement = _did_note_advertisement_status(resolved)
     if status["database_exists"]:
         uri = f"file:{(resolved / STATE_DB).as_posix()}?mode=ro"
@@ -490,6 +494,8 @@ def mailbox_status(*, state_dir: Path) -> dict[str, Any]:
         "creation_required": False,
         "activation": activation,
         "intake_active": activation["active"],
+        "supervised_continuous_polling": supervised_polling["active"],
+        "supervised_continuous_polling_activation": supervised_polling["activation_status"],
         "new_valid_request_classification": (
             "valid_request" if activation["active"] else "intake_inactive"
         ),

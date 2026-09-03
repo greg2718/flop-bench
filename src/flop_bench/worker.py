@@ -16,8 +16,12 @@ from .mailbox import poll_mailbox
 from .state import (
     acquire_mailbox_worker_lease,
     connect_state,
+    mailbox_activation_state,
     mailbox_worker_snapshot,
     mailbox_worker_state,
+    migration_status,
+    record_mailbox_activation,
+    record_mailbox_deactivation,
     release_mailbox_worker_lease,
     update_mailbox_worker,
 )
@@ -26,6 +30,10 @@ DEFAULT_POLL_INTERVAL_SECONDS = 30.0
 DEFAULT_MAX_BACKOFF_SECONDS = 300.0
 MAX_INTERVAL_SECONDS = 3600.0
 _SAFE_FAILURE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+WORKER_ACTIVATE_CONFIRMATION = "ENABLE-SUPERVISED-BENCH-POLLING"
+WORKER_DEACTIVATE_CONFIRMATION = "DISABLE-SUPERVISED-BENCH-POLLING"
+SUPERVISED_POLLING_ACTIVATION_KEY = f"{MAILBOX}:supervised-continuous-polling"
+SUPERVISED_POLLING_PROTOCOL_VERSION = "flop-bench.supervised-continuous-polling.v0.1"
 
 
 def _now() -> datetime:
@@ -58,9 +66,142 @@ def worker_stop_handler(stop: Callable[[], None]) -> Callable[[int, Any], None]:
     return handler
 
 
+def _supervised_polling_activation(state_dir: Path) -> dict[str, Any]:
+    return mailbox_activation_state(state_dir, mailbox=SUPERVISED_POLLING_ACTIVATION_KEY)
+
+
+def _supervised_polling_active(state_dir: Path) -> bool:
+    return bool(_supervised_polling_activation(state_dir)["active"])
+
+
+def worker_activation_preview(*, state_dir: Path) -> dict[str, Any]:
+    assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
+    resolved = state_dir.expanduser().resolve(strict=False)
+    status = migration_status(resolved)
+    mailbox_activation = mailbox_activation_state(resolved, mailbox=MAILBOX)
+    polling_activation = _supervised_polling_activation(resolved)
+    blockers = []
+    if not status["database_exists"]:
+        blockers.append("state_database_missing")
+    if status["pending_migrations"]:
+        blockers.append("state_schema_migration_required")
+    if mailbox_activation["permission_issues"]:
+        blockers.append("private_state_permission_issue")
+    if not mailbox_activation["active"]:
+        blockers.append("mailbox_intake_inactive")
+    return {
+        "ok": True,
+        "state_dir": str(resolved),
+        "mailbox": MAILBOX,
+        "activation": polling_activation,
+        "mailbox_intake_active": mailbox_activation["active"],
+        "supervised_continuous_polling": polling_activation["active"],
+        "activation_blockers": blockers,
+        "can_activate": not blockers,
+        "required_confirmation": WORKER_ACTIVATE_CONFIRMATION,
+        "activation_consequences": [
+            "worker run without --once may continuously poll the mailbox "
+            "under an external supervisor",
+            "polling remains bounded read-only intake",
+            "valid signed requests enter pending_human_review only",
+        ],
+        "disabled_behaviors": {
+            "state_creation": False,
+            "migration": False,
+            "network": False,
+            "identity_loading": False,
+            "approval": False,
+            "execution": False,
+            "signing": False,
+            "result_delivery": False,
+            "reply": False,
+            "posting": False,
+            "router_updates": False,
+            "wallets": False,
+            "flop_transfers": False,
+        },
+        "state_write": False,
+        "network_action": False,
+        "will_poll": False,
+        "will_sign": False,
+        "will_post": False,
+        "will_execute": False,
+        "will_reply": False,
+        "will_update_router": False,
+    }
+
+
+def worker_activate(*, state_dir: Path, confirm: str) -> dict[str, Any]:
+    if confirm != WORKER_ACTIVATE_CONFIRMATION:
+        raise SafetyError("worker activation requires exact confirmation")
+    preview = worker_activation_preview(state_dir=state_dir)
+    if preview["activation_blockers"]:
+        raise SafetyError(
+            "worker activation is blocked: " + ", ".join(preview["activation_blockers"])
+        )
+    resolved = state_dir.expanduser().resolve(strict=False)
+    with connect_state(resolved) as conn:
+        activation = record_mailbox_activation(
+            conn,
+            mailbox=SUPERVISED_POLLING_ACTIVATION_KEY,
+            protocol_version=SUPERVISED_POLLING_PROTOCOL_VERSION,
+        )
+    return {
+        "ok": True,
+        **activation,
+        "mailbox": MAILBOX,
+        "supervised_continuous_polling": True,
+        "state_dir": str(resolved),
+        "state_write": True,
+        "network_action": False,
+        "will_poll": False,
+        "will_sign": False,
+        "will_post": False,
+        "will_execute": False,
+        "will_reply": False,
+        "will_update_router": False,
+    }
+
+
+def worker_deactivate(*, state_dir: Path, confirm: str) -> dict[str, Any]:
+    if confirm != WORKER_DEACTIVATE_CONFIRMATION:
+        raise SafetyError("worker deactivation requires exact confirmation")
+    assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
+    resolved = state_dir.expanduser().resolve(strict=False)
+    status = migration_status(resolved)
+    if not status["database_exists"]:
+        raise SafetyError("worker deactivation requires existing Bench state database")
+    if status["pending_migrations"]:
+        raise SafetyError("worker deactivation requires migrated Bench state")
+    with connect_state(resolved) as conn:
+        activation = record_mailbox_deactivation(
+            conn,
+            mailbox=SUPERVISED_POLLING_ACTIVATION_KEY,
+            protocol_version=SUPERVISED_POLLING_PROTOCOL_VERSION,
+        )
+    return {
+        "ok": True,
+        **activation,
+        "mailbox": MAILBOX,
+        "supervised_continuous_polling": False,
+        "existing_records_preserved": True,
+        "running_workers_exit_after_current_poll_or_sleep": True,
+        "state_dir": str(resolved),
+        "state_write": True,
+        "network_action": False,
+        "will_poll": False,
+        "will_sign": False,
+        "will_post": False,
+        "will_execute": False,
+        "will_reply": False,
+        "will_update_router": False,
+    }
+
+
 def worker_status(*, state_dir: Path, now: Callable[[], datetime] = _now) -> dict[str, Any]:
     assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
     row = mailbox_worker_snapshot(state_dir, mailbox=MAILBOX)
+    polling_activation = _supervised_polling_activation(state_dir)
     if row is None:
         status = "unavailable"
         lease_status = "absent"
@@ -94,6 +235,8 @@ def worker_status(*, state_dir: Path, now: Callable[[], datetime] = _now) -> dic
         "worker_instance_id": row.get("instance_id"),
         "cursor": row.get("cursor", 0),
         "pending_human_review": row.get("pending_human_review", 0),
+        "supervised_continuous_polling": polling_activation["active"],
+        "supervised_continuous_polling_activation": polling_activation["activation_status"],
         "state_write": False,
         "network_action": False,
     }
@@ -138,6 +281,10 @@ def run_worker(
 ) -> dict[str, Any]:
     validate_worker_timing(poll_interval=poll_interval, max_backoff=max_backoff)
     assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
+    if not once and not _supervised_polling_active(state_dir):
+        raise SafetyError(
+            "persistent mailbox worker requires supervised continuous polling activation"
+        )
     instance_id = uuid.uuid4().hex
     lease_seconds = max(60.0, poll_interval * 2)
     with connect_state(state_dir) as conn:
@@ -153,6 +300,13 @@ def run_worker(
     last: dict[str, Any] = {}
     try:
         while not should_stop():
+            if not once and not _supervised_polling_active(state_dir):
+                last = {
+                    "ok": True,
+                    "history_scan_complete": True,
+                    "poll_status": "stopped_supervised_polling_deactivated",
+                }
+                break
             now = clock()
             with connect_state(state_dir) as conn:
                 if not update_mailbox_worker(

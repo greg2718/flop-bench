@@ -1084,7 +1084,12 @@ def record_mailbox_activation(
     return _mailbox_activation_row_dict(result, mailbox=mailbox)
 
 
-def record_mailbox_deactivation(conn: sqlite3.Connection, *, mailbox: str) -> dict[str, Any]:
+def record_mailbox_deactivation(
+    conn: sqlite3.Connection,
+    *,
+    mailbox: str,
+    protocol_version: str = "flop-bench.mailbox-request.v0.1",
+) -> dict[str, Any]:
     now = datetime.now(UTC).isoformat()
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -1105,10 +1110,11 @@ def record_mailbox_deactivation(conn: sqlite3.Connection, *, mailbox: str) -> di
                 autonomous_reply, router_updates, updated_at
             )
             VALUES (
-                ?, 'flop-bench.mailbox-request.v0.1', 'inactive', ?,
+                ?, ?, 'inactive', ?,
                 'human_operator', 'manual_only', 0, 0, 0, 0, ?
             )
             ON CONFLICT(mailbox) DO UPDATE SET
+                protocol_version = excluded.protocol_version,
                 activation_status = 'inactive',
                 activated_by = 'human_operator',
                 execution_mode = 'manual_only',
@@ -1118,7 +1124,7 @@ def record_mailbox_deactivation(conn: sqlite3.Connection, *, mailbox: str) -> di
                 router_updates = 0,
                 updated_at = excluded.updated_at
             """,
-            (mailbox, activated_at, now),
+            (mailbox, protocol_version, activated_at, now),
         )
         result = conn.execute(
             """

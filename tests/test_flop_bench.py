@@ -184,8 +184,13 @@ from flop_bench.verification import (
     verify_signing_request,
 )
 from flop_bench.worker import (
+    WORKER_ACTIVATE_CONFIRMATION,
+    WORKER_DEACTIVATE_CONFIRMATION,
     run_worker,
     validate_worker_timing,
+    worker_activate,
+    worker_activation_preview,
+    worker_deactivate,
     worker_health,
     worker_status,
     worker_stop_handler,
@@ -620,6 +625,7 @@ def test_worker_once_lease_recovery_backoff_and_read_only_status(tmp_path: Path)
     assert status["consecutive_failures"] == 0
     assert worker_health(state_dir=state, now=clock)["health"] == "stopped"
 
+    activate_supervised_worker_polling(state)
     delays: list[float] = []
     calls = 0
 
@@ -655,6 +661,14 @@ def test_worker_once_lease_recovery_backoff_and_read_only_status(tmp_path: Path)
     assert missing_status["cursor"] is None
     assert missing_health["cursor"] is None
     assert not (tmp_path / "missing").exists()
+
+
+def activate_supervised_worker_polling(state: Path) -> None:
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
+    worker_activate(state_dir=state, confirm=WORKER_ACTIVATE_CONFIRMATION)
 
 
 def set_mailbox_cursor(state: Path, cursor: int) -> None:
@@ -962,6 +976,7 @@ def test_worker_failure_classifications_use_injected_backoff_only(
     tmp_path: Path, failure: str
 ) -> None:
     state = tmp_path / failure
+    activate_supervised_worker_polling(state)
     delays: list[float] = []
     calls = 0
 
@@ -994,6 +1009,81 @@ def test_worker_failure_classifications_use_injected_backoff_only(
     assert status["current_backoff_seconds"] == 2
     assert status["last_failure_classification"] == failure
     assert delays == [2]
+
+
+def test_worker_supervised_polling_activation_preview_activate_deactivate_and_run_gate(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "supervised"
+
+    before_state = worker_activation_preview(state_dir=state)
+    assert before_state["state_write"] is False
+    assert before_state["network_action"] is False
+    assert before_state["can_activate"] is False
+    assert before_state["supervised_continuous_polling"] is False
+    assert not state.exists()
+
+    with connect_state(state):
+        pass
+    write_reconciled_did_note_observation(state)
+    mailbox_activate(state_dir=state, confirm=MAILBOX_ACTIVATE_CONFIRMATION)
+    ready = worker_activation_preview(state_dir=state)
+    assert ready["can_activate"] is True
+    with pytest.raises(SafetyError):
+        worker_activate(state_dir=state, confirm="wrong")
+    with pytest.raises(SafetyError):
+        run_worker(
+            state_dir=state,
+            transport=FakeActivationTransport(),
+            poll=lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("persistent worker must fail before polling")
+            ),
+        )
+
+    activated = worker_activate(state_dir=state, confirm=WORKER_ACTIVATE_CONFIRMATION)
+    assert activated["supervised_continuous_polling"] is True
+    status = worker_status(state_dir=state)
+    health = worker_health(state_dir=state)
+    mailbox = mailbox_status(state_dir=state)
+    manifest = service_manifest(state_dir=state)
+    assert status["supervised_continuous_polling"] is True
+    assert health["supervised_continuous_polling"] is True
+    assert mailbox["supervised_continuous_polling"] is True
+    assert manifest["mailbox"]["supervised_continuous_polling"] is True
+    assert manifest["safety"]["supervised_continuous_polling"] is True
+    assert manifest["safety"]["autonomous_polling"] is False
+
+    deactivated = worker_deactivate(state_dir=state, confirm=WORKER_DEACTIVATE_CONFIRMATION)
+    assert deactivated["supervised_continuous_polling"] is False
+    assert worker_status(state_dir=state)["supervised_continuous_polling"] is False
+
+
+def test_running_worker_notices_supervised_polling_deactivation(tmp_path: Path) -> None:
+    state = tmp_path / "deactivate-running"
+    activate_supervised_worker_polling(state)
+    polls = 0
+    delays: list[float] = []
+
+    def poll(**_kwargs: object) -> dict[str, object]:
+        nonlocal polls
+        polls += 1
+        worker_deactivate(state_dir=state, confirm=WORKER_DEACTIVATE_CONFIRMATION)
+        return {"ok": True, "history_scan_complete": True, "cursor_after": 0}
+
+    result = run_worker(
+        state_dir=state,
+        transport=FakeActivationTransport(),
+        poll_interval=2,
+        max_backoff=4,
+        sleeper=delays.append,
+        poll=poll,
+    )
+
+    assert polls == 1
+    assert delays == [2]
+    assert result["ok"] is True
+    assert result["last_poll"]["poll_status"] == "stopped_supervised_polling_deactivated"
+    assert worker_status(state_dir=state)["worker_status"] == "stopped"
 
 
 def test_worker_delayed_visibility_and_duplicate_intake_are_idempotent(tmp_path: Path) -> None:
@@ -4516,9 +4606,12 @@ def test_mailbox_activation_success_idempotency_private_permissions_and_manifest
     status = mailbox_status(state_dir=state)
     manifest = service_manifest(state_dir=state)
     assert status["intake_active"] is True
+    assert status["supervised_continuous_polling"] is False
     assert manifest["mailbox"]["active"] is True
+    assert manifest["mailbox"]["supervised_continuous_polling"] is False
     assert manifest["safety"]["requests_accepted"] is True
     assert manifest["safety"]["autonomous_polling"] is False
+    assert manifest["safety"]["supervised_continuous_polling"] is False
     assert manifest["safety"]["autonomous_reply"] is False
     assert manifest["safety"]["router_updates"] is False
 
@@ -4692,6 +4785,62 @@ def test_mailbox_cli_activation_and_no_autonomous_scheduler(tmp_path: Path) -> N
     parsed_activate = json.loads(activate.stdout)
     assert parsed_activate["autonomous_scheduler"] is False
     assert parsed_activate["will_poll"] is False
+
+    worker_preview = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "worker",
+            "activation-preview",
+            "--state-dir",
+            str(state),
+        ],
+        cwd=REPO,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert worker_preview.returncode == 0
+    assert json.loads(worker_preview.stdout)["can_activate"] is True
+    worker_activate_result = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "worker",
+            "activate",
+            "--state-dir",
+            str(state),
+            "--confirm",
+            WORKER_ACTIVATE_CONFIRMATION,
+        ],
+        cwd=REPO,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert worker_activate_result.returncode == 0
+    assert json.loads(worker_activate_result.stdout)["supervised_continuous_polling"] is True
+    worker_deactivate_result = subprocess.run(  # noqa: S603 - fixed CLI smoke argv.
+        [
+            sys.executable,
+            "-m",
+            "flop_bench.cli",
+            "worker",
+            "deactivate",
+            "--state-dir",
+            str(state),
+            "--confirm",
+            WORKER_DEACTIVATE_CONFIRMATION,
+        ],
+        cwd=REPO,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert worker_deactivate_result.returncode == 0
+    assert json.loads(worker_deactivate_result.stdout)["supervised_continuous_polling"] is False
 
 
 def test_mailbox_service_capability_does_not_authorize_actions(tmp_path: Path) -> None:

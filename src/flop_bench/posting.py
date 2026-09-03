@@ -50,6 +50,7 @@ MAX_TECHNOCORE_NONCE_DIGITS = 19
 URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
 STRONG_POST_STATUSES = frozenset({"posted", "reconciled_posted", "already-posted"})
 TECHNOCORE_MB_ROOM_RE = re.compile(r"^mb-[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$")
+SUPERVISED_POLLING_ACTIVATION_KEY = f"{MAILBOX}:supervised-continuous-polling"
 
 
 def service_manifest(*, state_dir: Path | None = None) -> dict[str, Any]:
@@ -67,6 +68,11 @@ def service_manifest(*, state_dir: Path | None = None) -> dict[str, Any]:
             "router_updates": False,
         }
     )
+    supervised_polling = (
+        mailbox_activation_state(state_dir, mailbox=SUPERVISED_POLLING_ACTIVATION_KEY)
+        if state_dir is not None
+        else {"active": False, "activation_status": "inactive"}
+    )
     return {
         "schema_version": "flop-bench.service-manifest.v0.2",
         "bench_did": BENCH_DID,
@@ -78,6 +84,8 @@ def service_manifest(*, state_dir: Path | None = None) -> dict[str, Any]:
             "activation_status": activation["activation_status"],
             "protocol_version": activation["protocol_version"],
             "execution_mode": activation["execution_mode"],
+            "supervised_continuous_polling": supervised_polling["active"],
+            "supervised_continuous_polling_activation": supervised_polling["activation_status"],
         },
         "capabilities": list(BENCH_SERVICE_CAPABILITIES),
         "operator_group": {
@@ -98,6 +106,7 @@ def service_manifest(*, state_dir: Path | None = None) -> dict[str, Any]:
             "flop_transfers": False,
             "autonomous_outbound_posting": False,
             "autonomous_polling": activation["autonomous_polling"],
+            "supervised_continuous_polling": supervised_polling["active"],
             "autonomous_reply": activation["autonomous_reply"],
             "router_updates": activation["router_updates"],
             "requests_accepted": activation["active"],
