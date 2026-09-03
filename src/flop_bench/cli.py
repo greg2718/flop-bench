@@ -82,6 +82,9 @@ from .worker import (
     DEFAULT_MAX_BACKOFF_SECONDS,
     DEFAULT_POLL_INTERVAL_SECONDS,
     run_worker,
+    worker_activate,
+    worker_activation_preview,
+    worker_deactivate,
     worker_health,
     worker_status,
     worker_stop_handler,
@@ -307,6 +310,14 @@ def build_parser() -> argparse.ArgumentParser:
     worker_run.add_argument("--max-backoff", type=float, default=DEFAULT_MAX_BACKOFF_SECONDS)
     worker_run.add_argument("--once", action="store_true")
     worker_run.add_argument("--verbose", action="store_true")
+    worker_activation_preview_cmd = worker_sub.add_parser("activation-preview")
+    worker_activation_preview_cmd.add_argument("--state-dir", required=True, type=Path)
+    worker_activate_cmd = worker_sub.add_parser("activate")
+    worker_activate_cmd.add_argument("--state-dir", required=True, type=Path)
+    worker_activate_cmd.add_argument("--confirm", required=True)
+    worker_deactivate_cmd = worker_sub.add_parser("deactivate")
+    worker_deactivate_cmd.add_argument("--state-dir", required=True, type=Path)
+    worker_deactivate_cmd.add_argument("--confirm", required=True)
     worker_status_cmd = worker_sub.add_parser("status")
     worker_status_cmd.add_argument("--state-dir", required=True, type=Path)
     worker_health_cmd = worker_sub.add_parser("health")
@@ -588,6 +599,12 @@ def run(argv: list[str] | None = None) -> int:
             _print_json(worker_status(state_dir=args.state_dir))
         elif args.cmd == "worker" and args.worker_cmd == "health":
             _print_json(worker_health(state_dir=args.state_dir))
+        elif args.cmd == "worker" and args.worker_cmd == "activation-preview":
+            _print_json(worker_activation_preview(state_dir=args.state_dir))
+        elif args.cmd == "worker" and args.worker_cmd == "activate":
+            _print_json(worker_activate(state_dir=args.state_dir, confirm=args.confirm))
+        elif args.cmd == "worker" and args.worker_cmd == "deactivate":
+            _print_json(worker_deactivate(state_dir=args.state_dir, confirm=args.confirm))
         elif args.cmd == "worker" and args.worker_cmd == "run":
             stop = threading.Event()
             previous = {
@@ -600,6 +617,10 @@ def run(argv: list[str] | None = None) -> int:
                     if args.verbose
                     else None
                 )
+
+                def sleep_until_signal(seconds: float) -> None:
+                    stop.wait(seconds)
+
                 _print_json(
                     run_worker(
                         state_dir=args.state_dir,
@@ -607,6 +628,7 @@ def run(argv: list[str] | None = None) -> int:
                         once=args.once,
                         poll_interval=args.poll_interval,
                         max_backoff=args.max_backoff,
+                        sleeper=sleep_until_signal,
                         should_stop=stop.is_set,
                         log=log,
                     )
