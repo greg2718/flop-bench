@@ -55,6 +55,10 @@ While local intake is inactive, otherwise valid requests are stored with `classi
 
 Once local intake is active, valid signed requests enter `pending_human_review`. Human approval changes a pending request to `approved_for_manual_execution` only. Approval does not execute tests, sign responses, post replies, update Router, fetch URLs, or start a scheduler.
 
+## Supervised Intake Worker
+
+`worker run` continuously performs only the same bounded read-only mailbox polling described above. It uses one expiring local lease, bounded failure backoff, and atomic cursor storage. It never approves, executes, signs, posts, replies, follows URLs, or updates Router. It requires an external supervisor in production; cloud/container deployment is not part of this protocol.
+
 Manual execution and result-preparation commands are explicit:
 
 ```bash

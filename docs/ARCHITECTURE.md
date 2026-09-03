@@ -40,4 +40,4 @@ The only supported remote procedure is `literal_equality` over bounded JSON scal
 
 ## Network Gates
 
-Default operation is offline. Live Technocore operations are limited to explicit room activation/status, human-approved signed posting, bounded read-only reconciliation, and separately authorized bounded mailbox polling. Router submission, mailbox replies, result delivery, wallet actions, transfers, autonomous polling, and schedulers are not implemented.
+Default operation is offline. Live Technocore operations are limited to explicit room activation/status, human-approved signed posting, bounded read-only reconciliation, and separately authorized bounded mailbox polling. Phase G1 adds a supervised intake worker with a local expiring SQLite lease and bounded polling/backoff only; it cannot approve, execute, sign, reply, or update Router. Router submission, wallet actions, transfers, and deployment/supervisor configuration remain separate work.

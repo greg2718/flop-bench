@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +78,14 @@ from .service import (
 )
 from .state import activation_history, connect_state_with_migrations
 from .verification import prepare_verification_delivery, verify_request_file
+from .worker import (
+    DEFAULT_MAX_BACKOFF_SECONDS,
+    DEFAULT_POLL_INTERVAL_SECONDS,
+    run_worker,
+    worker_health,
+    worker_status,
+    worker_stop_handler,
+)
 
 
 def _print_json(value: Any) -> None:
@@ -289,6 +299,18 @@ def build_parser() -> argparse.ArgumentParser:
     verification_prepare_delivery.add_argument("--state-dir", required=True, type=Path)
     verification_prepare_delivery.add_argument("--reply-room", required=True)
     verification_prepare_delivery.add_argument("--target-did", required=True)
+    worker = sub.add_parser("worker")
+    worker_sub = worker.add_subparsers(dest="worker_cmd", required=True)
+    worker_run = worker_sub.add_parser("run")
+    worker_run.add_argument("--state-dir", required=True, type=Path)
+    worker_run.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL_SECONDS)
+    worker_run.add_argument("--max-backoff", type=float, default=DEFAULT_MAX_BACKOFF_SECONDS)
+    worker_run.add_argument("--once", action="store_true")
+    worker_run.add_argument("--verbose", action="store_true")
+    worker_status_cmd = worker_sub.add_parser("status")
+    worker_status_cmd.add_argument("--state-dir", required=True, type=Path)
+    worker_health_cmd = worker_sub.add_parser("health")
+    worker_health_cmd.add_argument("--state-dir", required=True, type=Path)
     return parser
 
 
@@ -561,6 +583,37 @@ def run(argv: list[str] | None = None) -> int:
                     reply_room=args.reply_room,
                     target_did=args.target_did,
                 )
+            )
+        elif args.cmd == "worker" and args.worker_cmd == "status":
+            _print_json(worker_status(state_dir=args.state_dir))
+        elif args.cmd == "worker" and args.worker_cmd == "health":
+            _print_json(worker_health(state_dir=args.state_dir))
+        elif args.cmd == "worker" and args.worker_cmd == "run":
+            stop = threading.Event()
+            previous = {
+                sig: signal.signal(sig, worker_stop_handler(stop.set))
+                for sig in (signal.SIGINT, signal.SIGTERM)
+            }
+            try:
+                log = (
+                    (lambda event: print(json.dumps(event, sort_keys=True), file=sys.stderr))
+                    if args.verbose
+                    else None
+                )
+                _print_json(
+                    run_worker(
+                        state_dir=args.state_dir,
+                        transport=UrlLibActivationTransport(),
+                        once=args.once,
+                        poll_interval=args.poll_interval,
+                        max_backoff=args.max_backoff,
+                        should_stop=stop.is_set,
+                        log=log,
+                    )
+                )
+            finally:
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
         else:
             raise FlopBenchError("unknown command")
     except LedgerError as exc:
