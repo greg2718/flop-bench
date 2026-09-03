@@ -39,6 +39,7 @@ from flop_bench.activation import (
     validate_origin,
 )
 from flop_bench.adapters import run_local_command_step
+from flop_bench.cli import run as cli_run
 from flop_bench.config import (
     BENCH_DID,
     BENCH_SERVICE_CAPABILITIES,
@@ -339,12 +340,19 @@ def test_verification_result_prepare_delivery_preserves_router_provenance(
 
     monkeypatch.setattr("flop_bench.identity.load_production_identity_key", fail_identity_load)
     monkeypatch.setattr("urllib.request.urlopen", fail_network)
-    prepared = prepare_verification_delivery(result_path, state_dir=state)
+    prepared = prepare_verification_delivery(
+        result_path,
+        state_dir=state,
+        reply_room="mb-flop-scout",
+        target_did=SCOUT_DID,
+    )
 
     assert prepared["status"] == "prepared"
     assert prepared["private_key_accesses"] == 0
     assert prepared["network_writes"] == 0
     assert prepared["authenticity_status"] == "UNSIGNED_LOCAL"
+    assert prepared["reply_room"] == "mb-flop-scout"
+    assert prepared["target_did"] == SCOUT_DID
     preview = result_preview(state_dir=state, request_id="FVR-local-1")
     assert preview["routing_decision_id"] == "frd1-local"
     assert preview["routing_decision_hash"] == "0" * 64
@@ -354,10 +362,13 @@ def test_verification_result_prepare_delivery_preserves_router_provenance(
     assert preview["independent_reputation"] is False
     assert preview["operator_group"] == LOCAL_OPERATOR_GROUP
     assert preview["result_hash"] == result["result_hash"]
+    assert preview["reply_room"] == "mb-flop-scout"
+    assert preview["target_did"] == SCOUT_DID
     delivery = result_delivery_preview(state_dir=state, request_id="FVR-local-1")
-    assert delivery["can_send"] is False
-    assert "missing_result_destination" in delivery["blockers"]
-    assert "result_delivery_target_did_unavailable" in delivery["blockers"]
+    assert delivery["can_send"] is True
+    assert delivery["blockers"] == []
+    assert delivery["destination"] == "mb-flop-scout"
+    assert delivery["target_did"] == SCOUT_DID
     assert delivery["result_envelope"]["routing_decision_id"] == "frd1-local"
     assert delivery["state_write"] is False
     assert delivery["network_action"] is False
@@ -377,7 +388,198 @@ def test_verification_result_prepare_rejects_invalid_input_before_identity_acces
 
     monkeypatch.setattr("flop_bench.identity.load_production_identity_key", fail_identity_load)
     with pytest.raises(ValidationError, match="missing required fields"):
-        prepare_verification_delivery(result_path, state_dir=tmp_path / "state")
+        prepare_verification_delivery(
+            result_path,
+            state_dir=tmp_path / "state",
+            reply_room="mb-flop-scout",
+            target_did=SCOUT_DID,
+        )
+
+
+@pytest.mark.parametrize(
+    ("reply_room", "target_did", "error"),
+    [
+        ("mb-flop-scout", None, "target_did is required"),
+        ("mb-flop-scout", "did:key:not-a-did", "target_did is invalid"),
+        ("d-flop-bench", SCOUT_DID, r"must be a canonical mb-\* room"),
+    ],
+)
+def test_verification_result_prepare_rejects_invalid_return_routing(
+    tmp_path: Path,
+    reply_room: str,
+    target_did: str | None,
+    error: str,
+) -> None:
+    result = verify_signing_request(
+        verification_request_fixture(), completed_at="2026-09-02T12:00:01Z"
+    )
+    result_path = write_json(tmp_path / "verification-result.json", result)
+    with pytest.raises(ValidationError, match=error):
+        prepare_verification_delivery(
+            result_path,
+            state_dir=tmp_path / "state",
+            reply_room=reply_room,
+            target_did=target_did,
+        )
+
+
+def test_imported_verification_result_missing_legacy_target_stays_blocked(tmp_path: Path) -> None:
+    result = verify_signing_request(
+        verification_request_fixture(), completed_at="2026-09-02T12:00:01Z"
+    )
+    result_path = write_json(tmp_path / "verification-result.json", result)
+    state = tmp_path / "state"
+    prepare_verification_delivery(
+        result_path,
+        state_dir=state,
+        reply_room="mb-flop-scout",
+        target_did=SCOUT_DID,
+    )
+    with connect_state(state) as conn:
+        conn.execute("UPDATE verification_result_imports SET target_did = NULL")
+        conn.commit()
+    preview = result_delivery_preview(state_dir=state, request_id="FVR-local-1")
+    assert preview["can_send"] is False
+    assert "result_delivery_target_did_unavailable" in preview["blockers"]
+
+
+def test_verification_result_target_did_is_explicit_not_inferred_from_mailbox(
+    tmp_path: Path,
+) -> None:
+    result = verify_signing_request(
+        verification_request_fixture(), completed_at="2026-09-02T12:00:01Z"
+    )
+    result_path = write_json(tmp_path / "verification-result.json", result)
+    explicit_target = public_did(Ed25519PrivateKey.generate())
+    state = tmp_path / "state"
+    prepare_verification_delivery(
+        result_path,
+        state_dir=state,
+        reply_room="mb-flop-scout",
+        target_did=explicit_target,
+    )
+    preview = result_delivery_preview(state_dir=state, request_id="FVR-local-1")
+    assert preview["target_did"] == explicit_target
+    assert preview["target_did"] != SCOUT_DID
+
+
+def test_blocked_imported_result_send_does_not_prompt_for_private_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = verify_signing_request(
+        verification_request_fixture(), completed_at="2026-09-02T12:00:01Z"
+    )
+    result_path = write_json(tmp_path / "verification-result.json", result)
+    state = tmp_path / "state"
+    prepare_verification_delivery(
+        result_path,
+        state_dir=state,
+        reply_room="mb-flop-scout",
+        target_did=SCOUT_DID,
+    )
+
+    def fail_passphrase_prompt() -> str:
+        raise AssertionError("blocked result send must not prompt for a passphrase")
+
+    monkeypatch.setattr(
+        "flop_bench.cli.read_interactive_existing_passphrase", fail_passphrase_prompt
+    )
+    assert (
+        cli_run(
+            [
+                "result",
+                "send",
+                "FVR-local-1",
+                "--state-dir",
+                str(state),
+                "--destination",
+                "mb-wrong-destination",
+                "--live",
+                "--confirm",
+                RESULT_SEND_CONFIRMATION,
+            ]
+        )
+        == 4
+    )
+
+
+def test_non_live_imported_result_send_does_not_prompt_or_mutate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = verify_signing_request(
+        verification_request_fixture(), completed_at="2026-09-02T12:00:01Z"
+    )
+    result_path = write_json(tmp_path / "verification-result.json", result)
+    state = tmp_path / "state"
+    prepare_verification_delivery(
+        result_path,
+        state_dir=state,
+        reply_room="mb-flop-scout",
+        target_did=SCOUT_DID,
+    )
+
+    def fail_passphrase_prompt() -> str:
+        raise AssertionError("non-live result send must not prompt for a passphrase")
+
+    monkeypatch.setattr(
+        "flop_bench.cli.read_interactive_existing_passphrase", fail_passphrase_prompt
+    )
+    assert (
+        cli_run(
+            [
+                "result",
+                "send",
+                "FVR-local-1",
+                "--state-dir",
+                str(state),
+                "--destination",
+                "mb-flop-scout",
+                "--confirm",
+                RESULT_SEND_CONFIRMATION,
+            ]
+        )
+        == 4
+    )
+    assert result_history(state_dir=state, limit=10)["deliveries"] == []
+
+
+def test_non_live_result_delivery_does_not_load_key_nonce_or_sign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, _sender = completed_result_request(tmp_path, request_id="non-live-no-key")
+    transport = FakeActivationTransport()
+    calls = {"key": 0, "nonce": 0, "sign": 0}
+
+    def fail_key(*args: object, **kwargs: object) -> object:
+        calls["key"] += 1
+        raise AssertionError("non-live result delivery must not load a key")
+
+    def fail_nonce(*args: object, **kwargs: object) -> int:
+        calls["nonce"] += 1
+        raise AssertionError("non-live result delivery must not acquire a nonce")
+
+    def fail_sign(*args: object, **kwargs: object) -> str:
+        calls["sign"] += 1
+        raise AssertionError("non-live result delivery must not sign")
+
+    monkeypatch.setattr("flop_bench.execution.load_production_identity_key", fail_key)
+    monkeypatch.setattr("flop_bench.execution._next_delivery_nonce", fail_nonce)
+    monkeypatch.setattr("flop_bench.execution.b64u", fail_sign)
+    with pytest.raises(SafetyError, match="explicit --live"):
+        send_result_delivery(
+            state_dir=state,
+            request_id="non-live-no-key",
+            destination="mb-result-replies",
+            live=False,
+            confirm=RESULT_SEND_CONFIRMATION,
+            passphrase=strong_test_phrase(),
+            transport=transport,
+            expected_state_dir=state,
+            expected_bench_did=BENCH_DID,
+        )
+    assert calls == {"key": 0, "nonce": 0, "sign": 0}
+    assert transport.requests == []
+    assert result_history(state_dir=state, limit=10)["deliveries"] == []
 
 
 def load_scout_module() -> object:

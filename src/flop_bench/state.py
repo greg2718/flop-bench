@@ -10,7 +10,7 @@ from typing import Any, cast
 
 from .exceptions import SafetyError
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 STATE_DB = "state.sqlite"
 SQLITE_SIGNED_64_MAX = 9_223_372_036_854_775_807
 PRIVATE_FILE_MODE = 0o600
@@ -627,11 +627,33 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
             """
         )
         applied.append(11)
+    if current < 12:
+        columns = _table_columns(conn, VERIFICATION_RESULT_IMPORT_TABLE)
+        if "reply_room" not in columns:
+            try:
+                conn.execute("ALTER TABLE verification_result_imports ADD COLUMN reply_room TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).casefold():
+                    raise
+        if "target_did" not in columns:
+            try:
+                conn.execute("ALTER TABLE verification_result_imports ADD COLUMN target_did TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).casefold():
+                    raise
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (12)")
+        applied.append(12)
     conn.commit()
     return applied
 
 
-def record_verification_result_import(conn: sqlite3.Connection, *, result: dict[str, Any]) -> bool:
+def record_verification_result_import(
+    conn: sqlite3.Connection,
+    *,
+    result: dict[str, Any],
+    reply_room: str,
+    target_did: str,
+) -> bool:
     """Persist a validated Router-linked result once, without legacy evidence coercion."""
     now = datetime.now(UTC).isoformat()
     cur = conn.execute(
@@ -641,8 +663,8 @@ def record_verification_result_import(conn: sqlite3.Connection, *, result: dict[
             routing_decision_hash, task_hash, verification_mode, status, score,
             findings_json, checks_json, reproducibility, same_operator,
             independent_reputation, operator_group, evidence_classification,
-            result_hash, artifact_hashes_json, completed_at, imported_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            result_hash, artifact_hashes_json, completed_at, imported_at, reply_room, target_did
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             result["request_id"],
@@ -665,7 +687,24 @@ def record_verification_result_import(conn: sqlite3.Connection, *, result: dict[
             json.dumps(result["artifact_hashes"], sort_keys=True, separators=(",", ":")),
             result["completed_at"],
             now,
+            reply_room,
+            target_did,
         ),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def set_verification_result_import_routing(
+    conn: sqlite3.Connection, *, request_id: str, reply_room: str, target_did: str
+) -> bool:
+    cur = conn.execute(
+        """
+        UPDATE verification_result_imports
+        SET reply_room = ?, target_did = ?
+        WHERE request_id = ? AND reply_room IS NULL AND target_did IS NULL
+        """,
+        (reply_room, target_did, request_id),
     )
     conn.commit()
     return cur.rowcount == 1

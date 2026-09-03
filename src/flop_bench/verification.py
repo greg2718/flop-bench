@@ -8,10 +8,13 @@ from typing import Any
 from .canonical import atomic_write_text, canonical_json_bytes, sha256_bytes
 from .config import BENCH_DID
 from .exceptions import SafetyError, ValidationError
+from .posting import validate_signed_write_room
+from .protocol import public_key_from_did
 from .state import (
     connect_state,
     migration_status,
     record_verification_result_import,
+    set_verification_result_import_routing,
     verification_result_import,
 )
 
@@ -199,7 +202,33 @@ def validate_verification_result(result: dict[str, Any]) -> None:
         raise ValidationError("verification result hash does not match its contents")
 
 
-def prepare_verification_delivery(result_path: Path, *, state_dir: Path) -> dict[str, Any]:
+def _validate_delivery_routing(
+    *, reply_room: str | None, target_did: str | None
+) -> tuple[str, str]:
+    if not isinstance(reply_room, str) or not reply_room:
+        raise ValidationError("verification result reply_room is required")
+    try:
+        validate_signed_write_room(reply_room)
+    except SafetyError as exc:
+        raise ValidationError("verification result reply_room is unsupported") from exc
+    if not reply_room.startswith("mb-"):
+        raise ValidationError("verification result reply_room must be a canonical mb-* room")
+    if not isinstance(target_did, str) or not target_did:
+        raise ValidationError("verification result target_did is required")
+    try:
+        public_key_from_did(target_did)
+    except ValidationError as exc:
+        raise ValidationError("verification result target_did is invalid") from exc
+    return reply_room, target_did
+
+
+def prepare_verification_delivery(
+    result_path: Path,
+    *,
+    state_dir: Path,
+    reply_room: str | None,
+    target_did: str | None,
+) -> dict[str, Any]:
     """Import a validated unsigned verification result into the existing delivery state."""
     raw = result_path.read_bytes()
     if len(raw) > MAX_VERIFICATION_RESULT_BYTES:
@@ -211,6 +240,9 @@ def prepare_verification_delivery(result_path: Path, *, state_dir: Path) -> dict
     if not isinstance(parsed, dict):
         raise ValidationError("verification result must contain a JSON object")
     validate_verification_result(parsed)
+    resolved_reply_room, resolved_target_did = _validate_delivery_routing(
+        reply_room=reply_room, target_did=target_did
+    )
     existing = (
         verification_result_import(state_dir, request_id=parsed["request_id"])
         if migration_status(state_dir)["database_exists"]
@@ -221,24 +253,52 @@ def prepare_verification_delivery(result_path: Path, *, state_dir: Path) -> dict
             raise SafetyError(
                 "verification result request_id conflicts with existing imported result"
             )
+        existing_reply_room = existing.get("reply_room")
+        existing_target_did = existing.get("target_did")
+        if (
+            existing_reply_room == resolved_reply_room
+            and existing_target_did == resolved_target_did
+        ):
+            state_write = False
+            status = "already-prepared"
+        elif existing_reply_room is None and existing_target_did is None:
+            with connect_state(state_dir) as conn:
+                state_write = set_verification_result_import_routing(
+                    conn,
+                    request_id=parsed["request_id"],
+                    reply_room=resolved_reply_room,
+                    target_did=resolved_target_did,
+                )
+            status = "prepared"
+        else:
+            raise SafetyError("verification result delivery routing conflicts with existing import")
         return {
             "ok": True,
             "request_id": parsed["request_id"],
-            "status": "already-prepared",
+            "status": status,
             "result_hash": parsed["result_hash"],
+            "reply_room": resolved_reply_room,
+            "target_did": resolved_target_did,
             "authenticity_status": "UNSIGNED_LOCAL",
             "private_key_accesses": 0,
             "network_writes": 0,
-            "state_write": False,
+            "state_write": state_write,
             "network_action": False,
         }
     with connect_state(state_dir) as conn:
-        created = record_verification_result_import(conn, result=parsed)
+        created = record_verification_result_import(
+            conn,
+            result=parsed,
+            reply_room=resolved_reply_room,
+            target_did=resolved_target_did,
+        )
     return {
         "ok": True,
         "request_id": parsed["request_id"],
         "status": "prepared" if created else "already-prepared",
         "result_hash": parsed["result_hash"],
+        "reply_room": resolved_reply_room,
+        "target_did": resolved_target_did,
         "authenticity_status": "UNSIGNED_LOCAL",
         "private_key_accesses": 0,
         "network_writes": 0,

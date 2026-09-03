@@ -37,7 +37,7 @@ from .posting import (
     signed_post_preimage,
     validate_signed_write_room,
 )
-from .protocol import parse_timestamp
+from .protocol import parse_timestamp, public_key_from_did
 from .schemas import (
     EVIDENCE_BUNDLE_SCHEMA,
     MAILBOX_RESULT_SCHEMA,
@@ -549,6 +549,8 @@ def result_preview(*, state_dir: Path, request_id: str) -> dict[str, Any]:
             "result_hash": imported["result_hash"],
             "artifact_hashes": imported["artifact_hashes"],
             "completed_at": imported["completed_at"],
+            "reply_room": imported["reply_room"],
+            "target_did": imported["target_did"],
             "authenticity_status": "UNSIGNED_LOCAL",
             "result_delivery_status": "not_sent",
             "state_write": False,
@@ -638,6 +640,8 @@ def _imported_verification_result_envelope(imported: dict[str, Any]) -> dict[str
         "result_hash": imported["result_hash"],
         "artifact_hashes": imported["artifact_hashes"],
         "completed_at": imported["completed_at"],
+        "reply_room": imported["reply_room"],
+        "target_did": imported["target_did"],
         "authenticity_status": "UNSIGNED_LOCAL",
     }
 
@@ -674,6 +678,16 @@ def _delivery_destination_blockers(
     return resolved, list(dict.fromkeys(blockers))
 
 
+def _delivery_target_blockers(target_did: Any) -> list[str]:
+    if not isinstance(target_did, str) or not target_did:
+        return ["result_delivery_target_did_unavailable"]
+    try:
+        public_key_from_did(target_did)
+    except ValidationError:
+        return ["result_delivery_target_did_invalid"]
+    return []
+
+
 def result_delivery_preview(*, state_dir: Path, request_id: str) -> dict[str, Any]:
     assert_isolated(BenchConfig(state_dir=state_dir, subject_did=BENCH_DID))
     resolved = state_dir.expanduser().resolve(strict=False)
@@ -686,15 +700,15 @@ def result_delivery_preview(*, state_dir: Path, request_id: str) -> dict[str, An
     )
     if imported is not None:
         row = None
-        reply_room = None
+        reply_room = imported.get("reply_room")
         envelope = _imported_verification_result_envelope(imported)
-        blockers.append("missing_result_destination")
-        blockers.append("result_delivery_target_did_unavailable")
+        target_did = imported.get("target_did")
     elif not status["database_exists"]:
         blockers.append("state_database_missing")
         row = None
         envelope = None
         reply_room = None
+        target_did = None
     else:
         pending_migrations = list(status["pending_migrations"])
         if pending_migrations:
@@ -704,13 +718,16 @@ def result_delivery_preview(*, state_dir: Path, request_id: str) -> dict[str, An
             blockers.append("request_not_found")
             envelope = None
             reply_room = None
+            target_did = None
         else:
             try:
                 request_envelope = _load_envelope(row)
                 reply_room = request_envelope.get("reply_room")
+                target_did = row.get("sender_did")
             except (SafetyError, ValidationError) as exc:
                 blockers.append(str(exc))
                 reply_room = None
+                target_did = None
             try:
                 envelope = _completed_result_envelope(row)
             except SafetyError as exc:
@@ -720,6 +737,7 @@ def result_delivery_preview(*, state_dir: Path, request_id: str) -> dict[str, An
         reply_room=reply_room, destination=None
     )
     blockers.extend(destination_blockers)
+    blockers.extend(_delivery_target_blockers(target_did))
     result_text = _canonical_result_text(envelope) if envelope is not None else None
     return {
         "ok": True,
@@ -727,6 +745,7 @@ def result_delivery_preview(*, state_dir: Path, request_id: str) -> dict[str, An
         "can_send": not blockers,
         "blockers": list(dict.fromkeys(blockers)),
         "destination": destination,
+        "target_did": target_did,
         "message_hash": message_hash(result_text) if result_text is not None else None,
         "message_bytes": len(result_text.encode("utf-8")) if result_text is not None else None,
         "result_envelope": envelope,

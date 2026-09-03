@@ -287,6 +287,8 @@ def build_parser() -> argparse.ArgumentParser:
     verification_prepare_delivery = verification_sub.add_parser("prepare-delivery")
     verification_prepare_delivery.add_argument("result", type=Path)
     verification_prepare_delivery.add_argument("--state-dir", required=True, type=Path)
+    verification_prepare_delivery.add_argument("--reply-room", required=True)
+    verification_prepare_delivery.add_argument("--target-did", required=True)
     return parser
 
 
@@ -358,6 +360,17 @@ def run(argv: list[str] | None = None) -> int:
                 result_delivery_preview(state_dir=args.state_dir, request_id=args.request_id)
             )
         elif args.cmd == "result" and args.result_cmd == "send":
+            delivery_preview = result_delivery_preview(
+                state_dir=args.state_dir, request_id=args.request_id
+            )
+            if delivery_preview["blockers"]:
+                raise SafetyError(
+                    "result delivery is blocked: " + ", ".join(delivery_preview["blockers"])
+                )
+            if args.destination != delivery_preview["destination"]:
+                raise SafetyError("result delivery destination_mismatch")
+            if not args.live:
+                raise SafetyError("live Technocore operation requires explicit --live")
             passphrase = read_interactive_existing_passphrase()
             _print_json(
                 send_result_delivery(
@@ -541,7 +554,13 @@ def run(argv: list[str] | None = None) -> int:
                 )
             )
         elif args.cmd == "verification" and args.verification_cmd == "prepare-delivery":
-            _print_json(prepare_verification_delivery(args.result, state_dir=args.state_dir))
+            _print_json(
+                prepare_verification_delivery(
+                    args.result,
+                    state_dir=args.state_dir,
+                    reply_room=args.reply_room,
+                    target_did=args.target_did,
+                )
         else:
             raise FlopBenchError("unknown command")
     except LedgerError as exc:
