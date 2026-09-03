@@ -649,8 +649,171 @@ def test_worker_once_lease_recovery_backoff_and_read_only_status(tmp_path: Path)
         worker_status(state_dir=state, now=clock)["last_failure_classification"]
         == "remote_unavailable"
     )
-    assert worker_status(state_dir=tmp_path / "missing", now=clock)["state_write"] is False
+    missing_status = worker_status(state_dir=tmp_path / "missing", now=clock)
+    missing_health = worker_health(state_dir=tmp_path / "missing", now=clock)
+    assert missing_status["state_write"] is False
+    assert missing_status["cursor"] is None
+    assert missing_health["cursor"] is None
     assert not (tmp_path / "missing").exists()
+
+
+def set_mailbox_cursor(state: Path, cursor: int) -> None:
+    with connect_state(state) as conn:
+        conn.execute(
+            """
+            INSERT INTO metadata(key, value, updated_at)
+            VALUES ('mailbox:mb-flop-bench:cursor', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (str(cursor), datetime.now(UTC).isoformat()),
+        )
+        conn.commit()
+
+
+def test_worker_status_and_health_report_mailbox_cursor_without_worker_row(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "worker-state"
+    set_mailbox_cursor(state, 6)
+
+    before = worker_status(state_dir=state)
+    health = worker_health(state_dir=state)
+    after = worker_status(state_dir=state)
+
+    assert before["worker_status"] == "unavailable"
+    assert before["lease_status"] == "absent"
+    assert before["cursor"] == 6
+    assert health["health"] == "unavailable"
+    assert health["cursor"] == 6
+    assert after == before
+    assert mailbox_worker_state(state, mailbox="mb-flop-bench") is None
+
+
+def test_worker_status_and_health_report_mailbox_cursor_for_worker_rows(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 9, 3, tzinfo=UTC)
+    cases = {
+        "active": lambda state: _create_active_worker_row(
+            state, instance_id="active", now=now, lease_seconds=60
+        ),
+        "stopped": lambda state: _create_stopped_worker_row(state, now),
+        "expired": lambda state: _create_active_worker_row(
+            state, instance_id="expired", now=now, lease_seconds=1
+        ),
+    }
+
+    for name, create_worker_row in cases.items():
+        state = tmp_path / name
+        set_mailbox_cursor(state, 6)
+        assert create_worker_row(state)
+        if name == "active":
+            check_time = now
+        elif name == "expired":
+            check_time = now + timedelta(seconds=2)
+        else:
+            check_time = now
+
+        with connect_state(state) as conn:
+            assert update_mailbox_worker(
+                conn,
+                mailbox="mb-flop-bench",
+                instance_id=name if name != "stopped" else "stopped",
+                now=now,
+                lease_seconds=1 if name == "expired" else 60,
+                successful=False,
+                backoff_seconds=2,
+                failure_classification="remote_unavailable",
+            ) is (name != "stopped")
+
+        status = worker_status(state_dir=state, now=lambda check_time=check_time: check_time)
+        health = worker_health(state_dir=state, now=lambda check_time=check_time: check_time)
+
+        assert status["cursor"] == 6
+        assert health["cursor"] == 6
+        with connect_state(state) as conn:
+            assert (
+                conn.execute(
+                    "SELECT value FROM metadata WHERE key = 'mailbox:mb-flop-bench:cursor'"
+                ).fetchone()[0]
+                == "6"
+            )
+
+
+def _create_active_worker_row(
+    state: Path, *, instance_id: str, now: datetime, lease_seconds: float
+) -> bool:
+    with connect_state(state) as conn:
+        return acquire_mailbox_worker_lease(
+            conn,
+            mailbox="mb-flop-bench",
+            instance_id=instance_id,
+            now=now,
+            lease_seconds=lease_seconds,
+            poll_interval_seconds=30,
+        )
+
+
+def _create_stopped_worker_row(state: Path, now: datetime) -> bool:
+    with connect_state(state) as conn:
+        acquired = acquire_mailbox_worker_lease(
+            conn,
+            mailbox="mb-flop-bench",
+            instance_id="stopped",
+            now=now,
+            lease_seconds=60,
+            poll_interval_seconds=30,
+        )
+    with connect_state(state) as conn:
+        release_mailbox_worker_lease(conn, mailbox="mb-flop-bench", instance_id="stopped")
+    return acquired
+
+
+def test_worker_once_poll_resumes_after_existing_mailbox_cursor(tmp_path: Path) -> None:
+    state = tmp_path / "resume"
+    set_mailbox_cursor(state, 6)
+    sender = public_did(Ed25519PrivateKey.generate())
+    transport = FakeActivationTransport()
+    transport.room_messages["mb-flop-bench"] = [
+        {
+            "seq": 7,
+            "from": sender,
+            "nonce": 7,
+            "text": mailbox_request_text(sender_did=sender, request_id="resume-after-six"),
+        }
+    ]
+
+    result = run_worker(state_dir=state, transport=transport, once=True)
+
+    assert result["ok"] is True
+    assert result["last_poll"]["cursor_before"] == 6
+    assert result["last_poll"]["cursor_after"] == 7
+    assert "since=6" in transport.requests[0][1]
+    assert "since=0" not in transport.requests[0][1]
+    assert worker_status(state_dir=state)["cursor"] == 7
+
+
+def test_migration_13_preserves_existing_mailbox_cursor(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    set_mailbox_cursor(state, 6)
+    with connect_state(state) as conn:
+        conn.execute("DROP TABLE mailbox_intake_worker")
+        conn.execute("DELETE FROM schema_migrations WHERE version = 13")
+        conn.commit()
+
+    with connect_state(state) as conn:
+        assert [
+            int(row[0]) for row in conn.execute("SELECT version FROM schema_migrations")
+        ] == list(range(1, SCHEMA_VERSION + 1))
+        assert (
+            conn.execute(
+                "SELECT value FROM metadata WHERE key = 'mailbox:mb-flop-bench:cursor'"
+            ).fetchone()[0]
+            == "6"
+        )
+
+    assert worker_status(state_dir=state)["cursor"] == 6
 
 
 def test_worker_lease_lifecycle_and_signal_boundary(tmp_path: Path) -> None:

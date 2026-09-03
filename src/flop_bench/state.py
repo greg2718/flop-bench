@@ -921,9 +921,16 @@ def mailbox_worker_snapshot(state_dir: Path, *, mailbox: str) -> dict[str, Any] 
         message_table = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mailbox_messages'"
         ).fetchone()
-        cursor_row = conn.execute(
-            "SELECT value FROM metadata WHERE key = ?", (f"mailbox:{mailbox}:cursor",)
+        metadata_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'"
         ).fetchone()
+        cursor_row = (
+            None
+            if metadata_table is None
+            else conn.execute(
+                "SELECT value FROM metadata WHERE key = ?", (f"mailbox:{mailbox}:cursor",)
+            ).fetchone()
+        )
         pending = (
             0
             if message_table is None
@@ -934,9 +941,8 @@ def mailbox_worker_snapshot(state_dir: Path, *, mailbox: str) -> dict[str, Any] 
                 ).fetchone()[0]
             )
         )
-    if row is None:
-        return None
-    result = dict(row)
+    result = {} if row is None else dict(row)
+    result["worker_row_present"] = row is not None
     try:
         result["cursor"] = int(cursor_row["value"]) if cursor_row is not None else 0
     except (TypeError, ValueError):
